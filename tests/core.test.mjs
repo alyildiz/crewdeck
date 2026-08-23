@@ -1,0 +1,68 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { addProject, CrewdeckError, loadConfig } from "../src/core.mjs";
+
+function git(cwd, ...args) {
+  return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
+}
+
+async function fixture() {
+  const root = await mkdtemp(path.join(os.tmpdir(), "crewdeck-test-"));
+  const repo = path.join(root, "repo");
+  execFileSync("git", ["init", "-q", "-b", "main", repo]);
+  await writeFile(path.join(repo, "README.md"), "test\n");
+  git(repo, "add", "README.md");
+  git(repo, "commit", "-qm", "initial");
+  const configPath = path.join(root, "crewdeck.json");
+  await writeFile(
+    configPath,
+    JSON.stringify({
+      maxWorkers: 5,
+      worktreeRoot: path.join(root, "worktrees"),
+      defaultProfile: "worker",
+      profiles: { worker: { kind: "pi", model: "test/model", thinking: "medium" } },
+      projects: {},
+    }),
+  );
+  return { root, repo, configPath };
+}
+
+test("loads a minimal valid configuration", async () => {
+  const { configPath } = await fixture();
+  const config = await loadConfig(configPath);
+  assert.equal(config.maxWorkers, 5);
+  assert.equal(config.profiles.worker.thinking, "medium");
+  assert.ok(path.isAbsolute(config.worktreeRoot));
+});
+
+test("registers a Git project with explicit trust", async () => {
+  const { configPath, repo } = await fixture();
+  const project = await addProject(configPath, "demo", repo, {
+    base: "main",
+    trustProjectResources: true,
+  });
+  assert.deepEqual(project, {
+    path: repo,
+    base: "main",
+    trustProjectResources: true,
+    verify: [],
+  });
+  const persisted = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(persisted.projects.demo.path, repo);
+});
+
+test("rejects invalid worker thinking levels", async () => {
+  const { configPath } = await fixture();
+  const raw = JSON.parse(await readFile(configPath, "utf8"));
+  raw.profiles.worker.thinking = "enormous";
+  await writeFile(configPath, JSON.stringify(raw));
+  await assert.rejects(() => loadConfig(configPath), (error) => {
+    assert.ok(error instanceof CrewdeckError);
+    assert.equal(error.code, "invalid_config");
+    return true;
+  });
+});

@@ -1,0 +1,26 @@
+{
+  "maxWorkers": 5,
+  "worktreeRoot": "~/.local/share/crewdeck/worktrees",
+  "defaultProfile": "worker",
+  "profiles": {
+    "worker": {
+      "kind": "pi",
+      "model": "openai-codex/gpt-5.6-sol",
+      "thinking": "medium"
+    },
+    "scout": {
+      "kind": "pi",
+      "model": "openai-codex/gpt-5.6-sol",
+      "thinking": "low",
+      "readOnly": true
+    }
+  },
+  "projects": {
+    "crewdeck": {
+      "path": "/home/baris/projects/crewdeck",
+      "base": "main",
+      "trustProjectResources": true,
+      "verify": ["npm test", "npm run check"]
+    }
+  }
+}

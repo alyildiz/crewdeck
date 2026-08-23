@@ -1,0 +1,106 @@
+#!/usr/bin/env node
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  addProject,
+  cleanupTask,
+  getStatus,
+  loadConfig,
+  mergeTask,
+  prepareIntegration,
+  promptTask,
+  spawnBatch,
+  stateLocation,
+} from "../src/core.mjs";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const configPath = process.env.CREWDECK_CONFIG || path.join(root, "crewdeck.json");
+const [command, ...args] = process.argv.slice(2);
+
+function usage() {
+  console.log(`Crewdeck v0.1
+
+Usage:
+  crewdeck config
+  crewdeck project add <name> <path> [--base <branch>] [--trust]
+  crewdeck project list
+  crewdeck spawn <project> <id> <task> [--profile <name>]
+  crewdeck status [id]
+  crewdeck prompt <id> <message> [--wait]
+  crewdeck prepare <id>
+  crewdeck merge <id> --confirm
+  crewdeck cleanup <id> --confirm
+
+State: ${stateLocation()}
+Config: ${configPath}`);
+}
+
+function option(name) {
+  const index = args.indexOf(name);
+  return index >= 0 ? args[index + 1] : undefined;
+}
+
+try {
+  let result;
+  switch (command) {
+    case "config":
+      result = await loadConfig(configPath);
+      delete result.__path;
+      break;
+    case "project": {
+      if (args[0] === "list") {
+        const config = await loadConfig(configPath);
+        result = config.projects;
+      } else if (args[0] === "add" && args[1] && args[2]) {
+        result = await addProject(configPath, args[1], args[2], {
+          base: option("--base"),
+          trustProjectResources: args.includes("--trust"),
+        });
+      } else {
+        usage();
+        process.exitCode = 2;
+      }
+      break;
+    }
+    case "spawn": {
+      if (!args[0] || !args[1] || !args[2]) throw new Error("spawn requires <project> <id> <task>");
+      result = await spawnBatch(configPath, {
+        project: args[0],
+        tasks: [{ id: args[1], task: args[2], profile: option("--profile") }],
+      });
+      break;
+    }
+    case "status":
+      result = await getStatus(configPath, args[0]);
+      break;
+    case "prompt":
+      if (!args[0] || !args[1]) throw new Error("prompt requires <id> <message>");
+      result = await promptTask(configPath, args[0], args[1], { wait: args.includes("--wait") });
+      break;
+    case "prepare":
+      if (!args[0]) throw new Error("prepare requires <id>");
+      result = await prepareIntegration(configPath, args[0]);
+      break;
+    case "merge":
+      if (!args[0] || !args.includes("--confirm")) throw new Error("merge requires <id> --confirm");
+      result = await mergeTask(configPath, args[0]);
+      break;
+    case "cleanup":
+      if (!args[0] || !args.includes("--confirm")) throw new Error("cleanup requires <id> --confirm");
+      result = await cleanupTask(configPath, args[0]);
+      break;
+    case "help":
+    case "--help":
+    case "-h":
+    case undefined:
+      usage();
+      break;
+    default:
+      usage();
+      process.exitCode = 2;
+  }
+  if (result !== undefined) console.log(JSON.stringify(result, null, 2));
+} catch (error) {
+  console.error(JSON.stringify({ error: error.message, code: error.code || "error", details: error.details }, null, 2));
+  process.exitCode = 1;
+}
