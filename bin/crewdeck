@@ -2,6 +2,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  abandonTask,
   addProject,
   cleanupTask,
   collectResults,
@@ -33,6 +34,7 @@ Usage:
   crewdeck prompt <id> <message> [--wait]
   crewdeck prepare <id>
   crewdeck merge <id> --confirm
+  crewdeck abandon <id> --confirm [--reason <text>]
   crewdeck cleanup <id> --confirm
 
 State: ${stateLocation()}
@@ -104,6 +106,10 @@ try {
     case "merge":
       if (!args[0] || !args.includes("--confirm")) throw new Error("merge requires <id> --confirm");
       result = await mergeTask(configPath, args[0]);
+      break;
+    case "abandon":
+      if (!args[0] || !args.includes("--confirm")) throw new Error("abandon requires <id> --confirm");
+      result = await abandonTask(configPath, args[0], { reason: option("--reason") });
       break;
     case "cleanup":
       if (!args[0] || !args.includes("--confirm")) throw new Error("cleanup requires <id> --confirm");

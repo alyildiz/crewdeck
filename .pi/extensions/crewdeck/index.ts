@@ -7,6 +7,7 @@ import { Type } from "typebox";
 import { createCompletionWakeController } from "../../../src/completion-wake.mjs";
 import { createCrewCommand } from "../../../src/crew-view.mjs";
 import {
+  abandonTask,
   cleanupTask,
   collectResults,
   getPendingResultIds,
@@ -186,10 +187,30 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "crew_abandon",
+    label: "Abandon Worker",
+    description:
+      "Explicitly abandon a clean, non-integrated change task, then close its agent/workspace and remove only its isolated worktree and branch. Refuses report, integrated, cleaned, already abandoned, active, or dirty tasks and always asks for independent confirmation.",
+    parameters: Type.Object({
+      id: Type.String(),
+      reason: Type.Optional(Type.String({ description: "Durable reason this change is no longer needed" })),
+    }),
+    async execute(_id, params, _signal, _update, ctx) {
+      if (!ctx.hasUI) throw new Error("crew_abandon requires interactive confirmation");
+      const confirmed = await ctx.ui.confirm(
+        "Abandon unintegrated Crewdeck task?",
+        `Permanently discard the committed change branch for task '${params.id}' and remove its isolated worktree? The base branch is not changed and nothing is pushed.`,
+      );
+      if (!confirmed) return text({ abandoned: false, reason: "user declined" });
+      return text(await abandonTask(CONFIG, params.id, { reason: params.reason }));
+    },
+  });
+
+  pi.registerTool({
     name: "crew_cleanup",
     label: "Clean Worker",
     description:
-      "Close and remove an integrated Crewdeck worker worktree, workspace, and merged branch. Refuses unintegrated or dirty work and asks for confirmation.",
+      "Close and remove an integrated, or already explicitly abandoned, Crewdeck worker worktree, workspace, and isolated branch. Refuses other unintegrated or dirty work and asks for confirmation.",
     parameters: Type.Object({ id: Type.String() }),
     async execute(_id, params, _signal, _update, ctx) {
       if (!ctx.hasUI) throw new Error("crew_cleanup requires interactive confirmation");

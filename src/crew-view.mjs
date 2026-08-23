@@ -1,6 +1,7 @@
 export const TERMINAL_CREW_STATUSES = new Set([
   "report-collected",
   "integrated",
+  "abandoned",
   "cleaned",
 ]);
 

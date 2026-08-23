@@ -16,9 +16,9 @@ You talk to one Pi session in this repository. Its project-local skill decides h
 - durable structured scout reports and build results outside worktrees
 - durable result reconciliation plus an automatic Pi follow-up whenever a worker completes
 - automatic safe report-task cleanup after result collection when configured
-- sequential build rebase, verification, local fast-forward merge, and safe cleanup
+- sequential build rebase, verification, local fast-forward merge, safe cleanup, and explicit abandonment of obsolete unintegrated changes
 - orchestrator skill allowlist: only the project-local `crewdeck` skill
-- no push, PR creation, remote workers, forced cleanup, or background LLM polling
+- no push, PR creation, remote workers, dirty-worktree deletion, or background LLM polling
 
 Conflict reconciliation between two concurrently developed build branches is the next milestone and intentionally remains outside v0.2.
 
@@ -146,7 +146,7 @@ Example:
 On my-project, use local-fast to analyze the pricing page without changing code, and use cloud-medium to build the already-approved expiration test.
 ```
 
-Use `/crew` to display active or actionable workers without an LLM turn, `/crew all` to display the complete durable task history, and `/crew clear` to hide the widget. The default view hides terminal `report-collected`, `integrated`, and `cleaned` tasks; a missing Herdr agent remains visible when its task is not terminal. When `crew_complete` stores a result, the orchestrator extension reconciles all durable uncollected reports, groups nearby completions, and calls `pi.sendUserMessage(..., { deliverAs: "followUp" })`. This necessarily wakes the orchestrator so it can inspect status and collect the named results. The same reconciliation runs at session start, so results produced while Pi was stopped or missed by `fs.watch` are delivered at least once; collection is the acknowledgement.
+Use `/crew` to display active or actionable workers without an LLM turn, `/crew all` to display the complete durable task history, and `/crew clear` to hide the widget. The default view hides terminal `report-collected`, `integrated`, completed `abandoned`, and `cleaned` tasks; `/crew all` retains them. An interrupted abandonment remains visible as `abandon-cleanup-pending`, and a missing Herdr agent remains visible when its task is not terminal. When `crew_complete` stores a result, the orchestrator extension reconciles all durable uncollected reports, groups nearby completions, and calls `pi.sendUserMessage(..., { deliverAs: "followUp" })`. This necessarily wakes the orchestrator so it can inspect status and collect the named results. The same reconciliation runs at session start, so results produced while Pi was stopped or missed by `fs.watch` are delivered at least once; collection is the acknowledgement.
 
 ## Task contracts
 
@@ -164,9 +164,12 @@ A scout cannot call `write`, `edit`, or `bash`. It must submit `crew_complete` w
 
 ```text
 running → candidate → ready → integrated → cleaned
+         ↘ conflict/obsolete → abandoned
 ```
 
 A build must commit and call `crew_complete` with its exact HEAD, tests, risks, and open questions. `candidate` additionally requires a settled agent, clean worktree, at least one commit, and a result commit matching HEAD. Builds remain alive for integration and possible correction.
+
+`abandoned` is a separate terminal outcome and never means integrated. The independently confirmed abandon operation accepts only a settled, clean, non-integrated change task. It first records `abandonedAt`, the prior status, and an optional reason, then closes the worker/workspace and removes only the isolated worktree and branch. It never changes the base branch or pushes. Dirty worktrees, report tasks, and integrated, cleaned, or already abandoned tasks are refused. Durable reports and task history remain in the Crewdeck state directory. If cleanup is interrupted after the durable transition, a separately confirmed `cleanup` may resume cleanup of that already abandoned task without changing its terminal status.
 
 ## Manual CLI
 
@@ -180,7 +183,9 @@ bin/crewdeck collect pricing-analysis
 bin/crewdeck diff pricing-fix
 bin/crewdeck prepare pricing-fix
 bin/crewdeck merge pricing-fix --confirm
+# For a superseded, clean change that must not be integrated:
+bin/crewdeck abandon obsolete-fix --confirm --reason "superseded by pricing-fix"
 bin/crewdeck cleanup pricing-fix --confirm
 ```
 
-The CLI's `--confirm` is intended for a human at a shell. The Pi extension independently displays an interactive confirmation before build merge and manual cleanup.
+The CLI's `--confirm` is intended for a human at a shell. The Pi extension independently displays separate interactive confirmations before build merge, abandonment, and manual cleanup.

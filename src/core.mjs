@@ -684,13 +684,15 @@ export async function getStatus(configPath, id) {
       record.lifecycle ||= config.kinds[record.kind]?.lifecycle || (record.kind === "scout" ? "report" : "change");
       record.cleanup ||= config.kinds[record.kind]?.cleanup ||
         (record.lifecycle === "report" ? "after-collection" : "after-integration");
-      if (record.status === "cleaned") {
-        return {
+      if (record.status === "cleaned" || (record.status === "abandoned" && record.cleanedAt)) {
+        const terminal = {
           ...publicTaskRecord(record),
-          observedStatus: "cleaned",
+          observedStatus: record.status,
           agent: { available: false, state: "closed" },
           git: { available: false, state: "worktree-removed" },
         };
+        if (record.status === "abandoned") terminal.result = publicTaskReport(await readTaskReport(record));
+        return terminal;
       }
       const [agent, snapshot, result] = await Promise.all([
         liveAgent(record),
@@ -698,6 +700,7 @@ export async function getStatus(configPath, id) {
         readTaskReport(record),
       ]);
       let observedStatus = record.status;
+      if (record.status === "abandoned" && !record.cleanedAt) observedStatus = "abandon-cleanup-pending";
       if (record.status === "running" && agent.state === "blocked") observedStatus = "blocked";
       if (record.lifecycle === "report" && result.available) {
         observedStatus = record.resultCollectedAt ? "report-collected" : "report-ready";
@@ -915,6 +918,67 @@ export async function prepareIntegration(configPath, id) {
   return { ok: true, task: publicTaskRecord(record), verification };
 }
 
+export async function abandonTask(configPath, id, { reason } = {}) {
+  const config = await loadConfig(configPath);
+  const state = await loadState();
+  const record = state.tasks[id];
+  if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
+  record.kind ||= record.profile === "scout" ? "scout" : "build";
+  record.lifecycle ||= config.kinds[record.kind]?.lifecycle || (record.kind === "scout" ? "report" : "change");
+  record.cleanup ||= config.kinds[record.kind]?.cleanup ||
+    (record.lifecycle === "report" ? "after-collection" : "after-integration");
+  if (record.lifecycle !== "change") {
+    throw new CrewdeckError("Report tasks cannot be abandoned", "read_only_task");
+  }
+  const project = resolveProject(config, record.project);
+  if (
+    record.branch !== `crew/${id}` ||
+    path.resolve(record.worktree) !== path.join(config.worktreeRoot, record.project, id) ||
+    path.resolve(record.repo) !== project.path
+  ) {
+    throw new CrewdeckError("Task does not reference its expected isolated Git resources", "unsafe_task_resources");
+  }
+  if (record.status === "integrated") {
+    throw new CrewdeckError("Integrated tasks cannot be abandoned", "already_integrated");
+  }
+  if (record.status === "abandoned") {
+    throw new CrewdeckError("Task is already abandoned", "already_abandoned");
+  }
+  if (record.status === "cleaned" || record.cleanedAt) {
+    throw new CrewdeckError("Cleaned tasks cannot be abandoned", "already_cleaned");
+  }
+  if (reason !== undefined && (typeof reason !== "string" || !reason.trim())) {
+    throw new CrewdeckError("Abandonment reason must be a non-empty string", "invalid_reason");
+  }
+  const agent = await liveAgent(record);
+  if (agent.available && !["idle", "done"].includes(agent.state)) {
+    throw new CrewdeckError(`Worker is ${agent.state}; wait until it settles before abandonment`, "worker_not_settled");
+  }
+  const snapshot = await gitSnapshot(record);
+  if (!snapshot.available || !snapshot.clean) {
+    throw new CrewdeckError("Worktree is not clean; abandonment never discards uncommitted data", "dirty_worktree", snapshot);
+  }
+
+  const previousStatus = record.status;
+  record.status = "abandoned";
+  record.abandonedFromStatus = previousStatus;
+  record.abandonedAt = new Date().toISOString();
+  if (reason !== undefined) record.abandonmentReason = reason.trim();
+  delete record.error;
+  await withStateLock(async () => {
+    const next = await loadState();
+    if (next.tasks[id]?.status !== previousStatus) {
+      throw new CrewdeckError("Task state changed during abandonment", "state_changed");
+    }
+    next.tasks[id] = record;
+    await saveState(next);
+  });
+
+  // The durable abandonment transition happens before destructive cleanup. If
+  // cleanup is interrupted, a later explicitly confirmed cleanup can resume it.
+  return cleanupTask(configPath, id);
+}
+
 export async function mergeTask(configPath, id) {
   const config = await loadConfig(configPath);
   const state = await loadState();
@@ -953,8 +1017,21 @@ export async function cleanupTask(configPath, id) {
   record.lifecycle ||= config.kinds[record.kind]?.lifecycle || (record.kind === "scout" ? "report" : "change");
   record.cleanup ||= config.kinds[record.kind]?.cleanup ||
     (record.lifecycle === "report" ? "after-collection" : "after-integration");
-  if (record.lifecycle === "change" && record.status !== "integrated") {
-    throw new CrewdeckError("Change tasks can be cleaned only after integration", "not_integrated");
+  if (record.status === "cleaned" || record.cleanedAt) {
+    throw new CrewdeckError("Task is already cleaned", "already_cleaned");
+  }
+  if (record.lifecycle === "change" && !["integrated", "abandoned"].includes(record.status)) {
+    throw new CrewdeckError("Change tasks can be cleaned only after integration or explicit abandonment", "not_integrated");
+  }
+  if (record.status === "abandoned") {
+    const project = resolveProject(config, record.project);
+    if (
+      record.branch !== `crew/${id}` ||
+      path.resolve(record.worktree) !== path.join(config.worktreeRoot, record.project, id) ||
+      path.resolve(record.repo) !== project.path
+    ) {
+      throw new CrewdeckError("Task does not reference its expected isolated Git resources", "unsafe_task_resources");
+    }
   }
   if (record.lifecycle === "report") {
     if (!record.resultCollectedAt) {
@@ -968,7 +1045,18 @@ export async function cleanupTask(configPath, id) {
     throw new CrewdeckError(`Worker is ${agent.state}; wait until it settles before cleanup`, "worker_not_settled");
   }
   const snapshot = await gitSnapshot(record);
-  if (!snapshot.available || !snapshot.clean) throw new CrewdeckError("Worktree is not clean", "dirty_worktree");
+  let worktreeAlreadyRemoved = false;
+  if (!snapshot.available && record.status === "abandoned") {
+    try {
+      await stat(record.worktree);
+    } catch (error) {
+      if (error.code === "ENOENT") worktreeAlreadyRemoved = true;
+      else throw error;
+    }
+  }
+  if ((!snapshot.available && !worktreeAlreadyRemoved) || (snapshot.available && !snapshot.clean)) {
+    throw new CrewdeckError("Worktree is not clean", "dirty_worktree", snapshot);
+  }
   if (record.lifecycle === "report" && snapshot.ahead !== 0) {
     throw new CrewdeckError("Report branch unexpectedly contains commits", "report_has_commits");
   }
@@ -978,13 +1066,27 @@ export async function cleanupTask(configPath, id) {
   } catch {
     // An already exited agent is fine; worktree removal remains the authority.
   }
-  await runJson("herdr", ["worktree", "remove", "--workspace", record.workspaceId], { timeout: 30_000 });
-  try {
-    await git(record.repo, ["branch", "-d", record.branch]);
-  } catch {
-    // The integrated work is safe even if branch deletion is refused.
+  if (!worktreeAlreadyRemoved) {
+    await runJson("herdr", ["worktree", "remove", "--workspace", record.workspaceId], { timeout: 30_000 });
+  } else {
+    try {
+      await runJson("herdr", ["workspace", "close", record.workspaceId], { timeout: 15_000 });
+    } catch {
+      // The isolated worktree is already absent; preserving an unknown workspace is safer than forcing cleanup.
+    }
   }
-  record.status = "cleaned";
+  try {
+    await git(record.repo, ["branch", record.status === "abandoned" ? "-D" : "-d", record.branch]);
+  } catch (error) {
+    if (record.status === "abandoned") {
+      throw new CrewdeckError("Abandoned worktree was removed but its isolated branch was preserved", "branch_cleanup_failed", {
+        branch: record.branch,
+        error: error.message,
+      });
+    }
+    // Integrated work is safe even if non-forced branch deletion is refused.
+  }
+  if (record.status !== "abandoned") record.status = "cleaned";
   record.cleanedAt = new Date().toISOString();
   let closeOwnedSource = false;
   await withStateLock(async () => {
@@ -996,7 +1098,8 @@ export async function cleanupTask(configPath, id) {
         (other) =>
           other.id !== id &&
           other.sourceWorkspaceId === record.sourceWorkspaceId &&
-          other.status !== "cleaned",
+          other.status !== "cleaned" &&
+          !other.cleanedAt,
       );
     await saveState(next);
   });

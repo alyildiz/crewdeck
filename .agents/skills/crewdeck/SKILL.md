@@ -1,6 +1,6 @@
 ---
 name: crewdeck
-description: Coordinate multiple coding agents through Crewdeck and Herdr. Use whenever the user asks to delegate project work, run workers or scouts, parallelize several coding tasks, inspect worker progress, collect analysis, integrate worker branches, or clean completed worktrees. Also use when one request contains several independently actionable project changes.
+description: Coordinate multiple coding agents through Crewdeck and Herdr. Use whenever the user asks to delegate project work, run workers or scouts, parallelize several coding tasks, inspect worker progress, collect analysis, integrate or abandon worker branches, or clean completed worktrees. Also use when one request contains several independently actionable project changes.
 compatibility: Requires Pi inside Herdr 0.8+, Git, and the Crewdeck Pi extension.
 ---
 
@@ -53,10 +53,12 @@ For each selected change-lifecycle task:
 4. Present the verified outcome and meaningful risk to the user.
 5. Call `crew_merge` only when the user explicitly asks to merge. The tool independently requests interactive confirmation and performs a local fast-forward only.
 6. Integrate the next branch against the newly advanced base.
-7. Call `crew_cleanup` only after integration. It refuses dirty or unintegrated change work.
+7. Call `crew_cleanup` only after integration. It also permits resuming interrupted cleanup for an already explicitly abandoned task, but refuses all other unintegrated change work.
+
+When a non-integrated change task is obsolete or superseded, call `crew_abandon` rather than pretending it was integrated or bypassing cleanup with raw Git/Herdr. This operation has its own interactive confirmation, refuses reports, active workers, dirty worktrees, and terminal tasks, records the distinct durable `abandoned` outcome, and removes only the isolated worktree and branch without changing base or pushing.
 
 Conflict reconciliation between concurrent build branches is intentionally deferred to the next Crewdeck milestone. Never bypass a current refusal with raw Git or Herdr commands.
 
 ## Recovery
 
-Use `crew_status` after restarting the orchestrator. Durable records and reports preserve task identity and outcomes. If Herdr reports an agent missing, preserve the worktree and inspect Git before proposing recovery; absence of an agent is never permission to delete work.
+Use `crew_status` after restarting the orchestrator. Durable records and reports preserve task identity and outcomes; `/crew` hides terminal abandoned tasks while `/crew all` shows them. If Herdr reports an agent missing, preserve the worktree and inspect Git before proposing recovery; absence of an agent is never permission to delete work.

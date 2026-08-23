@@ -10,6 +10,8 @@ const tasks = [
   { id: "missing-active", status: "running", observedStatus: "running", agent: { state: "missing" } },
   { id: "missing-collected", status: "running", observedStatus: "report-collected", agent: { state: "missing" } },
   { id: "integrated", status: "integrated", observedStatus: "integrated", agent: { state: "idle" } },
+  { id: "abandon-pending", status: "abandoned", observedStatus: "abandon-cleanup-pending", agent: { state: "missing" } },
+  { id: "abandoned", status: "abandoned", observedStatus: "abandoned", agent: { state: "closed" } },
   { id: "cleaned", status: "cleaned", observedStatus: "cleaned", agent: { state: "closed" } },
 ];
 
@@ -32,7 +34,7 @@ function commandFixture() {
 test("default crew view keeps active and actionable tasks, including a missing active agent", () => {
   assert.deepEqual(
     currentCrewTasks(tasks).map((task) => task.id),
-    ["running", "blocked", "report-ready", "candidate", "missing-active"],
+    ["running", "blocked", "report-ready", "candidate", "missing-active", "abandon-pending"],
   );
 });
 
@@ -42,7 +44,8 @@ test("/crew hides terminal durable tasks by default", async () => {
 
   const lines = fixture.widgets[0][1].join("\n");
   assert.match(lines, /missing-active/);
-  assert.doesNotMatch(lines, /missing-collected|integrated|cleaned/);
+  assert.match(lines, /abandon-pending/);
+  assert.doesNotMatch(lines, /missing-collected|integrated|abandoned|cleaned/);
   assert.deepEqual(fixture.widgets[0][2], { placement: "belowEditor" });
 });
 
