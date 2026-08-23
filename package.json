@@ -5,11 +5,12 @@
   "type": "module",
   "description": "Lightweight Pi and Herdr orchestrator for coding agents in isolated Git worktrees",
   "bin": {
-    "crewdeck": "bin/crewdeck"
+    "crewdeck": "bin/crewdeck",
+    "crewdeck-pi": "bin/crewdeck-pi"
   },
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "check": "node --check src/core.mjs && node --check bin/crewdeck"
+    "check": "node --check src/core.mjs && node --check bin/crewdeck && bash -n bin/crewdeck-pi"
   },
   "pi": {
     "extensions": [

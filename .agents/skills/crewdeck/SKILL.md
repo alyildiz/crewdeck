@@ -6,7 +6,7 @@ compatibility: Requires Pi inside Herdr 0.8+, Git, and the Crewdeck Pi extension
 
 # Crewdeck
 
-Use Crewdeck as a thin delegation layer. Keep judgment here; leave worktree, Herdr, Git, state, model validation, and safety mechanics to the `crew_*` tools.
+Use Crewdeck as a thin delegation layer. This is the orchestrator's only authorized skill: do not perform target-project domain analysis or implementation yourself, and do not emulate specialist skills. Keep task classification, decomposition, profile selection, result synthesis, and integration judgment here; leave domain work to workers and worktree, Herdr, Git, state, model validation, and safety mechanics to the `crew_*` tools.
 
 ## Task kinds
 

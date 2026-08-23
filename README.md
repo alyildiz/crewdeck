@@ -16,6 +16,7 @@ You talk to one Pi session in this repository. Its project-local skill decides h
 - token-free TUI notification when a result arrives
 - automatic safe scout cleanup after result collection
 - sequential build rebase, verification, local fast-forward merge, and safe cleanup
+- orchestrator skill allowlist: only the project-local `crewdeck` skill
 - no push, PR creation, remote workers, forced cleanup, or background LLM polling
 
 Conflict reconciliation between two concurrently developed build branches is the next milestone and intentionally remains outside v0.2.
@@ -103,14 +104,16 @@ bin/crewdeck project add my-project /absolute/path/to/project --base main --trus
 
 `--trust` applies only to build workers. Strict scouts launch with `--no-approve`, disable discovered extensions and skills, explicitly load only Crewdeck's reporter, and still receive the project's `AGENTS.md` because Pi context files load independently of project trust.
 
-Start the orchestrator inside a Herdr pane:
+Start the orchestrator inside a Herdr pane through its dedicated launcher:
 
 ```bash
 cd /home/baris/projects/crewdeck
-pi --model <orchestrator-model> --thinking xhigh
+bin/crewdeck-pi --model <orchestrator-model> --thinking xhigh
 ```
 
-Trust Crewdeck when Pi asks, then restart or `/reload` so its extension and skill load.
+The launcher uses Pi's official `--no-skills` plus one explicit `--skill` path. Consequently, only the `crewdeck` skill is visible to the orchestrator; global skills such as `frontend-design`, `harness-creator`, or `skill-creator` cannot trigger or consume its context. Additional `--skill` arguments are refused. This restriction applies to the orchestrator only—build workers still load the target project's skills according to their own trust policy, while scouts load no discovered skills.
+
+Do not start the orchestrator with bare `pi`. Trust Crewdeck when Pi asks, then restart through `bin/crewdeck-pi` so its project extension loads.
 
 Example:
 

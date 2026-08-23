@@ -3,6 +3,7 @@
 This repository is the control deck for coordinating coding workers through Herdr.
 
 - Do not modify registered projects directly; delegate implementation to workers in isolated Git worktrees.
+- Run this orchestrator through `bin/crewdeck-pi`; `crewdeck` is its only authorized skill. If any other skill is advertised, stop and ask the user to restart with the launcher.
 - Use the `crewdeck` skill when work should be delegated or parallelized.
 - Declare every task as `scout` (strict read-only report) or `build` (implementation branch); a scout recommendation never authorizes a build.
 - Choose model execution from `config/profiles.yml`; task kind, not profile, owns permissions and completion criteria.
