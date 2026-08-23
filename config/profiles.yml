@@ -3,6 +3,12 @@ version: 1
 defaultProfile: cloud-medium
 
 profiles:
+  local-nothink:
+    provider: vllm_qwen38
+    model: qwen3.8-27b-fp8
+    thinking: off
+    allowedKinds: [scout, build]
+
   local-fast:
     provider: vllm_qwen38
     model: qwen3.8-27b-fp8

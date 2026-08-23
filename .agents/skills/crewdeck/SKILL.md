@@ -10,14 +10,16 @@ Use Crewdeck as a thin delegation layer. This is the orchestrator's only authori
 
 ## Task kinds
 
-Every task must explicitly declare one immutable kind:
+Every task must explicitly declare one immutable kind configured in `config/kinds.yml`. Read that file at intake; it owns each kind's description, lifecycle, permissions, tool allowlist, explicit skill allowlist, and cleanup policy. Skill discovery is disabled for every worker, so `skills: []` means no skills and only listed skill paths are loaded.
 
-- `scout`: strict read-only investigation. The worker receives only `read`, `grep`, `find`, `ls`, and `crew_complete`; it cannot edit files or run shell commands. Its durable result is a structured report.
-- `build`: implementation. The worker may modify and test the project, must commit, and submits a structured result bound to its exact HEAD. Its durable result is the branch plus its report.
+Kinds use one of two code-enforced lifecycle families:
 
-A profile is orthogonal to kind. Profiles in `config/profiles.yml` select provider, model, thinking level, and allowed kinds; they never grant filesystem permissions.
+- `report`: strict read-only investigation. It cannot receive write or shell tools, cannot be integrated, and submits a structured evidence-based report.
+- `change`: implementation. It may modify and test the project, must commit, and submits a structured result bound to its exact HEAD.
 
-Explicit language such as "analyze", "audit", "investigate", "explain", "do not change code", or "read-only" selects `scout`. Explicit implementation language such as "fix", "add", "implement", or "change" selects `build`. When analysis may recommend later implementation but implementation is not already unambiguous, dispatch only a scout; a recommendation is evidence, not authorization to change code.
+The default configuration provides `scout` as a report kind and `build` as a change kind. A profile is orthogonal to kind. Profiles in `config/profiles.yml` select provider, model, thinking level, and allowed kinds; they never grant filesystem permissions.
+
+Choose the best matching configured kind while respecting lifecycle authority. With the default kinds, explicit language such as "analyze", "audit", "investigate", "explain", "do not change code", or "read-only" selects `scout`; explicit implementation language such as "fix", "add", "implement", or "change" selects `build`. When analysis may recommend later implementation but implementation is not already unambiguous, dispatch only a report-lifecycle task; a recommendation is evidence, not authorization to change code.
 
 ## Intake
 
@@ -31,9 +33,9 @@ Explicit language such as "analyze", "audit", "investigate", "explain", "do not 
 
 Call `crew_spawn_batch` once for the whole independent batch. Crewdeck creates visible Herdr workspaces outside the orchestrator tree, starts each Pi process in its project worktree, and validates the configured model against Pi's effective registry.
 
-After dispatch, report the task names, kinds, profiles, and purposes. Do not poll repeatedly. The user can inspect every workspace directly in Herdr. Crewdeck displays a token-free notification when a worker submits `crew_complete`; use `crew_status` when asked or before collection/integration.
+After dispatch, report the task names, kinds, profiles, and purposes. Do not poll repeatedly. The user can inspect every workspace directly in Herdr. When a worker submits `crew_complete`, Crewdeck durably reconciles the result and necessarily wakes this orchestrator with a follow-up naming every newly ready task.
 
-Call `crew_collect_results` for ready results. It returns the durable structured reports and marks them collected. By default, collected scouts with clean, commit-free worktrees are closed and removed immediately; builders remain available through integration. A Herdr `idle` or `done` state alone is never completion evidence.
+On a `CREWDECK COMPLETION` follow-up, call `crew_status` for the named ids and then `crew_collect_results`; do not merely tell the user that workers finished. Collection acknowledges delivery. It returns the durable structured reports. Report kinds configured with `cleanup: after-collection` are closed only when clean and commit-free; change kinds remain available through integration. A Herdr `idle` or `done` state alone is never completion evidence.
 
 ## Steering
 
@@ -43,7 +45,7 @@ Use `crew_steer` for a missing requirement, a concrete correction, or later conf
 
 Development may run in parallel; integration is sequential.
 
-For each selected build task:
+For each selected change-lifecycle task:
 
 1. Collect its structured result and confirm Crewdeck reports `candidate`: the agent settled, the worktree is clean, at least one commit exists, and the reported commit matches HEAD.
 2. Call `crew_diff` and inspect the bounded commits, diffstat, and patch before merge.
@@ -51,7 +53,7 @@ For each selected build task:
 4. Present the verified outcome and meaningful risk to the user.
 5. Call `crew_merge` only when the user explicitly asks to merge. The tool independently requests interactive confirmation and performs a local fast-forward only.
 6. Integrate the next branch against the newly advanced base.
-7. Call `crew_cleanup` only after integration. It refuses dirty or unintegrated build work.
+7. Call `crew_cleanup` only after integration. It refuses dirty or unintegrated change work.
 
 Conflict reconciliation between concurrent build branches is intentionally deferred to the next Crewdeck milestone. Never bypass a current refusal with raw Git or Herdr commands.
 

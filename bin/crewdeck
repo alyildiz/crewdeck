@@ -26,9 +26,9 @@ Usage:
   crewdeck config
   crewdeck project add <name> <path> [--base <branch>] [--trust]
   crewdeck project list
-  crewdeck spawn <project> <scout|build> <id> <task> [--profile <name>]
+  crewdeck spawn <project> <kind> <id> <task> [--profile <name>]
   crewdeck status [id]
-  crewdeck collect [id ...] [--keep-scouts]
+  crewdeck collect [id ...] [--keep-reports]
   crewdeck diff <build-id>
   crewdeck prompt <id> <message> [--wait]
   crewdeck prepare <id>
@@ -50,7 +50,9 @@ try {
     case "config":
       result = await loadConfig(configPath);
       delete result.__path;
+      delete result.__kindsPath;
       delete result.__profilesPath;
+      for (const kind of Object.values(result.kinds)) delete kind.resolvedSkills;
       break;
     case "project": {
       if (args[0] === "list") {
@@ -69,7 +71,7 @@ try {
     }
     case "spawn": {
       if (!args[0] || !args[1] || !args[2] || !args[3]) {
-        throw new Error("spawn requires <project> <scout|build> <id> <task>");
+        throw new Error("spawn requires <project> <kind> <id> <task>");
       }
       result = await spawnBatch(configPath, {
         project: args[0],
@@ -84,7 +86,7 @@ try {
       result = await collectResults(
         configPath,
         args.filter((arg) => !arg.startsWith("--")),
-        { cleanupScouts: !args.includes("--keep-scouts") },
+        { cleanupReports: !args.includes("--keep-reports") && !args.includes("--keep-scouts") },
       );
       break;
     case "diff":

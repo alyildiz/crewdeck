@@ -7,6 +7,7 @@ import { Type } from "typebox";
 
 const taskId = process.env.CREWDECK_TASK_ID || "";
 const taskKind = process.env.CREWDECK_TASK_KIND || "";
+const taskLifecycle = process.env.CREWDECK_TASK_LIFECYCLE || "";
 const reportToken = process.env.CREWDECK_REPORT_TOKEN || "";
 const reportDir = process.env.CREWDECK_REPORT_DIR || "";
 
@@ -42,7 +43,10 @@ const BuildResult = Type.Object({
 
 export default function crewdeckWorkerReporter(pi: ExtensionAPI) {
   if (!/^[a-z][a-z0-9-]{0,23}$/.test(taskId)) throw new Error("Invalid CREWDECK_TASK_ID");
-  if (taskKind !== "scout" && taskKind !== "build") throw new Error("Invalid CREWDECK_TASK_KIND");
+  if (!/^[a-z][a-z0-9-]{0,31}$/.test(taskKind)) throw new Error("Invalid CREWDECK_TASK_KIND");
+  if (taskLifecycle !== "report" && taskLifecycle !== "change") {
+    throw new Error("Invalid CREWDECK_TASK_LIFECYCLE");
+  }
   if (!/^[0-9a-f]{48}$/.test(reportToken)) throw new Error("Invalid CREWDECK_REPORT_TOKEN");
   if (!path.isAbsolute(reportDir)) throw new Error("CREWDECK_REPORT_DIR must be absolute");
 
@@ -50,10 +54,10 @@ export default function crewdeckWorkerReporter(pi: ExtensionAPI) {
     name: "crew_complete",
     label: "Complete Crewdeck Task",
     description:
-      taskKind === "scout"
-        ? "Submit the final durable read-only scout report. Required exactly once before ending the task."
-        : "Submit the final durable build result with the exact committed HEAD. Required exactly once before ending the task.",
-    parameters: taskKind === "scout" ? ScoutResult : BuildResult,
+      taskLifecycle === "report"
+        ? `Submit the final durable read-only ${taskKind} report. Required exactly once before ending the task.`
+        : `Submit the final durable ${taskKind} change result with the exact committed HEAD. Required exactly once before ending the task.`,
+    parameters: taskLifecycle === "report" ? ScoutResult : BuildResult,
     async execute(_toolCallId, params) {
       const target = path.join(reportDir, `${taskId}.json`);
       await mkdir(reportDir, { recursive: true, mode: 0o700 });
@@ -68,6 +72,7 @@ export default function crewdeckWorkerReporter(pi: ExtensionAPI) {
           schemaVersion: 1,
           taskId,
           kind: taskKind,
+          lifecycle: taskLifecycle,
           token: reportToken,
           completedAt: new Date().toISOString(),
           payload: params,

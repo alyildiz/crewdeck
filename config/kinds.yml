@@ -1,0 +1,22 @@
+version: 1
+
+kinds:
+  scout:
+    lifecycle: report
+    description: Strictly read-only investigation that produces an evidence-based report
+    permissions:
+      filesystem: read-only
+      shell: false
+    tools: [read, grep, find, ls]
+    skills: []
+    cleanup: after-collection
+
+  build:
+    lifecycle: change
+    description: Implement, test, and commit an approved change for controlled Git integration
+    permissions:
+      filesystem: write
+      shell: true
+    tools: [read, grep, find, ls, bash, edit, write]
+    skills: []
+    cleanup: after-integration

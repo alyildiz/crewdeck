@@ -3,11 +3,12 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { createCompletionWakeController } from "../../../src/completion-wake.mjs";
 import {
   cleanupTask,
   collectResults,
+  getPendingResultIds,
   getStatus,
   getTaskDiff,
   loadConfig,
@@ -67,19 +68,38 @@ async function validateProfiles(params: any, ctx: any) {
 
 export default function crewdeckExtension(pi: ExtensionAPI) {
   let reportWatcher: FSWatcher | undefined;
+  let activeContext: any;
+  const completionWake = createCompletionWakeController({
+    listPending: () => getPendingResultIds(CONFIG),
+    sendFollowUp: (ready: string[]) => {
+      const noun = ready.length === 1 ? "worker has" : "workers have";
+      pi.sendUserMessage(
+        `CREWDECK COMPLETION: ${noun} submitted durable results: ${ready.join(", ")}. ` +
+          "Call crew_status, then crew_collect_results for these task ids. Inspect change-task diffs before integration.",
+        { deliverAs: "followUp" },
+      );
+    },
+    onReady: (ready: string[], pending: string[]) => {
+      activeContext?.ui.notify(`Crewdeck result ready: ${ready.join(", ")}`, "info");
+      activeContext?.ui.setStatus("crewdeck", `crewdeck: ${pending.length} result(s) ready`);
+    },
+    onError: (error: Error) => {
+      activeContext?.ui.notify(`Crewdeck wake delivery failed: ${error.message}`, "warning");
+    },
+  });
   pi.registerTool({
     name: "crew_spawn_batch",
     label: "Spawn Crew",
     description:
-      "Launch one to five Pi workers concurrently in visible Herdr worktree workspaces for a registered project. Each worker loads that project's own AGENTS.md. Use for independently actionable coding or read-only scout tasks.",
+      "Launch one to five Pi workers concurrently in visible Herdr worktree workspaces for a registered project. Kind permissions, tools, skills, lifecycle, and cleanup come from config/kinds.yml.",
     parameters: Type.Object({
       project: Type.String({ description: "Registered project name from crewdeck.json" }),
       profile: Type.Optional(Type.String({ description: "Default profile for this batch" })),
       tasks: Type.Array(
         Type.Object({
           id: Type.String({ description: "Unique lowercase task id, max 24 characters" }),
-          kind: StringEnum(["scout", "build"] as const, {
-            description: "scout is strictly read-only analysis; build may modify and commit",
+          kind: Type.String({
+            description: "Task kind configured in config/kinds.yml",
           }),
           task: Type.String({ description: "Concrete task and acceptance criteria" }),
           profile: Type.Optional(Type.String({ description: "Optional per-task profile override" })),
@@ -107,14 +127,14 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     name: "crew_collect_results",
     label: "Collect Crew Results",
     description:
-      "Collect durable structured results submitted by Crewdeck workers. By default, safely closes read-only scouts after their reports are collected; build workers remain available through integration.",
+      "Collect durable structured results submitted by Crewdeck workers. Report kinds configured for after-collection are safely closed; change kinds remain available through integration.",
     parameters: Type.Object({
       ids: Type.Optional(Type.Array(Type.String(), { maxItems: 20 })),
-      keepScouts: Type.Optional(Type.Boolean({ default: false })),
+      keepReports: Type.Optional(Type.Boolean({ default: false })),
     }),
     async execute(_id, params, _signal, _update, ctx) {
       const results = await collectResults(CONFIG, params.ids, {
-        cleanupScouts: params.keepScouts !== true,
+        cleanupReports: params.keepReports !== true,
       });
       ctx.ui.setStatus("crewdeck", "crewdeck");
       return text(results);
@@ -125,7 +145,7 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     name: "crew_diff",
     label: "Inspect Build Diff",
     description:
-      "Return bounded commits, diffstat, and patch for a Crewdeck build branch before integration. Refuses scout tasks and truncates patches above 40 KB.",
+      "Return bounded commits, diffstat, and patch for a Crewdeck change branch before integration. Refuses report tasks and truncates patches above 40 KB.",
     parameters: Type.Object({ id: Type.String() }),
     async execute(_id, params) {
       return text(await getTaskDiff(CONFIG, params.id));
@@ -208,29 +228,20 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    activeContext = ctx;
     ctx.ui.setStatus("crewdeck", "crewdeck");
     const directory = reportDirectory();
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    try {
-      const tasks = await getStatus(CONFIG);
-      const pending = tasks.filter((task) => ["report-ready", "candidate"].includes(task.observedStatus));
-      if (pending.length > 0) ctx.ui.setStatus("crewdeck", `crewdeck: ${pending.length} result(s) ready`);
-    } catch {
-      // Configuration diagnostics remain available through the tools and /crew.
-    }
-    const announced = new Set<string>();
-    reportWatcher = watch(directory, (_eventType, rawFilename) => {
-      if (!rawFilename) return;
-      const filename = String(rawFilename);
-      if (!filename.endsWith(".json") || announced.has(filename)) return;
-      announced.add(filename);
-      const id = filename.slice(0, -5);
-      ctx.ui.notify(`Crewdeck result ready: ${id}`, "info");
-      ctx.ui.setStatus("crewdeck", "crewdeck: result ready");
-    });
+    reportWatcher?.close();
+    reportWatcher = watch(directory, () => completionWake.signal());
+    // Reconcile the durable report inbox at every start so an event that arrived
+    // while Pi was stopped, or was missed by fs.watch, still wakes the orchestrator.
+    completionWake.start();
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
+    completionWake.stop();
+    activeContext = undefined;
     reportWatcher?.close();
     reportWatcher = undefined;
     ctx.ui.setStatus("crewdeck", undefined);

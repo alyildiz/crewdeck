@@ -6,15 +6,16 @@ You talk to one Pi session in this repository. Its project-local skill decides h
 
 ## v0.2 scope
 
-- explicit `scout` and `build` task kinds with different permissions and completion contracts
-- provider/model/thinking profiles in human-editable YAML
+- configurable task kinds in human-editable YAML, backed by safe `report` and `change` lifecycles
+- per-kind tool and explicit skill allowlists; skill discovery is disabled for every worker
+- provider/model/thinking profiles in a separate human-editable YAML file
 - profile validation against Pi's effective model registry
 - up to five Pi workers per batch on Herdr 0.8+
 - one visible Herdr worktree workspace per task
 - strict scouts with only `read`, `grep`, `find`, `ls`, and `crew_complete`
 - durable structured scout reports and build results outside worktrees
-- token-free TUI notification when a result arrives
-- automatic safe scout cleanup after result collection
+- durable result reconciliation plus an automatic Pi follow-up whenever a worker completes
+- automatic safe report-task cleanup after result collection when configured
 - sequential build rebase, verification, local fast-forward merge, and safe cleanup
 - orchestrator skill allowlist: only the project-local `crewdeck` skill
 - no push, PR creation, remote workers, forced cleanup, or background LLM polling
@@ -42,7 +43,7 @@ Worktrees deliberately live outside this repository. Pi loads context files from
   "maxWorkers": 5,
   "worktreeRoot": "~/.local/share/crewdeck/worktrees",
   "profilesFile": "config/profiles.yml",
-  "scoutCleanup": "after-collection",
+  "kindsFile": "config/kinds.yml",
   "projects": {
     "my-project": {
       "path": "/absolute/path/to/my-project",
@@ -53,6 +54,30 @@ Worktrees deliberately live outside this repository. Pi loads context files from
   }
 }
 ```
+
+[`config/kinds.yml`](config/kinds.yml) defines task behavior independently from model selection:
+
+```yaml
+version: 1
+kinds:
+  scout:
+    lifecycle: report
+    description: Strictly read-only investigation that produces an evidence-based report
+    permissions: { filesystem: read-only, shell: false }
+    tools: [read, grep, find, ls]
+    skills: []
+    cleanup: after-collection
+
+  build:
+    lifecycle: change
+    description: Implement, test, and commit an approved change
+    permissions: { filesystem: write, shell: true }
+    tools: [read, grep, find, ls, bash, edit, write]
+    skills: []
+    cleanup: after-integration
+```
+
+Every worker starts with `--no-skills`. A kind may opt into reviewed skills by listing file or directory paths under `skills`; relative paths resolve from the directory containing `kinds.yml` and are passed as repeatable explicit `--skill` arguments. Report lifecycles are always read-only and shell-free. Change lifecycles must allow writes and shell, include `bash` plus `edit` or `write`, and use integration-gated cleanup. Crewdeck rejects kind definitions that weaken these invariants.
 
 [`config/profiles.yml`](config/profiles.yml) maps friendly profile names to Pi's canonical provider plus model id:
 
@@ -75,9 +100,9 @@ profiles:
 
 Crewdeck launches `provider/model`, for example `vllm_qwen38/qwen3.8-27b-fp8`. Pi's effective model registry is the runtime authority; a model may originate from `~/.pi/agent/models.json`, a built-in provider, or an extension. Crewdeck refuses unavailable models and profile/kind mismatches instead of silently falling back.
 
-A profile selects model execution only. Task kind owns permissions: allowing a profile for `scout` never gives that scout write tools.
+A profile selects model execution only. The kind owns permissions: listing a report kind in `allowedKinds` never grants it write or shell tools.
 
-Set `scoutCleanup` to `manual` to preserve collected scouts until explicit cleanup; the default `after-collection` closes only a clean scout with a valid durable report and no commits.
+Set a report kind's `cleanup` to `manual` to preserve collected workers until explicit cleanup. `after-collection` closes only a clean report task with a valid durable result and no commits.
 
 ## Setup
 
@@ -102,7 +127,7 @@ Register another project:
 bin/crewdeck project add my-project /absolute/path/to/project --base main --trust
 ```
 
-`--trust` applies only to build workers. Strict scouts launch with `--no-approve`, disable discovered extensions and skills, explicitly load only Crewdeck's reporter, and still receive the project's `AGENTS.md` because Pi context files load independently of project trust.
+`--trust` applies only to change-lifecycle workers. Report workers launch with `--no-approve`. All workers disable discovered extensions and skills, explicitly load Crewdeck's reporter plus only the skills listed by their kind, and still receive the project's `AGENTS.md` because Pi context files load independently of project trust.
 
 Start the orchestrator inside a Herdr pane through its dedicated launcher:
 
@@ -111,7 +136,7 @@ cd /home/baris/projects/crewdeck
 bin/crewdeck-pi --model <orchestrator-model> --thinking xhigh
 ```
 
-The launcher uses Pi's official `--no-skills` plus one explicit `--skill` path. Consequently, only the `crewdeck` skill is visible to the orchestrator; global skills such as `frontend-design`, `harness-creator`, or `skill-creator` cannot trigger or consume its context. Additional `--skill` arguments are refused. This restriction applies to the orchestrator only—build workers still load the target project's skills according to their own trust policy, while scouts load no discovered skills.
+The launcher uses Pi's official `--no-skills` plus one explicit `--skill` path. Consequently, only the `crewdeck` skill is visible to the orchestrator; global skills such as `frontend-design`, `harness-creator`, or `skill-creator` cannot trigger or consume its context. Additional `--skill` arguments are refused. Workers also disable skill discovery, but each kind may explicitly allow reviewed skill paths in `config/kinds.yml`.
 
 Do not start the orchestrator with bare `pi`. Trust Crewdeck when Pi asks, then restart through `bin/crewdeck-pi` so its project extension loads.
 
@@ -121,11 +146,13 @@ Example:
 On my-project, use local-fast to analyze the pricing page without changing code, and use cloud-medium to build the already-approved expiration test.
 ```
 
-Use `/crew` to display current workers without an LLM turn and `/crew clear` to hide the widget. Result files trigger a TUI notification without waking the LLM.
+Use `/crew` to display current workers without an LLM turn and `/crew clear` to hide the widget. When `crew_complete` stores a result, the orchestrator extension reconciles all durable uncollected reports, groups nearby completions, and calls `pi.sendUserMessage(..., { deliverAs: "followUp" })`. This necessarily wakes the orchestrator so it can inspect status and collect the named results. The same reconciliation runs at session start, so results produced while Pi was stopped or missed by `fs.watch` are delivered at least once; collection is the acknowledgement.
 
 ## Task contracts
 
-### Scout
+The default kinds map to these two lifecycle contracts.
+
+### Scout (`report` lifecycle)
 
 ```text
 running → report-ready → report-collected → cleaned
@@ -133,7 +160,7 @@ running → report-ready → report-collected → cleaned
 
 A scout cannot call `write`, `edit`, or `bash`. It must submit `crew_complete` with conclusion, findings, file/line evidence, recommendations, and open questions. Collecting the durable report normally closes and removes the clean scout immediately.
 
-### Build
+### Build (`change` lifecycle)
 
 ```text
 running → candidate → ready → integrated → cleaned
@@ -149,6 +176,7 @@ bin/crewdeck spawn my-project scout pricing-analysis "Analyze column Z without c
 bin/crewdeck spawn my-project build pricing-fix "Fix the price shown in column Z" --profile cloud-medium
 bin/crewdeck status
 bin/crewdeck collect pricing-analysis
+# Add --keep-reports to preserve an auto-cleanup report kind
 bin/crewdeck diff pricing-fix
 bin/crewdeck prepare pricing-fix
 bin/crewdeck merge pricing-fix --confirm

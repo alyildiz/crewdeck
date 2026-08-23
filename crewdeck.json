@@ -2,13 +2,28 @@
   "maxWorkers": 5,
   "worktreeRoot": "~/.local/share/crewdeck/worktrees",
   "profilesFile": "config/profiles.yml",
-  "scoutCleanup": "after-collection",
+  "kindsFile": "config/kinds.yml",
   "projects": {
     "crewdeck": {
       "path": "/home/baris/projects/crewdeck",
       "base": "main",
       "trustProjectResources": true,
-      "verify": ["npm test", "npm run check"]
+      "verify": [
+        "npm test",
+        "npm run check"
+      ]
+    },
+    "relai": {
+      "path": "/home/baris/projects/relai",
+      "base": "main",
+      "trustProjectResources": true,
+      "verify": []
+    },
+    "club-3090": {
+      "path": "/home/baris/projects/club-3090",
+      "base": "master",
+      "trustProjectResources": true,
+      "verify": []
     }
   }
 }

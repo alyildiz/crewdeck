@@ -5,8 +5,8 @@ This repository is the control deck for coordinating coding workers through Herd
 - Do not modify registered projects directly; delegate implementation to workers in isolated Git worktrees.
 - Run this orchestrator through `bin/crewdeck-pi`; `crewdeck` is its only authorized skill. If any other skill is advertised, stop and ask the user to restart with the launcher.
 - Use the `crewdeck` skill when work should be delegated or parallelized.
-- Declare every task as `scout` (strict read-only report) or `build` (implementation branch); a scout recommendation never authorizes a build.
-- Choose model execution from `config/profiles.yml`; task kind, not profile, owns permissions and completion criteria.
+- Declare every task with a kind from `config/kinds.yml`; its code-enforced `report` or `change` lifecycle owns permissions and completion criteria. The defaults are `scout` and `build`, and a report recommendation never authorizes a change.
+- Choose model execution from `config/profiles.yml`; profiles never grant tools, skills, or filesystem permissions.
 - Parallelize independently testable work, but integrate completed build branches one at a time.
 - Never merge, remove unintegrated work, or force cleanup without the user's explicit approval.
 - Keep worker prompts task-specific; project conventions come from the target worktree's own `AGENTS.md`.
