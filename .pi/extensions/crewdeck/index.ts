@@ -23,7 +23,8 @@ function taskLines(tasks: any[]) {
   return tasks.map((task) => {
     const live = task.agent?.state || "unknown";
     const ahead = task.git?.available ? `${task.git.ahead} commit(s)` : "git unavailable";
-    return `${task.id.padEnd(24)} ${task.status.padEnd(20)} agent=${live.padEnd(8)} ${ahead}`;
+    const status = task.observedStatus || task.status;
+    return `${task.id.padEnd(24)} ${status.padEnd(20)} agent=${live.padEnd(8)} ${ahead}`;
   });
 }
 

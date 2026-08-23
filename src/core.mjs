@@ -218,7 +218,51 @@ async function startAgentWhenShellReady(name, paneId, piArgs) {
   }
 }
 
-async function createOne(config, project, task, profileName) {
+async function ensureProjectWorkspace(project) {
+  const listed = await runJson("herdr", ["workspace", "list"], { timeout: 10_000 });
+  const workspaces = listed?.result?.workspaces || [];
+  const matches = [];
+  for (const workspace of workspaces) {
+    const checkoutMatches =
+      workspace.worktree?.is_linked_worktree === false &&
+      path.resolve(workspace.worktree?.checkout_path || "") === project.path;
+    let paneMatches = false;
+    if (!checkoutMatches) {
+      try {
+        const listedPanes = await runJson("herdr", ["pane", "list", "--workspace", workspace.workspace_id], {
+          timeout: 10_000,
+        });
+        paneMatches = (listedPanes?.result?.panes || []).some(
+          (pane) => path.resolve(pane.cwd || "") === project.path,
+        );
+      } catch {
+        // An unreadable workspace is not safe source authority.
+      }
+    }
+    if (checkoutMatches || paneMatches) matches.push(workspace);
+  }
+  if (matches.length > 1) {
+    throw new CrewdeckError(`Several Herdr workspaces represent ${project.path}`, "ambiguous_project_workspace");
+  }
+  if (matches.length === 1) {
+    return { id: matches[0].workspace_id, owned: matches[0].label === `project:${project.name}` };
+  }
+
+  const created = await runJson("herdr", [
+    "workspace",
+    "create",
+    "--cwd",
+    project.path,
+    "--label",
+    `project:${project.name}`,
+    "--no-focus",
+  ]);
+  const id = created?.result?.workspace?.workspace_id;
+  if (!id) throw new CrewdeckError("Herdr did not return a project workspace id", "invalid_herdr_response");
+  return { id, owned: true };
+}
+
+async function createOne(config, project, sourceWorkspace, task, profileName) {
   validateTaskInput(task);
   const profile = config.profiles[task.profile || profileName || config.defaultProfile];
   if (!profile) throw new CrewdeckError(`Unknown profile '${task.profile || profileName}'`, "unknown_profile");
@@ -243,8 +287,8 @@ async function createOne(config, project, task, profileName) {
   const created = await runJson("herdr", [
     "worktree",
     "create",
-    "--cwd",
-    project.path,
+    "--workspace",
+    sourceWorkspace.id,
     "--branch",
     branch,
     "--base",
@@ -274,6 +318,8 @@ async function createOne(config, project, task, profileName) {
     workspaceId,
     paneId,
     agentName: name,
+    sourceWorkspaceId: sourceWorkspace.id,
+    sourceWorkspaceOwned: sourceWorkspace.owned,
     createdAt: new Date().toISOString(),
   };
   await withStateLock(async () => {
@@ -284,7 +330,7 @@ async function createOne(config, project, task, profileName) {
 
   const piArgs = ["--model", profile.model, "--thinking", profile.thinking, "--name", `crew:${task.id}`];
   if (project.trustProjectResources === true) piArgs.push("--approve");
-  if (profile.readOnly === true) piArgs.push("--tools", "read,grep,find,ls,bash");
+  if (profile.readOnly === true) piArgs.push("--tools", "read,grep,find,ls");
 
   try {
     await startAgentWhenShellReady(name, paneId, piArgs);
@@ -322,9 +368,12 @@ export async function spawnBatch(configPath, { project: projectName, tasks, prof
   tasks.forEach(validateTaskInput);
   const project = resolveProject(config, projectName);
   await validateProject(project);
+  const sourceWorkspace = await ensureProjectWorkspace(project);
 
-  // Herdr creates each visible worktree workspace first; agent startups then happen concurrently.
-  const results = await Promise.allSettled(tasks.map((task) => createOne(config, project, task, profile)));
+  // Each task receives its own worktree workspace; independent Pi startups happen concurrently.
+  const results = await Promise.allSettled(
+    tasks.map((task) => createOne(config, project, sourceWorkspace, task, profile)),
+  );
   return results.map((result, index) =>
     result.status === "fulfilled"
       ? { ok: true, ...result.value }
@@ -360,7 +409,29 @@ export async function getStatus(configPath, id) {
   const records = id ? [state.tasks[id]].filter(Boolean) : Object.values(state.tasks);
   if (id && records.length === 0) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
   return Promise.all(
-    records.map(async (record) => ({ ...record, agent: await liveAgent(record), git: await gitSnapshot(record) })),
+    records.map(async (record) => {
+      if (record.status === "cleaned") {
+        return {
+          ...record,
+          observedStatus: "cleaned",
+          agent: { available: false, state: "closed" },
+          git: { available: false, state: "worktree-removed" },
+        };
+      }
+      const [agent, snapshot] = await Promise.all([liveAgent(record), gitSnapshot(record)]);
+      let observedStatus = record.status;
+      if (record.status === "running" && agent.state === "blocked") observedStatus = "blocked";
+      if (
+        record.status === "running" &&
+        ["idle", "done"].includes(agent.state) &&
+        snapshot.available &&
+        snapshot.clean &&
+        snapshot.ahead > 0
+      ) {
+        observedStatus = "ready-to-prepare";
+      }
+      return { ...record, observedStatus, agent, git: snapshot };
+    }),
   );
 }
 
@@ -487,11 +558,27 @@ export async function cleanupTask(configPath, id) {
   }
   record.status = "cleaned";
   record.cleanedAt = new Date().toISOString();
+  let closeOwnedSource = false;
   await withStateLock(async () => {
     const next = await loadState();
     next.tasks[id] = record;
+    closeOwnedSource =
+      record.sourceWorkspaceOwned === true &&
+      !Object.values(next.tasks).some(
+        (other) =>
+          other.id !== id &&
+          other.sourceWorkspaceId === record.sourceWorkspaceId &&
+          other.status !== "cleaned",
+      );
     await saveState(next);
   });
+  if (closeOwnedSource) {
+    try {
+      await runJson("herdr", ["workspace", "close", record.sourceWorkspaceId], { timeout: 15_000 });
+    } catch {
+      // Cleanup is complete; preserving an unexpected source workspace is safer than forcing it closed.
+    }
+  }
   return record;
 }
 

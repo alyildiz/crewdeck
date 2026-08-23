@@ -4,7 +4,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { addProject, CrewdeckError, loadConfig } from "../src/core.mjs";
+import { addProject, CrewdeckError, loadConfig, spawnBatch } from "../src/core.mjs";
 
 function git(cwd, ...args) {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
@@ -53,6 +53,32 @@ test("registers a Git project with explicit trust", async () => {
   });
   const persisted = JSON.parse(await readFile(configPath, "utf8"));
   assert.equal(persisted.projects.demo.path, repo);
+});
+
+test("rejects batches above the configured concurrency cap before mutation", async () => {
+  const { configPath } = await fixture();
+  const previous = process.env.HERDR_ENV;
+  process.env.HERDR_ENV = "1";
+  try {
+    await assert.rejects(
+      () =>
+        spawnBatch(configPath, {
+          project: "missing",
+          tasks: Array.from({ length: 6 }, (_, index) => ({
+            id: `task-${index}`,
+            task: `Perform independent test task number ${index}`,
+          })),
+        }),
+      (error) => {
+        assert.ok(error instanceof CrewdeckError);
+        assert.equal(error.code, "invalid_batch");
+        return true;
+      },
+    );
+  } finally {
+    if (previous === undefined) delete process.env.HERDR_ENV;
+    else process.env.HERDR_ENV = previous;
+  }
 });
 
 test("rejects invalid worker thinking levels", async () => {
