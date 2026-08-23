@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createCompletionWakeController } from "../../../src/completion-wake.mjs";
+import { createCrewCommand } from "../../../src/crew-view.mjs";
 import {
   cleanupTask,
   collectResults,
@@ -24,16 +25,6 @@ const CONFIG = process.env.CREWDECK_CONFIG || path.join(ROOT, "crewdeck.json");
 
 function text(value: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }], details: value };
-}
-
-function taskLines(tasks: any[]) {
-  if (tasks.length === 0) return ["Crewdeck: no recorded tasks"];
-  return tasks.map((task) => {
-    const live = task.agent?.state || "unknown";
-    const ahead = task.git?.available ? `${task.git.ahead} commit(s)` : "git unavailable";
-    const status = task.observedStatus || task.status;
-    return `${task.id.padEnd(24)} ${status.padEnd(20)} agent=${live.padEnd(8)} ${ahead}`;
-  });
 }
 
 async function validateProfiles(params: any, ctx: any) {
@@ -211,21 +202,7 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("crew", {
-    description: "Show Crewdeck workers without spending an LLM turn; use '/crew clear' to hide",
-    handler: async (args, ctx) => {
-      if (args.trim() === "clear") {
-        ctx.ui.setWidget("crewdeck", undefined);
-        return;
-      }
-      try {
-        const tasks = await getStatus(CONFIG);
-        ctx.ui.setWidget("crewdeck", taskLines(tasks), { placement: "belowEditor" });
-      } catch (error: any) {
-        ctx.ui.notify(error.message, "error");
-      }
-    },
-  });
+  pi.registerCommand("crew", createCrewCommand(() => getStatus(CONFIG)));
 
   pi.on("session_start", async (_event, ctx) => {
     activeContext = ctx;

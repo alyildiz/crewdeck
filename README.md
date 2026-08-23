@@ -146,7 +146,7 @@ Example:
 On my-project, use local-fast to analyze the pricing page without changing code, and use cloud-medium to build the already-approved expiration test.
 ```
 
-Use `/crew` to display current workers without an LLM turn and `/crew clear` to hide the widget. When `crew_complete` stores a result, the orchestrator extension reconciles all durable uncollected reports, groups nearby completions, and calls `pi.sendUserMessage(..., { deliverAs: "followUp" })`. This necessarily wakes the orchestrator so it can inspect status and collect the named results. The same reconciliation runs at session start, so results produced while Pi was stopped or missed by `fs.watch` are delivered at least once; collection is the acknowledgement.
+Use `/crew` to display active or actionable workers without an LLM turn, `/crew all` to display the complete durable task history, and `/crew clear` to hide the widget. The default view hides terminal `report-collected`, `integrated`, and `cleaned` tasks; a missing Herdr agent remains visible when its task is not terminal. When `crew_complete` stores a result, the orchestrator extension reconciles all durable uncollected reports, groups nearby completions, and calls `pi.sendUserMessage(..., { deliverAs: "followUp" })`. This necessarily wakes the orchestrator so it can inspect status and collect the named results. The same reconciliation runs at session start, so results produced while Pi was stopped or missed by `fs.watch` are delivered at least once; collection is the acknowledgement.
 
 ## Task contracts
 
