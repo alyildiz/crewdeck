@@ -189,6 +189,35 @@ function workerPrompt(task, project, profile) {
   ].join("\n\n");
 }
 
+async function startAgentWhenShellReady(name, paneId, piArgs) {
+  const deadline = Date.now() + 15_000;
+  while (true) {
+    try {
+      return await run(
+        "herdr",
+        [
+          "agent",
+          "start",
+          name,
+          "--kind",
+          "pi",
+          "--pane",
+          paneId,
+          "--timeout",
+          "120000",
+          "--",
+          ...piArgs,
+        ],
+        { timeout: 130_000 },
+      );
+    } catch (error) {
+      const shellStarting = error instanceof CrewdeckError && error.message.includes("agent_pane_busy");
+      if (!shellStarting || Date.now() >= deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+}
+
 async function createOne(config, project, task, profileName) {
   validateTaskInput(task);
   const profile = config.profiles[task.profile || profileName || config.defaultProfile];
@@ -258,19 +287,7 @@ async function createOne(config, project, task, profileName) {
   if (profile.readOnly === true) piArgs.push("--tools", "read,grep,find,ls,bash");
 
   try {
-    await run("herdr", [
-      "agent",
-      "start",
-      name,
-      "--kind",
-      "pi",
-      "--pane",
-      paneId,
-      "--timeout",
-      "120000",
-      "--",
-      ...piArgs,
-    ], { timeout: 130_000 });
+    await startAgentWhenShellReady(name, paneId, piArgs);
     await run("herdr", ["agent", "prompt", name, workerPrompt(task, project, profile)], { timeout: 15_000 });
     record.status = "running";
     record.startedAt = new Date().toISOString();
