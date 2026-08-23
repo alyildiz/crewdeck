@@ -658,6 +658,20 @@ async function liveAgent(record) {
   }
 }
 
+async function missingWorkspace(record) {
+  try {
+    await runJson("herdr", ["workspace", "get", record.workspaceId], { timeout: 10_000 });
+    return false;
+  } catch (error) {
+    if (/workspace_not_found|workspace[^\n]*not found|not found[^\n]*workspace/i.test(error.message)) return true;
+    throw new CrewdeckError(
+      "Cannot prove that the Herdr workspace is absent; reconciliation is refused",
+      "workspace_state_unknown",
+      { error: error.message },
+    );
+  }
+}
+
 async function gitSnapshot(record) {
   try {
     const status = (await git(record.worktree, ["status", "--porcelain"])).stdout;
@@ -684,14 +698,20 @@ export async function getStatus(configPath, id) {
       record.lifecycle ||= config.kinds[record.kind]?.lifecycle || (record.kind === "scout" ? "report" : "change");
       record.cleanup ||= config.kinds[record.kind]?.cleanup ||
         (record.lifecycle === "report" ? "after-collection" : "after-integration");
-      if (record.status === "cleaned" || (record.status === "abandoned" && record.cleanedAt)) {
+      if (
+        record.status === "cleaned" ||
+        record.status === "orphan-reconciled" ||
+        (record.status === "abandoned" && record.cleanedAt)
+      ) {
         const terminal = {
           ...publicTaskRecord(record),
           observedStatus: record.status,
           agent: { available: false, state: "closed" },
           git: { available: false, state: "worktree-removed" },
         };
-        if (record.status === "abandoned") terminal.result = publicTaskReport(await readTaskReport(record));
+        if (["abandoned", "orphan-reconciled"].includes(record.status)) {
+          terminal.result = publicTaskReport(await readTaskReport(record));
+        }
         return terminal;
       }
       const [agent, snapshot, result] = await Promise.all([
@@ -979,6 +999,120 @@ export async function abandonTask(configPath, id, { reason } = {}) {
   return cleanupTask(configPath, id);
 }
 
+export async function reconcileOrphanReport(configPath, id, { reason } = {}) {
+  const config = await loadConfig(configPath);
+  const state = await loadState();
+  const record = state.tasks[id];
+  if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
+  record.kind ||= record.profile === "scout" ? "scout" : "build";
+  record.lifecycle ||= config.kinds[record.kind]?.lifecycle || (record.kind === "scout" ? "report" : "change");
+  record.cleanup ||= config.kinds[record.kind]?.cleanup ||
+    (record.lifecycle === "report" ? "after-collection" : "after-integration");
+  if (record.lifecycle !== "report") {
+    throw new CrewdeckError("Only report tasks can use orphan reconciliation; use abandonment for changes", "report_task_required");
+  }
+  if (record.status === "orphan-reconciled") {
+    throw new CrewdeckError("Task orphan resources were already reconciled", "already_reconciled");
+  }
+  if (record.status === "cleaned" || record.cleanedAt) {
+    throw new CrewdeckError("Cleaned tasks cannot be reconciled as orphans", "already_cleaned");
+  }
+  if (!["starting", "running"].includes(record.status)) {
+    throw new CrewdeckError(`Report task status '${record.status}' is not eligible for orphan reconciliation`, "invalid_orphan_state");
+  }
+  if (typeof reason !== "string" || !reason.trim()) {
+    throw new CrewdeckError("Orphan reconciliation requires a non-empty durable reason", "invalid_reason");
+  }
+  const project = resolveProject(config, record.project);
+  if (
+    record.branch !== `crew/${id}` ||
+    path.resolve(record.worktree) !== path.join(config.worktreeRoot, record.project, id) ||
+    path.resolve(record.repo) !== project.path
+  ) {
+    throw new CrewdeckError("Task does not reference its expected isolated resources", "unsafe_task_resources");
+  }
+
+  const agent = await liveAgent(record);
+  if (agent.available) {
+    throw new CrewdeckError("The Herdr agent still exists; orphan reconciliation requires absent resources", "orphan_resources_present", { agent });
+  }
+  if (!(await missingWorkspace(record))) {
+    throw new CrewdeckError("The Herdr workspace still exists; use normal collection or cleanup", "orphan_resources_present");
+  }
+
+  try {
+    await stat(record.worktree);
+    const snapshot = await gitSnapshot(record);
+    if (snapshot.available && !snapshot.clean) {
+      throw new CrewdeckError("Worktree is dirty; reconciliation never discards uncommitted data", "dirty_worktree", snapshot);
+    }
+    throw new CrewdeckError("The Git worktree still exists; use normal collection or cleanup", "orphan_resources_present", snapshot);
+  } catch (error) {
+    if (error instanceof CrewdeckError) throw error;
+    if (error.code !== "ENOENT") {
+      throw new CrewdeckError("Cannot prove that the Git worktree is absent", "worktree_state_unknown", { error: error.message });
+    }
+  }
+
+  const baseHead = (await git(record.repo, ["rev-parse", record.base])).stdout;
+  const branchExists = (await git(record.repo, [
+    "branch", "--list", record.branch, "--format=%(refname)",
+  ])).stdout === `refs/heads/${record.branch}`;
+  if (branchExists) {
+    const ahead = Number((await git(record.repo, ["rev-list", "--count", `${record.base}..${record.branch}`])).stdout);
+    if (ahead > 0) {
+      throw new CrewdeckError(
+        "The report branch contains commits not integrated into base; reconciliation refuses to discard them",
+        "unintegrated_branch",
+        { branch: record.branch, ahead },
+      );
+    }
+  }
+
+  const worktrees = (await git(record.repo, ["worktree", "list", "--porcelain"])).stdout
+    .split(/\n\n+/)
+    .filter(Boolean)
+    .map((block) => Object.fromEntries(block.split("\n").map((line) => {
+      const space = line.indexOf(" ");
+      return space < 0 ? [line, true] : [line.slice(0, space), line.slice(space + 1)];
+    })));
+  const branchRef = `refs/heads/${record.branch}`;
+  const unexpectedCheckout = worktrees.find(
+    (item) => item.branch === branchRef && path.resolve(item.worktree) !== path.resolve(record.worktree),
+  );
+  if (unexpectedCheckout) {
+    throw new CrewdeckError("The residual branch is checked out in another worktree", "orphan_resources_present", unexpectedCheckout);
+  }
+  const staleRegistration = worktrees.find((item) => path.resolve(item.worktree) === path.resolve(record.worktree));
+  if (staleRegistration) {
+    if (staleRegistration.branch !== branchRef) {
+      throw new CrewdeckError("Stale worktree metadata references an unexpected branch", "unsafe_git_metadata", staleRegistration);
+    }
+    await git(record.repo, ["worktree", "remove", "--force", record.worktree]);
+  }
+  if (branchExists) await git(record.repo, ["branch", "-d", record.branch]);
+  const finalBaseHead = (await git(record.repo, ["rev-parse", record.base])).stdout;
+  if (finalBaseHead !== baseHead) {
+    throw new CrewdeckError("Base branch changed concurrently during orphan reconciliation", "base_changed");
+  }
+
+  const previousStatus = record.status;
+  record.status = "orphan-reconciled";
+  record.orphanReconciledFromStatus = previousStatus;
+  record.orphanReconciledAt = new Date().toISOString();
+  record.orphanReconciliationReason = reason.trim();
+  delete record.error;
+  await withStateLock(async () => {
+    const next = await loadState();
+    if (next.tasks[id]?.status !== previousStatus) {
+      throw new CrewdeckError("Task state changed during orphan reconciliation", "state_changed");
+    }
+    next.tasks[id] = record;
+    await saveState(next);
+  });
+  return publicTaskRecord(record);
+}
+
 export async function mergeTask(configPath, id) {
   const config = await loadConfig(configPath);
   const state = await loadState();
@@ -1019,6 +1153,9 @@ export async function cleanupTask(configPath, id) {
     (record.lifecycle === "report" ? "after-collection" : "after-integration");
   if (record.status === "cleaned" || record.cleanedAt) {
     throw new CrewdeckError("Task is already cleaned", "already_cleaned");
+  }
+  if (record.status === "orphan-reconciled") {
+    throw new CrewdeckError("Orphan reconciliation is already complete", "already_reconciled");
   }
   if (record.lifecycle === "change" && !["integrated", "abandoned"].includes(record.status)) {
     throw new CrewdeckError("Change tasks can be cleaned only after integration or explicit abandonment", "not_integrated");

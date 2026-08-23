@@ -12,6 +12,7 @@ const tasks = [
   { id: "integrated", status: "integrated", observedStatus: "integrated", agent: { state: "idle" } },
   { id: "abandon-pending", status: "abandoned", observedStatus: "abandon-cleanup-pending", agent: { state: "missing" } },
   { id: "abandoned", status: "abandoned", observedStatus: "abandoned", agent: { state: "closed" } },
+  { id: "orphan-reconciled", status: "orphan-reconciled", observedStatus: "orphan-reconciled", agent: { state: "closed" } },
   { id: "cleaned", status: "cleaned", observedStatus: "cleaned", agent: { state: "closed" } },
 ];
 
@@ -45,7 +46,7 @@ test("/crew hides terminal durable tasks by default", async () => {
   const lines = fixture.widgets[0][1].join("\n");
   assert.match(lines, /missing-active/);
   assert.match(lines, /abandon-pending/);
-  assert.doesNotMatch(lines, /missing-collected|integrated|abandoned|cleaned/);
+  assert.doesNotMatch(lines, /missing-collected|integrated|abandoned|orphan-reconciled|cleaned/);
   assert.deepEqual(fixture.widgets[0][2], { placement: "belowEditor" });
 });
 

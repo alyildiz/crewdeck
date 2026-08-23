@@ -17,6 +17,7 @@ import {
   mergeTask,
   prepareIntegration,
   promptTask,
+  reconcileOrphanReport,
   reportDirectory,
   spawnBatch,
 } from "../../../src/core.mjs";
@@ -203,6 +204,26 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
       );
       if (!confirmed) return text({ abandoned: false, reason: "user declined" });
       return text(await abandonTask(CONFIG, params.id, { reason: params.reason }));
+    },
+  });
+
+  pi.registerTool({
+    name: "crew_reconcile_orphan_report",
+    label: "Reconcile Orphan Report",
+    description:
+      "Explicitly finalize a report task only after its Herdr workspace and Git worktree were manually removed. Requires a durable reason and independent confirmation, preserves reports/history, refuses surviving resources, dirty worktrees, unintegrated commits, change tasks, and uncertain absence, and never changes base or pushes.",
+    parameters: Type.Object({
+      id: Type.String(),
+      reason: Type.String({ description: "Durable reason the report resources were removed outside Crewdeck" }),
+    }),
+    async execute(_id, params, _signal, _update, ctx) {
+      if (!ctx.hasUI) throw new Error("crew_reconcile_orphan_report requires interactive confirmation");
+      const confirmed = await ctx.ui.confirm(
+        "Reconcile orphaned report task?",
+        `Confirm that task '${params.id}' is a report whose Herdr workspace and Git worktree were already removed manually. Crewdeck will preserve its report/history and remove only safe residual Git metadata and a commit-free branch. Reason: ${params.reason}`,
+      );
+      if (!confirmed) return text({ reconciled: false, reason: "user declined" });
+      return text(await reconcileOrphanReport(CONFIG, params.id, { reason: params.reason }));
     },
   });
 

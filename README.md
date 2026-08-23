@@ -17,6 +17,7 @@ You talk to one Pi session in this repository. Its project-local skill decides h
 - durable result reconciliation plus an automatic Pi follow-up whenever a worker completes
 - automatic safe report-task cleanup after result collection when configured
 - sequential build rebase, verification, local fast-forward merge, safe cleanup, and explicit abandonment of obsolete unintegrated changes
+- explicitly confirmed reconciliation of report tasks whose Herdr workspace and Git worktree were already removed manually
 - orchestrator skill allowlist: only the project-local `crewdeck` skill
 - no push, PR creation, remote workers, dirty-worktree deletion, or background LLM polling
 
@@ -146,7 +147,7 @@ Example:
 On my-project, use local-fast to analyze the pricing page without changing code, and use cloud-medium to build the already-approved expiration test.
 ```
 
-Use `/crew` to display active or actionable workers without an LLM turn, `/crew all` to display the complete durable task history, and `/crew clear` to hide the widget. The default view hides terminal `report-collected`, `integrated`, completed `abandoned`, and `cleaned` tasks; `/crew all` retains them. An interrupted abandonment remains visible as `abandon-cleanup-pending`, and a missing Herdr agent remains visible when its task is not terminal. When `crew_complete` stores a result, the orchestrator extension reconciles all durable uncollected reports, groups nearby completions, and calls `pi.sendUserMessage(..., { deliverAs: "followUp" })`. This necessarily wakes the orchestrator so it can inspect status and collect the named results. The same reconciliation runs at session start, so results produced while Pi was stopped or missed by `fs.watch` are delivered at least once; collection is the acknowledgement.
+Use `/crew` to display active or actionable workers without an LLM turn, `/crew all` to display the complete durable task history, and `/crew clear` to hide the widget. The default view hides terminal `report-collected`, `orphan-reconciled`, `integrated`, completed `abandoned`, and `cleaned` tasks; `/crew all` retains them. An interrupted abandonment remains visible as `abandon-cleanup-pending`, and a missing Herdr agent remains visible when its task is not terminal. When `crew_complete` stores a result, the orchestrator extension reconciles all durable uncollected reports, groups nearby completions, and calls `pi.sendUserMessage(..., { deliverAs: "followUp" })`. This necessarily wakes the orchestrator so it can inspect status and collect the named results. The same reconciliation runs at session start, so results produced while Pi was stopped or missed by `fs.watch` are delivered at least once; collection is the acknowledgement.
 
 ## Task contracts
 
@@ -159,6 +160,16 @@ running → report-ready → report-collected → cleaned
 ```
 
 A scout cannot call `write`, `edit`, or `bash`. It must submit `crew_complete` with conclusion, findings, file/line evidence, recommendations, and open questions. Collecting the durable report normally closes and removes the clean scout immediately.
+
+If someone has already removed a report task's Herdr workspace and Git worktree manually, normal cleanup can no longer finish. The dedicated `reconcile-orphan` operation provides an explicit recovery transition:
+
+```text
+starting/running (including report-collected) → orphan-reconciled
+```
+
+This transition is never inferred from missing resources. It requires separate confirmation and a non-empty durable reason, accepts report lifecycles only, and proves that the agent, workspace, and worktree are absent. It refuses uncertain Herdr state, any surviving workspace/agent/worktree, dirty worktrees, unexpected resource paths, and branches with commits not integrated into base. It removes only stale metadata and a safely deletable isolated report branch; it does not close other resources, modify base, or push. Existing durable reports, collection timestamps, and task history are retained. Repeating the operation returns `already_reconciled`. The terminal task disappears from `/crew` and remains in `/crew all`.
+
+Use this recovery for a `report-collected` task when automatic cleanup previously failed with `workspace_not_found`; do not edit `state.json` or use it for change tasks. Change tasks continue to use the separately controlled abandonment lifecycle below.
 
 ### Build (`change` lifecycle)
 
@@ -185,7 +196,9 @@ bin/crewdeck prepare pricing-fix
 bin/crewdeck merge pricing-fix --confirm
 # For a superseded, clean change that must not be integrated:
 bin/crewdeck abandon obsolete-fix --confirm --reason "superseded by pricing-fix"
+# Only when a report workspace and worktree were already removed outside Crewdeck:
+bin/crewdeck reconcile-orphan old-report --confirm --reason "manual removal during maintenance"
 bin/crewdeck cleanup pricing-fix --confirm
 ```
 
-The CLI's `--confirm` is intended for a human at a shell. The Pi extension independently displays separate interactive confirmations before build merge, abandonment, and manual cleanup.
+The CLI's `--confirm` is intended for a human at a shell. Orphan reconciliation additionally requires `--reason`. The Pi extension independently displays separate interactive confirmations before build merge, abandonment, orphan-report reconciliation, and manual cleanup.

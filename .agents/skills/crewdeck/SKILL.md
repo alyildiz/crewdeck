@@ -55,10 +55,12 @@ For each selected change-lifecycle task:
 6. Integrate the next branch against the newly advanced base.
 7. Call `crew_cleanup` only after integration. It also permits resuming interrupted cleanup for an already explicitly abandoned task, but refuses all other unintegrated change work.
 
+For a report task only, when its Herdr workspace and Git worktree were already removed manually and normal cleanup cannot run, call `crew_reconcile_orphan_report`. Never infer this from `agent missing` or `git unavailable`: obtain a concrete reason and use the tool's independent confirmation. It proves resource absence, refuses surviving or uncertain resources, dirty worktrees, and unintegrated branch commits, preserves reports/history, and records the terminal `orphan-reconciled` outcome. Use it to finish a collected report whose cleanup failed with `workspace_not_found`; never edit durable state directly.
+
 When a non-integrated change task is obsolete or superseded, call `crew_abandon` rather than pretending it was integrated or bypassing cleanup with raw Git/Herdr. This operation has its own interactive confirmation, refuses reports, active workers, dirty worktrees, and terminal tasks, records the distinct durable `abandoned` outcome, and removes only the isolated worktree and branch without changing base or pushing.
 
 Conflict reconciliation between concurrent build branches is intentionally deferred to the next Crewdeck milestone. Never bypass a current refusal with raw Git or Herdr commands.
 
 ## Recovery
 
-Use `crew_status` after restarting the orchestrator. Durable records and reports preserve task identity and outcomes; `/crew` hides terminal abandoned tasks while `/crew all` shows them. If Herdr reports an agent missing, preserve the worktree and inspect Git before proposing recovery; absence of an agent is never permission to delete work.
+Use `crew_status` after restarting the orchestrator. Durable records and reports preserve task identity and outcomes; `/crew` hides terminal abandoned and orphan-reconciled tasks while `/crew all` shows them. If Herdr reports an agent missing, preserve the worktree and inspect Git before proposing recovery; absence of an agent is never permission to delete work.
