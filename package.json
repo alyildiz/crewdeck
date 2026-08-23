@@ -1,6 +1,6 @@
 {
   "name": "crewdeck",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Lightweight Pi and Herdr orchestrator for coding agents in isolated Git worktrees",
@@ -12,7 +12,14 @@
     "check": "node --check src/core.mjs && node --check bin/crewdeck"
   },
   "pi": {
-    "extensions": ["./.pi/extensions/crewdeck/index.ts"],
-    "skills": ["./.agents/skills/crewdeck"]
+    "extensions": [
+      "./.pi/extensions/crewdeck/index.ts"
+    ],
+    "skills": [
+      "./.agents/skills/crewdeck"
+    ]
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
   }
 }

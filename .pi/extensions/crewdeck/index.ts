@@ -1,13 +1,20 @@
+import { watch, type FSWatcher } from "node:fs";
+import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import {
   cleanupTask,
+  collectResults,
   getStatus,
+  getTaskDiff,
+  loadConfig,
   mergeTask,
   prepareIntegration,
   promptTask,
+  reportDirectory,
   spawnBatch,
 } from "../../../src/core.mjs";
 
@@ -28,7 +35,38 @@ function taskLines(tasks: any[]) {
   });
 }
 
+async function validateProfiles(params: any, ctx: any) {
+  const config = await loadConfig(CONFIG);
+  const names = new Set<string>();
+  for (const task of params.tasks) names.add(task.profile || params.profile || config.defaultProfile);
+  for (const name of names) {
+    const profile = config.profiles[name];
+    if (!profile) throw new Error(`Unknown Crewdeck profile '${name}'`);
+    const model = ctx.modelRegistry.find(profile.provider, profile.model);
+    if (!model) {
+      throw new Error(
+        `Profile '${name}' references unavailable Pi model ${profile.provider}/${profile.model}`,
+      );
+    }
+    if (profile.thinking !== "off" && model.reasoning === false) {
+      throw new Error(`Profile '${name}' requests thinking=${profile.thinking} on a non-reasoning model`);
+    }
+    const mappedLevel = model.thinkingLevelMap?.[profile.thinking];
+    if (mappedLevel === null) {
+      throw new Error(`Profile '${name}' uses unsupported thinking level ${profile.thinking}`);
+    }
+    if (["xhigh", "max"].includes(profile.thinking) && typeof mappedLevel !== "string") {
+      throw new Error(
+        `Profile '${name}' must explicitly map extended thinking level ${profile.thinking}`,
+      );
+    }
+    const auth = await ctx.modelRegistry.getProviderAuth(profile.provider);
+    if (!auth) throw new Error(`Profile '${name}' provider ${profile.provider} has no usable authentication`);
+  }
+}
+
 export default function crewdeckExtension(pi: ExtensionAPI) {
+  let reportWatcher: FSWatcher | undefined;
   pi.registerTool({
     name: "crew_spawn_batch",
     label: "Spawn Crew",
@@ -40,13 +78,17 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
       tasks: Type.Array(
         Type.Object({
           id: Type.String({ description: "Unique lowercase task id, max 24 characters" }),
+          kind: StringEnum(["scout", "build"] as const, {
+            description: "scout is strictly read-only analysis; build may modify and commit",
+          }),
           task: Type.String({ description: "Concrete task and acceptance criteria" }),
           profile: Type.Optional(Type.String({ description: "Optional per-task profile override" })),
         }),
         { minItems: 1, maxItems: 5 },
       ),
     }),
-    async execute(_id, params) {
+    async execute(_id, params, _signal, _update, ctx) {
+      await validateProfiles(params, ctx);
       return text(await spawnBatch(CONFIG, params));
     },
   });
@@ -58,6 +100,35 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     parameters: Type.Object({ id: Type.Optional(Type.String()) }),
     async execute(_id, params) {
       return text(await getStatus(CONFIG, params.id));
+    },
+  });
+
+  pi.registerTool({
+    name: "crew_collect_results",
+    label: "Collect Crew Results",
+    description:
+      "Collect durable structured results submitted by Crewdeck workers. By default, safely closes read-only scouts after their reports are collected; build workers remain available through integration.",
+    parameters: Type.Object({
+      ids: Type.Optional(Type.Array(Type.String(), { maxItems: 20 })),
+      keepScouts: Type.Optional(Type.Boolean({ default: false })),
+    }),
+    async execute(_id, params, _signal, _update, ctx) {
+      const results = await collectResults(CONFIG, params.ids, {
+        cleanupScouts: params.keepScouts !== true,
+      });
+      ctx.ui.setStatus("crewdeck", "crewdeck");
+      return text(results);
+    },
+  });
+
+  pi.registerTool({
+    name: "crew_diff",
+    label: "Inspect Build Diff",
+    description:
+      "Return bounded commits, diffstat, and patch for a Crewdeck build branch before integration. Refuses scout tasks and truncates patches above 40 KB.",
+    parameters: Type.Object({ id: Type.String() }),
+    async execute(_id, params) {
+      return text(await getTaskDiff(CONFIG, params.id));
     },
   });
 
@@ -136,11 +207,32 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     ctx.ui.setStatus("crewdeck", "crewdeck");
+    const directory = reportDirectory();
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    try {
+      const tasks = await getStatus(CONFIG);
+      const pending = tasks.filter((task) => ["report-ready", "candidate"].includes(task.observedStatus));
+      if (pending.length > 0) ctx.ui.setStatus("crewdeck", `crewdeck: ${pending.length} result(s) ready`);
+    } catch {
+      // Configuration diagnostics remain available through the tools and /crew.
+    }
+    const announced = new Set<string>();
+    reportWatcher = watch(directory, (_eventType, rawFilename) => {
+      if (!rawFilename) return;
+      const filename = String(rawFilename);
+      if (!filename.endsWith(".json") || announced.has(filename)) return;
+      announced.add(filename);
+      const id = filename.slice(0, -5);
+      ctx.ui.notify(`Crewdeck result ready: ${id}`, "info");
+      ctx.ui.setStatus("crewdeck", "crewdeck: result ready");
+    });
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
+    reportWatcher?.close();
+    reportWatcher = undefined;
     ctx.ui.setStatus("crewdeck", undefined);
     ctx.ui.setWidget("crewdeck", undefined);
   });

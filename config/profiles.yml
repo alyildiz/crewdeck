@@ -1,0 +1,34 @@
+version: 1
+
+defaultProfile: cloud-medium
+
+profiles:
+  local-fast:
+    provider: vllm_qwen38
+    model: qwen3.8-27b-fp8
+    thinking: low
+    allowedKinds: [scout]
+
+  local-medium:
+    provider: vllm_qwen38
+    model: qwen3.8-27b-fp8
+    thinking: medium
+    allowedKinds: [scout, build]
+
+  local-deep:
+    provider: vllm_qwen38
+    model: qwen3.8-27b-fp8
+    thinking: xhigh
+    allowedKinds: [scout]
+
+  cloud-medium:
+    provider: openai-codex
+    model: gpt-5.6-sol
+    thinking: medium
+    allowedKinds: [scout, build]
+
+  cloud-deep:
+    provider: openai-codex
+    model: gpt-5.6-sol
+    thinking: xhigh
+    allowedKinds: [scout, build]

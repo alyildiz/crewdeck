@@ -1,12 +1,17 @@
 import { execFile } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { parse as parseYaml } from "yaml";
 
 const execFileAsync = promisify(execFile);
 const TASK_ID_RE = /^[a-z][a-z0-9-]{0,23}$/;
+const TASK_KINDS = new Set(["scout", "build"]);
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const REPORTER_EXTENSION = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../worker/reporter.ts");
 
 export class CrewdeckError extends Error {
   constructor(message, code = "crewdeck_error", details = undefined) {
@@ -32,6 +37,45 @@ function stateRoot() {
 
 function statePath() {
   return path.join(stateRoot(), "state.json");
+}
+
+function reportsRoot() {
+  return path.join(stateRoot(), "reports");
+}
+
+function taskReportPath(id) {
+  return path.join(reportsRoot(), `${id}.json`);
+}
+
+async function readTaskReport(record) {
+  try {
+    const report = JSON.parse(await readFile(taskReportPath(record.id), "utf8"));
+    if (
+      report.schemaVersion !== 1 ||
+      report.taskId !== record.id ||
+      report.kind !== record.kind ||
+      report.token !== record.reportToken ||
+      !report.payload ||
+      typeof report.payload !== "object"
+    ) {
+      return { available: false, error: "Report identity does not match the task" };
+    }
+    return { available: true, path: taskReportPath(record.id), report };
+  } catch (error) {
+    if (error.code === "ENOENT") return { available: false, state: "missing" };
+    return { available: false, error: error.message };
+  }
+}
+
+function publicTaskRecord(record) {
+  const { reportToken: _reportToken, ...publicRecord } = record;
+  return publicRecord;
+}
+
+function publicTaskReport(result) {
+  if (!result.available) return result;
+  const { token: _token, ...report } = result.report;
+  return { available: true, path: result.path, report };
 }
 
 async function run(command, args, options = {}) {
@@ -111,32 +155,71 @@ async function withStateLock(fn) {
   }
 }
 
-export async function loadConfig(configPath) {
+async function loadRawConfig(configPath) {
   const absolute = path.resolve(configPath);
-  let config;
   try {
-    config = JSON.parse(await readFile(absolute, "utf8"));
+    return { absolute, config: JSON.parse(await readFile(absolute, "utf8")) };
   } catch (error) {
     throw new CrewdeckError(`Cannot read ${absolute}: ${error.message}`, "invalid_config");
   }
-  if (!Number.isInteger(config.maxWorkers) || config.maxWorkers < 1 || config.maxWorkers > 16) {
-    throw new CrewdeckError("maxWorkers must be an integer from 1 to 16", "invalid_config");
+}
+
+async function loadProfiles(config, configAbsolute) {
+  if (!config.profilesFile || typeof config.profilesFile !== "string") {
+    throw new CrewdeckError("profilesFile must point to a YAML profile file", "invalid_config");
   }
-  if (!config.profiles || !config.profiles[config.defaultProfile]) {
+  const profilesPath = path.resolve(path.dirname(configAbsolute), expandHome(config.profilesFile));
+  let document;
+  try {
+    document = parseYaml(await readFile(profilesPath, "utf8"));
+  } catch (error) {
+    throw new CrewdeckError(`Cannot read ${profilesPath}: ${error.message}`, "invalid_config");
+  }
+  if (document?.version !== 1 || !document.profiles || typeof document.profiles !== "object") {
+    throw new CrewdeckError(`${profilesPath} must contain version: 1 and profiles`, "invalid_config");
+  }
+  if (!document.defaultProfile || !document.profiles[document.defaultProfile]) {
     throw new CrewdeckError("defaultProfile must name a configured profile", "invalid_config");
+  }
+  for (const [name, profile] of Object.entries(document.profiles)) {
+    if (!profile.provider || !profile.model || !THINKING_LEVELS.has(profile.thinking)) {
+      throw new CrewdeckError(
+        `Profile ${name}: provider, model, and a valid thinking level are required`,
+        "invalid_config",
+      );
+    }
+    if (
+      !Array.isArray(profile.allowedKinds) ||
+      profile.allowedKinds.length === 0 ||
+      profile.allowedKinds.some((kind) => !TASK_KINDS.has(kind))
+    ) {
+      throw new CrewdeckError(`Profile ${name}: allowedKinds must contain scout and/or build`, "invalid_config");
+    }
+  }
+  return {
+    path: profilesPath,
+    profiles: document.profiles,
+    defaultProfile: document.defaultProfile,
+  };
+}
+
+export async function loadConfig(configPath) {
+  const { absolute, config } = await loadRawConfig(configPath);
+  if (!Number.isInteger(config.maxWorkers) || config.maxWorkers < 1 || config.maxWorkers > 5) {
+    throw new CrewdeckError("maxWorkers must be an integer from 1 to 5", "invalid_config");
   }
   if (!config.projects || typeof config.projects !== "object") {
     throw new CrewdeckError("projects must be an object", "invalid_config");
   }
-  for (const [name, profile] of Object.entries(config.profiles)) {
-    if (profile.kind !== "pi") {
-      throw new CrewdeckError(`Profile ${name}: only kind=pi is supported in v0.1`, "invalid_config");
-    }
-    if (!profile.model || !THINKING_LEVELS.has(profile.thinking)) {
-      throw new CrewdeckError(`Profile ${name}: model and valid thinking are required`, "invalid_config");
-    }
+  if (!["after-collection", "manual"].includes(config.scoutCleanup || "after-collection")) {
+    throw new CrewdeckError("scoutCleanup must be after-collection or manual", "invalid_config");
   }
+  const loadedProfiles = await loadProfiles(config, absolute);
   config.__path = absolute;
+  config.__profilesPath = loadedProfiles.path;
+  config.profiles = loadedProfiles.profiles;
+  config.defaultProfile = loadedProfiles.defaultProfile;
+  config.scoutCleanup ||= "after-collection";
   config.worktreeRoot = path.resolve(expandHome(config.worktreeRoot));
   return config;
 }
@@ -167,26 +250,61 @@ function validateTaskInput(task) {
   if (typeof task.task !== "string" || task.task.trim().length < 8) {
     throw new CrewdeckError(`Task ${task.id} needs a concrete description`, "invalid_task");
   }
+  if (!TASK_KINDS.has(task.kind)) {
+    throw new CrewdeckError(`Task ${task.id} must declare kind=scout or kind=build`, "invalid_task");
+  }
 }
 
 function agentName(id) {
   return `cd_${id.replaceAll("-", "_")}`;
 }
 
-function workerPrompt(task, project, profile) {
-  const mode = profile.readOnly
-    ? "This is a read-only scout task. Do not modify files or create commits."
-    : "Implement the task, run relevant tests, and commit the result on the current branch.";
+function workerPrompt(task, project) {
+  const delivery =
+    task.kind === "scout"
+      ? [
+          "This is a strictly read-only scout task. You have no write, edit, or shell tool. Analyze only; a recommendation never authorizes implementation.",
+          "Finish by calling crew_complete exactly once with a self-contained report: conclusion, findings, evidence, recommendations, and openQuestions.",
+        ]
+      : [
+          "This is a build task. Implement the accepted scope, run relevant tests, and commit the result on the current branch.",
+          "Finish by calling crew_complete exactly once with summary, the exact HEAD commit hash, tests, risks, and openQuestions.",
+        ];
   return [
     `# Task\n${task.task.trim()}`,
     `# Project\nYou are already in an isolated Git worktree of ${project.name}. Read and follow this worktree's AGENTS.md and inspect the project before acting.`,
-    `# Delivery\n${mode}`,
+    `# Delivery\n${delivery.join("\n")}`,
     "Stay inside this worktree. Do not push, merge, rebase, switch branches, remove the worktree, or modify another checkout.",
     "Do not wait for the orchestrator unless a real product decision or blocker prevents progress.",
-    profile.readOnly
-      ? "Finish with a concise report containing findings, evidence, and recommended next steps."
-      : "Finish with a concise summary containing the commit hash, changed behavior, tests run, and any remaining risk.",
+    "The task is not complete until crew_complete accepts the structured result.",
   ].join("\n\n");
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'\\''`)}'`;
+}
+
+async function bindWorkerEnvironment(paneId, record) {
+  const values = {
+    CREWDECK_TASK_ID: record.id,
+    CREWDECK_TASK_KIND: record.kind,
+    CREWDECK_REPORT_TOKEN: record.reportToken,
+    CREWDECK_REPORT_DIR: reportsRoot(),
+  };
+  const command = `export ${Object.entries(values)
+    .map(([key, value]) => `${key}=${shellQuote(value)}`)
+    .join(" ")}`;
+  const deadline = Date.now() + 15_000;
+  while (true) {
+    try {
+      await run("herdr", ["pane", "run", paneId, command], { timeout: 10_000 });
+      return;
+    } catch (error) {
+      const shellStarting = error instanceof CrewdeckError && error.message.includes("pane_busy");
+      if (!shellStarting || Date.now() >= deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
 }
 
 async function startAgentWhenShellReady(name, paneId, piArgs) {
@@ -264,16 +382,23 @@ async function ensureProjectWorkspace(project) {
 
 async function createOne(config, project, sourceWorkspace, task, profileName) {
   validateTaskInput(task);
-  const profile = config.profiles[task.profile || profileName || config.defaultProfile];
-  if (!profile) throw new CrewdeckError(`Unknown profile '${task.profile || profileName}'`, "unknown_profile");
+  const selectedProfile = task.profile || profileName || config.defaultProfile;
+  const profile = config.profiles[selectedProfile];
+  if (!profile) throw new CrewdeckError(`Unknown profile '${selectedProfile}'`, "unknown_profile");
+  if (!profile.allowedKinds.includes(task.kind)) {
+    throw new CrewdeckError(`Profile '${selectedProfile}' does not allow kind=${task.kind}`, "profile_kind_mismatch");
+  }
   const branch = `crew/${task.id}`;
   const worktree = path.join(config.worktreeRoot, project.name, task.id);
   const name = agentName(task.id);
 
   const state = await loadState();
   const existing = state.tasks[task.id];
-  if (existing && !["cleaned", "failed"].includes(existing.status)) {
-    throw new CrewdeckError(`Task '${task.id}' already exists with status ${existing.status}`, "task_exists");
+  if (existing) {
+    throw new CrewdeckError(
+      `Task '${task.id}' already exists with status ${existing.status}; task ids are durable and cannot be reused`,
+      "task_exists",
+    );
   }
   try {
     await git(project.path, ["show-ref", "--verify", `refs/heads/${branch}`]);
@@ -309,7 +434,8 @@ async function createOne(config, project, sourceWorkspace, task, profileName) {
     id: task.id,
     project: project.name,
     description: task.task.trim(),
-    profile: task.profile || profileName || config.defaultProfile,
+    kind: task.kind,
+    profile: selectedProfile,
     status: "starting",
     branch,
     base: project.base,
@@ -320,6 +446,7 @@ async function createOne(config, project, sourceWorkspace, task, profileName) {
     agentName: name,
     sourceWorkspaceId: sourceWorkspace.id,
     sourceWorkspaceOwned: sourceWorkspace.owned,
+    reportToken: randomBytes(24).toString("hex"),
     createdAt: new Date().toISOString(),
   };
   await withStateLock(async () => {
@@ -328,13 +455,27 @@ async function createOne(config, project, sourceWorkspace, task, profileName) {
     await saveState(next);
   });
 
-  const piArgs = ["--model", profile.model, "--thinking", profile.thinking, "--name", `crew:${task.id}`];
-  if (project.trustProjectResources === true) piArgs.push("--approve");
-  if (profile.readOnly === true) piArgs.push("--tools", "read,grep,find,ls");
+  const piArgs = [
+    "--model",
+    `${profile.provider}/${profile.model}`,
+    "--thinking",
+    profile.thinking,
+    "--name",
+    `crew:${task.id}`,
+    "--no-extensions",
+    "-e",
+    REPORTER_EXTENSION,
+  ];
+  if (task.kind === "scout") {
+    piArgs.push("--no-approve", "--no-skills", "--tools", "read,grep,find,ls,crew_complete");
+  } else if (project.trustProjectResources === true) {
+    piArgs.push("--approve");
+  }
 
   try {
+    await bindWorkerEnvironment(paneId, record);
     await startAgentWhenShellReady(name, paneId, piArgs);
-    await run("herdr", ["agent", "prompt", name, workerPrompt(task, project, profile)], { timeout: 15_000 });
+    await run("herdr", ["agent", "prompt", name, workerPrompt(task, project)], { timeout: 15_000 });
     record.status = "running";
     record.startedAt = new Date().toISOString();
     await withStateLock(async () => {
@@ -342,7 +483,7 @@ async function createOne(config, project, sourceWorkspace, task, profileName) {
       next.tasks[task.id] = record;
       await saveState(next);
     });
-    return record;
+    return publicTaskRecord(record);
   } catch (error) {
     record.status = "failed";
     record.error = error.message;
@@ -365,7 +506,18 @@ export async function spawnBatch(configPath, { project: projectName, tasks, prof
   }
   const ids = tasks.map((task) => task.id);
   if (new Set(ids).size !== ids.length) throw new CrewdeckError("Task ids must be unique", "invalid_batch");
-  tasks.forEach(validateTaskInput);
+  tasks.forEach((task) => {
+    validateTaskInput(task);
+    const selectedProfile = task.profile || profile || config.defaultProfile;
+    const configuredProfile = config.profiles[selectedProfile];
+    if (!configuredProfile) throw new CrewdeckError(`Unknown profile '${selectedProfile}'`, "unknown_profile");
+    if (!configuredProfile.allowedKinds.includes(task.kind)) {
+      throw new CrewdeckError(
+        `Profile '${selectedProfile}' does not allow kind=${task.kind}`,
+        "profile_kind_mismatch",
+      );
+    }
+  });
   const project = resolveProject(config, projectName);
   await validateProject(project);
   const sourceWorkspace = await ensureProjectWorkspace(project);
@@ -409,30 +561,87 @@ export async function getStatus(configPath, id) {
   const records = id ? [state.tasks[id]].filter(Boolean) : Object.values(state.tasks);
   if (id && records.length === 0) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
   return Promise.all(
-    records.map(async (record) => {
+    records.map(async (storedRecord) => {
+      const record = {
+        ...storedRecord,
+        kind: storedRecord.kind || (storedRecord.profile === "scout" ? "scout" : "build"),
+      };
       if (record.status === "cleaned") {
         return {
-          ...record,
+          ...publicTaskRecord(record),
           observedStatus: "cleaned",
           agent: { available: false, state: "closed" },
           git: { available: false, state: "worktree-removed" },
         };
       }
-      const [agent, snapshot] = await Promise.all([liveAgent(record), gitSnapshot(record)]);
+      const [agent, snapshot, result] = await Promise.all([
+        liveAgent(record),
+        gitSnapshot(record),
+        readTaskReport(record),
+      ]);
       let observedStatus = record.status;
       if (record.status === "running" && agent.state === "blocked") observedStatus = "blocked";
+      if (record.kind === "scout" && result.available) {
+        observedStatus = record.resultCollectedAt ? "report-collected" : "report-ready";
+      }
+      const reportedCommit = result.available ? result.report.payload?.commit : undefined;
+      const commitMatches =
+        typeof reportedCommit === "string" && snapshot.available && snapshot.head.startsWith(reportedCommit);
       if (
+        record.kind === "build" &&
         record.status === "running" &&
         ["idle", "done"].includes(agent.state) &&
+        result.available &&
         snapshot.available &&
         snapshot.clean &&
-        snapshot.ahead > 0
+        snapshot.ahead > 0 &&
+        commitMatches
       ) {
-        observedStatus = "ready-to-prepare";
+        observedStatus = "candidate";
       }
-      return { ...record, observedStatus, agent, git: snapshot };
+      return {
+        ...publicTaskRecord(record),
+        observedStatus,
+        agent,
+        git: snapshot,
+        result: publicTaskReport(result),
+      };
     }),
   );
+}
+
+export async function getTaskDiff(configPath, id) {
+  await loadConfig(configPath);
+  const state = await loadState();
+  const record = state.tasks[id];
+  if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
+  record.kind ||= record.profile === "scout" ? "scout" : "build";
+  if (record.kind !== "build") throw new CrewdeckError("Scout tasks have no integration diff", "read_only_task");
+  const snapshot = await gitSnapshot(record);
+  if (!snapshot.available) throw new CrewdeckError("Build worktree is unavailable", "missing_worktree");
+  const range = `${record.base}...HEAD`;
+  const [commits, stat, patchResult] = await Promise.all([
+    git(record.worktree, ["log", "--oneline", "--decorate=no", `${record.base}..HEAD`]),
+    git(record.worktree, ["diff", "--stat", range]),
+    git(record.worktree, ["diff", "--no-ext-diff", "--unified=3", range], { maxBuffer: 4 * 1024 * 1024 }),
+  ]);
+  const maxPatchBytes = 40 * 1024;
+  const patchBytes = Buffer.byteLength(patchResult.stdout, "utf8");
+  const patch =
+    patchBytes <= maxPatchBytes
+      ? patchResult.stdout
+      : `${Buffer.from(patchResult.stdout, "utf8").subarray(0, maxPatchBytes).toString("utf8")}\n\n[diff truncated: ${patchBytes - maxPatchBytes} bytes omitted; inspect the worktree for the full patch]`;
+  return {
+    task: publicTaskRecord(record),
+    clean: snapshot.clean,
+    head: snapshot.head,
+    baseHead: snapshot.baseHead,
+    ahead: snapshot.ahead,
+    commits: commits.stdout,
+    stat: stat.stdout,
+    patch,
+    truncated: patchBytes > maxPatchBytes,
+  };
 }
 
 export async function promptTask(configPath, id, message, { wait = false } = {}) {
@@ -446,14 +655,57 @@ export async function promptTask(configPath, id, message, { wait = false } = {})
   return runJson("herdr", args, { timeout: wait ? 610_000 : 15_000 });
 }
 
+export async function collectResults(configPath, ids, { cleanupScouts } = {}) {
+  const config = await loadConfig(configPath);
+  const state = await loadState();
+  const selectedIds = ids?.length
+    ? ids
+    : Object.values(state.tasks)
+        .filter((record) => !record.resultCollectedAt && record.status !== "cleaned")
+        .map((record) => record.id);
+  const collected = [];
+  for (const id of selectedIds) {
+    const record = state.tasks[id];
+    if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
+    record.kind ||= record.profile === "scout" ? "scout" : "build";
+    const result = await readTaskReport(record);
+    if (!result.available) continue;
+    record.resultCollectedAt ||= new Date().toISOString();
+    collected.push({ task: publicTaskRecord(record), result: publicTaskReport(result) });
+  }
+  if (collected.length > 0) {
+    await withStateLock(async () => {
+      const next = await loadState();
+      for (const item of collected) {
+        next.tasks[item.task.id].resultCollectedAt = item.task.resultCollectedAt;
+        next.tasks[item.task.id].kind ||= item.task.kind;
+      }
+      await saveState(next);
+    });
+  }
+
+  const shouldCleanup = cleanupScouts ?? config.scoutCleanup === "after-collection";
+  if (shouldCleanup) {
+    for (const item of collected) {
+      if (item.task.kind !== "scout" || item.task.status === "cleaned") continue;
+      try {
+        item.cleanup = await cleanupTask(configPath, item.task.id);
+      } catch (error) {
+        item.cleanup = { ok: false, error: error.message, code: error.code };
+      }
+    }
+  }
+  return collected;
+}
+
 export async function prepareIntegration(configPath, id) {
   const config = await loadConfig(configPath);
   const state = await loadState();
   const record = state.tasks[id];
   if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
+  record.kind ||= record.profile === "scout" ? "scout" : "build";
   const project = resolveProject(config, record.project);
-  const profile = config.profiles[record.profile];
-  if (profile.readOnly) throw new CrewdeckError("Scout tasks cannot be integrated", "read_only_task");
+  if (record.kind !== "build") throw new CrewdeckError("Scout tasks cannot be integrated", "read_only_task");
   const agent = await liveAgent(record);
   if (agent.available && !["idle", "done"].includes(agent.state)) {
     throw new CrewdeckError(`Worker is ${agent.state}; wait until it settles`, "worker_not_settled");
@@ -463,6 +715,11 @@ export async function prepareIntegration(configPath, id) {
     throw new CrewdeckError("Worker worktree is not clean", "dirty_worktree", snapshot);
   }
   if (snapshot.ahead < 1) throw new CrewdeckError("Worker branch has no commits to integrate", "no_commits");
+  const result = await readTaskReport(record);
+  if (!result.available) throw new CrewdeckError("Builder has not submitted crew_complete", "missing_result");
+  if (!snapshot.head.startsWith(result.report.payload?.commit || "!")) {
+    throw new CrewdeckError("Builder result commit does not match the worktree HEAD", "result_commit_mismatch");
+  }
 
   try {
     await git(record.worktree, ["rebase", record.base], { timeout: 120_000 });
@@ -474,7 +731,7 @@ export async function prepareIntegration(configPath, id) {
       next.tasks[id] = record;
       await saveState(next);
     });
-    return { ok: false, conflict: true, task: record, error: error.message };
+    return { ok: false, conflict: true, task: publicTaskRecord(record), error: error.message };
   }
 
   const verification = [];
@@ -490,7 +747,13 @@ export async function prepareIntegration(configPath, id) {
         next.tasks[id] = record;
         await saveState(next);
       });
-      return { ok: false, conflict: false, task: record, verification, error: error.message };
+      return {
+        ok: false,
+        conflict: false,
+        task: publicTaskRecord(record),
+        verification,
+        error: error.message,
+      };
     }
   }
   record.status = "ready";
@@ -502,7 +765,7 @@ export async function prepareIntegration(configPath, id) {
     next.tasks[id] = record;
     await saveState(next);
   });
-  return { ok: true, task: record, verification };
+  return { ok: true, task: publicTaskRecord(record), verification };
 }
 
 export async function mergeTask(configPath, id) {
@@ -531,7 +794,7 @@ export async function mergeTask(configPath, id) {
     next.tasks[id] = record;
     await saveState(next);
   });
-  return record;
+  return publicTaskRecord(record);
 }
 
 export async function cleanupTask(configPath, id) {
@@ -539,11 +802,26 @@ export async function cleanupTask(configPath, id) {
   const state = await loadState();
   const record = state.tasks[id];
   if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
-  if (record.status !== "integrated") {
-    throw new CrewdeckError("Only integrated tasks can be cleaned up in v0.1", "not_integrated");
+  record.kind ||= record.profile === "scout" ? "scout" : "build";
+  if (record.kind === "build" && record.status !== "integrated") {
+    throw new CrewdeckError("Build tasks can be cleaned only after integration", "not_integrated");
+  }
+  if (record.kind === "scout") {
+    if (!record.resultCollectedAt) {
+      throw new CrewdeckError("Scout result must be collected before cleanup", "result_not_collected");
+    }
+    const result = await readTaskReport(record);
+    if (!result.available) throw new CrewdeckError("Scout durable report is missing", "missing_result");
+  }
+  const agent = await liveAgent(record);
+  if (agent.available && !["idle", "done"].includes(agent.state)) {
+    throw new CrewdeckError(`Worker is ${agent.state}; wait until it settles before cleanup`, "worker_not_settled");
   }
   const snapshot = await gitSnapshot(record);
   if (!snapshot.available || !snapshot.clean) throw new CrewdeckError("Worktree is not clean", "dirty_worktree");
+  if (record.kind === "scout" && snapshot.ahead !== 0) {
+    throw new CrewdeckError("Scout branch unexpectedly contains commits", "scout_has_commits");
+  }
   try {
     await run("herdr", ["agent", "send-keys", record.agentName, "ctrl+d"], { timeout: 10_000 });
     await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -579,7 +857,7 @@ export async function cleanupTask(configPath, id) {
       // Cleanup is complete; preserving an unexpected source workspace is safer than forcing it closed.
     }
   }
-  return record;
+  return publicTaskRecord(record);
 }
 
 export async function addProject(configPath, name, projectPath, options = {}) {
@@ -587,7 +865,8 @@ export async function addProject(configPath, name, projectPath, options = {}) {
   const absolute = path.resolve(expandHome(projectPath));
   const root = (await git(absolute, ["rev-parse", "--show-toplevel"])).stdout;
   if (path.resolve(root) !== absolute) throw new CrewdeckError("Project path must be a Git worktree root", "invalid_project");
-  const config = await loadConfig(configPath);
+  const { config } = await loadRawConfig(configPath);
+  if (!config.projects || typeof config.projects !== "object") config.projects = {};
   const base = options.base || (await git(absolute, ["branch", "--show-current"])).stdout;
   if (!base) throw new CrewdeckError("Cannot infer base branch; pass --base", "invalid_project");
   config.projects[name] = {
@@ -596,11 +875,14 @@ export async function addProject(configPath, name, projectPath, options = {}) {
     trustProjectResources: options.trustProjectResources === true,
     verify: options.verify || [],
   };
-  delete config.__path;
   await writeFile(path.resolve(configPath), `${JSON.stringify(config, null, 2)}\n`);
   return config.projects[name];
 }
 
 export function stateLocation() {
   return statePath();
+}
+
+export function reportDirectory() {
+  return reportsRoot();
 }
