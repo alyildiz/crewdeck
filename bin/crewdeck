@@ -9,11 +9,15 @@ import {
   getStatus,
   getTaskDiff,
   loadConfig,
+  forwardReviewFindings,
   mergeTask,
   prepareIntegration,
   promptTask,
+  publishPullRequest,
   reconcileOrphanReport,
+  resumeBuild,
   spawnBatch,
+  spawnReview,
   stateLocation,
 } from "../src/core.mjs";
 
@@ -22,17 +26,21 @@ const configPath = process.env.CREWDECK_CONFIG || path.join(root, "crewdeck.json
 const [command, ...args] = process.argv.slice(2);
 
 function usage() {
-  console.log(`Crewdeck v0.2
+  console.log(`Crewdeck v0.3
 
 Usage:
   crewdeck config
   crewdeck project add <name> <path> [--base <branch>] [--trust]
   crewdeck project list
-  crewdeck spawn <project> <kind> <id> <task> [--profile <name>]
+  crewdeck spawn <project> <kind> <id> <task> [--profile <name>] [--reviewed-pr]
+  crewdeck review <parent-id> <review-id> <reviewed-head> <task> [--profile <name>]
   crewdeck status [id]
-  crewdeck collect [id ...] [--keep-reports]
+  crewdeck collect [id|inbox-key ...] [--keep-reports]
   crewdeck diff <build-id>
   crewdeck prompt <id> <message> [--wait]
+  crewdeck forward-review <review-id> [--wait]
+  crewdeck resume <reviewed-pr-build-id>
+  crewdeck publish <build-id> --remote <name> --repo <owner/name> --base <branch> --head <branch> --title <text> --body <text>
   crewdeck prepare <id>
   crewdeck merge <id> --confirm
   crewdeck abandon <id> --confirm [--reason <text>]
@@ -79,7 +87,26 @@ try {
       }
       result = await spawnBatch(configPath, {
         project: args[0],
-        tasks: [{ kind: args[1], id: args[2], task: args[3], profile: option("--profile") }],
+        tasks: [{
+          kind: args[1],
+          id: args[2],
+          task: args[3],
+          profile: option("--profile"),
+          workflow: args.includes("--reviewed-pr") ? "reviewed-pr" : "direct",
+        }],
+      });
+      break;
+    }
+    case "review": {
+      if (!args[0] || !args[1] || !args[2] || !args[3]) {
+        throw new Error("review requires <parent-id> <review-id> <reviewed-head> <task>");
+      }
+      result = await spawnReview(configPath, {
+        parentTaskId: args[0],
+        id: args[1],
+        reviewedHead: args[2],
+        task: args[3],
+        profile: option("--profile"),
       });
       break;
     }
@@ -101,6 +128,29 @@ try {
       if (!args[0] || !args[1]) throw new Error("prompt requires <id> <message>");
       result = await promptTask(configPath, args[0], args[1], { wait: args.includes("--wait") });
       break;
+    case "forward-review":
+      if (!args[0]) throw new Error("forward-review requires <review-id>");
+      result = await forwardReviewFindings(configPath, args[0], { wait: args.includes("--wait") });
+      break;
+    case "resume":
+      if (!args[0]) throw new Error("resume requires <reviewed-pr-build-id>");
+      result = await resumeBuild(configPath, args[0]);
+      break;
+    case "publish": {
+      const required = ["--remote", "--repo", "--base", "--head", "--title", "--body"];
+      if (!args[0] || required.some((name) => !option(name))) {
+        throw new Error("publish requires <id> --remote --repo --base --head --title --body");
+      }
+      result = await publishPullRequest(configPath, args[0], {
+        remote: option("--remote"),
+        repo: option("--repo"),
+        base: option("--base"),
+        head: option("--head"),
+        title: option("--title"),
+        body: option("--body"),
+      });
+      break;
+    }
     case "prepare":
       if (!args[0]) throw new Error("prepare requires <id>");
       result = await prepareIntegration(configPath, args[0]);

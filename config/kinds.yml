@@ -11,6 +11,17 @@ kinds:
     skills: []
     cleanup: after-collection
 
+  review:
+    lifecycle: report
+    contract: review
+    description: Read-only review of one exact reviewed-pr build candidate SHA
+    permissions:
+      filesystem: read-only
+      shell: false
+    tools: [read, grep, find, ls]
+    skills: []
+    cleanup: after-collection
+
   build:
     lifecycle: change
     description: Implement, test, and commit an approved change for controlled Git integration

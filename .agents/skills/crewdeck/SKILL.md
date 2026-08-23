@@ -1,66 +1,85 @@
 ---
 name: crewdeck
-description: Coordinate multiple coding agents through Crewdeck and Herdr. Use whenever the user asks to delegate project work, run workers or scouts, parallelize several coding tasks, inspect worker progress, collect analysis, integrate or abandon worker branches, or clean completed worktrees. Also use when one request contains several independently actionable project changes.
+description: Coordinate multiple coding agents through Crewdeck and Herdr. Use whenever the user asks to delegate project work, run workers or scouts, parallelize coding tasks, review exact build candidates, publish a reviewed draft PR, inspect worker progress, collect results, integrate or abandon worker branches, or clean completed worktrees.
 compatibility: Requires Pi inside Herdr 0.8+, Git, and the Crewdeck Pi extension.
 ---
 
 # Crewdeck
 
-Use Crewdeck as a thin delegation layer. This is the orchestrator's only authorized skill: do not perform target-project domain analysis or implementation yourself, and do not emulate specialist skills. Keep task classification, decomposition, profile selection, result synthesis, and integration judgment here; leave domain work to workers and worktree, Herdr, Git, state, model validation, and safety mechanics to the `crew_*` tools.
+Use Crewdeck as a thin delegation layer. This is the orchestrator's only authorized skill: do not perform target-project implementation yourself or emulate specialist skills. Keep task classification, decomposition, profile selection, reviewed-PR control, result synthesis, and integration judgment here; leave project work to workers and deterministic Herdr/Git/GitHub operations to `crew_*` tools.
 
-## Task kinds
+## Task kinds and workflows
 
-Every task must explicitly declare one immutable kind configured in `config/kinds.yml`. Read that file at intake; it owns each kind's description, lifecycle, permissions, tool allowlist, explicit skill allowlist, and cleanup policy. Skill discovery is disabled for every worker, so `skills: []` means no skills and only listed skill paths are loaded.
+Every task declares an immutable kind from `config/kinds.yml`. Read it at intake. Kinds own lifecycle, contract, permissions, tools, explicit skills, and cleanup; profiles only select provider/model/thinking and allowed kinds.
 
-Kinds use one of two code-enforced lifecycle families:
+- `report`: strict read-only, shell-free investigation. A recommendation never authorizes code changes.
+- `change`: owns one writable `crew/<id>` branch and may implement/commit.
+- `contract: review`: a report kind bound to one `parentTaskId` and one full `reviewedHead`. It emits only `approved`, `changes-requested`, `blocked`, or `inconclusive` plus structured findings.
 
-- `report`: strict read-only investigation. It cannot receive write or shell tools, cannot be integrated, and submits a structured evidence-based report.
-- `change`: implementation. It may modify and test the project, must commit, and submits a structured result bound to its exact HEAD.
+Defaults are `scout`, `review`, and `build`. Scouts and reviewers use detached, branchless Git worktrees opened by Herdr because that exact Herdr 0.8 path is proven; builds retain `crew/<id>`. Reviewers never have a communication path to builds.
 
-The default configuration provides `scout` as a report kind and `build` as a change kind. A profile is orthogonal to kind. Profiles in `config/profiles.yml` select provider, model, thinking level, and allowed kinds; they never grant filesystem permissions.
+A build has one of two workflows:
 
-Choose the best matching configured kind while respecting lifecycle authority. With the default kinds, explicit language such as "analyze", "audit", "investigate", "explain", "do not change code", or "read-only" selects `scout`; explicit implementation language such as "fix", "add", "implement", or "change" selects `build`. When analysis may recommend later implementation but implementation is not already unambiguous, dispatch only a report-lifecycle task; a recommendation is evidence, not authorization to change code.
+- `direct` (default, backward compatible): terminating immutable `crew_complete`, then the existing prepare/confirmed-local-merge lifecycle.
+- `reviewed-pr`: non-terminating, versioned `crew_submit_candidate`; exact-SHA review rounds; deterministic draft-PR publication. It is never prepared for local merge by this workflow.
 
-## Intake
+## Intake and dispatch
 
-1. Resolve the target from the registered names in `crewdeck.json`. Ask one short question if the project is ambiguous or unregistered.
-2. Split the request by independently testable outcome, not by file. Two workers may edit the same file; their branches remain isolated.
-3. Serialize only when one task semantically depends on another's result, both mutate the same external state, or independent validation would be misleading.
-4. Give each task a stable lowercase id, explicit kind, concrete outcome, acceptance criteria, relevant constraints, and exclusions. Do not copy project conventions: workers load the target worktree's own `AGENTS.md`.
-5. Choose only a profile whose `allowedKinds` includes the task kind. Never silently substitute another model when a configured profile is unavailable.
+1. Resolve a registered project from `crewdeck.json`; ask one short question only if ambiguous/unregistered.
+2. Split by independently testable outcome. Serialize semantic dependencies and external-state mutations.
+3. Give every task a stable lowercase id, configured kind, concrete outcome, acceptance criteria, constraints, and exclusions.
+4. Use only a profile whose `allowedKinds` includes the kind. Never silently substitute a model.
+5. Select `workflow: reviewed-pr` only when exact-SHA review and draft-PR publication are requested; otherwise preserve `direct`.
+6. Call `crew_spawn_batch` once for independent work. Never put a review kind in this batch: use `crew_spawn_review` after collecting a candidate.
 
-## Dispatch and results
+After dispatch, report task names, kinds, workflows, profiles, and purposes. Do not poll. Herdr workspaces stay visible.
 
-Call `crew_spawn_batch` once for the whole independent batch. Crewdeck creates visible Herdr workspaces outside the orchestrator tree, starts each Pi process in its project worktree, and validates the configured model against Pi's effective registry.
+## Durable inbox and wakeups
 
-After dispatch, report the task names, kinds, profiles, and purposes. Do not poll repeatedly. The user can inspect every workspace directly in Herdr. When a worker submits `crew_complete`, Crewdeck durably reconciles the result and necessarily wakes this orchestrator with a follow-up naming every newly ready task.
+`crew_submit_candidate` stores `build-id@candidate-N` without terminating the build. `crew_complete` still terminates direct builds, scouts, and reviewers and remains immutable for historical tasks.
 
-On a `CREWDECK COMPLETION` follow-up, call `crew_status` for the named ids and then `crew_collect_results`; do not merely tell the user that workers finished. Collection acknowledges delivery. It returns the durable structured reports. Report kinds configured with `cleanup: after-collection` are closed only when clean and commit-free; change kinds remain available through integration. A Herdr `idle` or `done` state alone is never completion evidence.
+The completion watcher reconciles durable inbox events on writes and restart, then necessarily wakes this orchestrator with `CREWDECK COMPLETION`. On that follow-up:
 
-## Steering
+1. Call `crew_status` for the named task ids (strip `@candidate-N` from inbox keys).
+2. Call `crew_collect_results` with the exact inbox keys from the follow-up.
+3. Treat collection as acknowledgement. Never infer completion from Herdr `idle`/`done` alone.
 
-Use `crew_steer` for a missing requirement, a concrete correction, or later conflict resolution. Keep messages short because the worker already has its task and project context. Do not use steering for routine progress checks.
+Report kinds configured `after-collection` close only after their durable result is collected and their immutable worktree is clean.
 
-## Build integration
+## Reviewed-PR loop
 
-Development may run in parallel; integration is sequential.
+For one reviewed-pr build:
 
-For each selected change-lifecycle task:
+1. Collect its current `build-id@candidate-N`. Confirm the worktree is clean and HEAD equals the full candidate SHA.
+2. Call `crew_spawn_review` with a distinct id, the build `parentTaskId`, and that exact 40-character `reviewedHead`. Crewdeck refuses duplicate/concurrent reviewers and stale candidates.
+3. When the reviewer wakes the orchestrator, collect it. Crewdeck copies the exact verdict/findings into the parent's durable `reviewInbox` before reviewer cleanup.
+4. Re-check status. Any HEAD change invalidates the review (and any SHA-bound CI evidence).
+5. For `changes-requested`, call `crew_forward_review` with the review id. This is the only allowed path: durable inbox → orchestrator follow-up → Herdr steering tool. It forwards the stored JSON without lossy retyping. Never send a reviewer message directly to the build.
+6. The same build agent remains sole writer and submits the next candidate after corrections. If its agent is provably absent, `crew_resume_build` may adopt the intact owned branch/workspace; it refuses an existing/uncertain writer.
+7. `blocked`/`inconclusive`, or `changes-requested` at `maxReviewRounds`, produces durable escalation rather than silently starting another round. Never stack several reviewers.
+8. After a collected `approved` verdict for the current HEAD, inspect `crew_diff`, then call `crew_publish_pr` with explicit `remote`, GitHub `owner/name`, `base`, owned `head=crew/<id>`, title, and body.
 
-1. Collect its structured result and confirm Crewdeck reports `candidate`: the agent settled, the worktree is clean, at least one commit exists, and the reported commit matches HEAD.
-2. Call `crew_diff` and inspect the bounded commits, diffstat, and patch before merge.
-3. Call `crew_prepare_integration`. It rebases onto the current local base and runs configured verification commands.
-4. Present the verified outcome and meaningful risk to the user.
-5. Call `crew_merge` only when the user explicitly asks to merge. The tool independently requests interactive confirmation and performs a local fast-forward only.
-6. Integrate the next branch against the newly advanced base.
-7. Call `crew_cleanup` only after integration. It also permits resuming interrupted cleanup for an already explicitly abandoned task, but refuses all other unintegrated change work.
+`crew_publish_pr` is fail-closed and idempotent. It validates the GitHub remote/repository/base/head, exact current candidate and approval, clean worktree, settled/provably absent writer, credentials, forge repository, remote ref ownership, and draft PR identity. It pushes the approved SHA (never the base), uses a lease, creates or updates one draft PR, and durably stores URL, number, remote head/SHA, and timestamps. Retry reconciles a PR created before an interrupted response. It never marks a PR ready and never merges.
 
-For a report task only, when its Herdr workspace and Git worktree were already removed manually and normal cleanup cannot run, call `crew_reconcile_orphan_report`. Never infer this from `agent missing` or `git unavailable`: obtain a concrete reason and use the tool's independent confirmation. It proves resource absence, refuses surviving or uncertain resources, dirty worktrees, and unintegrated branch commits, preserves reports/history, and records the terminal `orphan-reconciled` outcome. Use it to finish a collected report whose cleanup failed with `workspace_not_found`; never edit durable state directly.
+Do not use no-mistakes or add extra reviewers. Merge is outside reviewed-pr publication and remains governed by the existing explicit local merge authorization for direct tasks; never call GitHub merge commands.
 
-When a non-integrated change task is obsolete or superseded, call `crew_abandon` rather than pretending it was integrated or bypassing cleanup with raw Git/Herdr. This operation has its own interactive confirmation, refuses reports, active workers, dirty worktrees, and terminal tasks, records the distinct durable `abandoned` outcome, and removes only the isolated worktree and branch without changing base or pushing.
+## Direct build integration
 
-Conflict reconciliation between concurrent build branches is intentionally deferred to the next Crewdeck milestone. Never bypass a current refusal with raw Git or Herdr commands.
+For each selected direct change task, sequentially:
 
-## Recovery
+1. Collect its structured result and confirm `candidate`: settled agent, clean worktree, commits ahead, reported commit matching HEAD.
+2. Call `crew_diff` and inspect bounded commits/diffstat/patch.
+3. Call `crew_prepare_integration` to rebase and run configured verification.
+4. Present verified outcome and risk.
+5. Call `crew_merge` only after explicit user request and its independent confirmation. It is local fast-forward only and never pushes.
+6. Call `crew_cleanup` only after integration.
 
-Use `crew_status` after restarting the orchestrator. Durable records and reports preserve task identity and outcomes; `/crew` hides terminal abandoned and orphan-reconciled tasks while `/crew all` shows them. If Herdr reports an agent missing, preserve the worktree and inspect Git before proposing recovery; absence of an agent is never permission to delete work.
+Use `crew_abandon` for a clean settled obsolete unintegrated change. It has independent confirmation and never changes base or pushes.
+
+## Steering and recovery
+
+Use `crew_steer` for ordinary missing requirements or conflict instructions. Use `crew_forward_review` instead for collected review findings.
+
+Use `crew_status` after restart; state, candidate journals, review inboxes, delivery acknowledgements, escalation, and publication metadata are durable. Missing agents are never deletion authority.
+
+For a report whose Herdr workspace and Git worktree were already removed manually, `crew_reconcile_orphan_report` requires a concrete reason and independent confirmation, proves resources absent, preserves reports/history, and refuses uncertainty, dirty data, or unintegrated commits. Never edit durable state directly or bypass Crewdeck with raw Herdr/Git/GitHub commands.

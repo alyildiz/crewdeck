@@ -11,6 +11,8 @@ const execFileAsync = promisify(execFile);
 const TASK_ID_RE = /^[a-z][a-z0-9-]{0,23}$/;
 const KIND_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const LIFECYCLES = new Set(["report", "change"]);
+const CONTRACTS = new Set(["standard", "review"]);
+const WORKFLOWS = new Set(["direct", "reviewed-pr"]);
 const BUILTIN_TOOLS = new Set(["read", "grep", "find", "ls", "bash", "edit", "write"]);
 const MUTATING_TOOLS = new Set(["bash", "edit", "write"]);
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -50,6 +52,37 @@ function taskReportPath(id) {
   return path.join(reportsRoot(), `${id}.json`);
 }
 
+function taskCandidatesPath(id) {
+  return path.join(reportsRoot(), `${id}.candidates.json`);
+}
+
+async function readCandidateJournal(record) {
+  try {
+    const journal = JSON.parse(await readFile(taskCandidatesPath(record.id), "utf8"));
+    if (
+      journal.schemaVersion !== 1 ||
+      journal.taskId !== record.id ||
+      journal.kind !== record.kind ||
+      journal.workflow !== "reviewed-pr" ||
+      journal.token !== record.reportToken ||
+      !Array.isArray(journal.candidates) ||
+      journal.candidates.some(
+        (candidate, index) =>
+          candidate?.version !== index + 1 ||
+          !/^[0-9a-f]{40}$/.test(candidate.head || "") ||
+          !candidate.payload ||
+          candidate.payload.commit !== candidate.head,
+      )
+    ) {
+      return { available: false, error: "Candidate journal identity or sequence does not match the task" };
+    }
+    return { available: true, path: taskCandidatesPath(record.id), journal };
+  } catch (error) {
+    if (error.code === "ENOENT") return { available: false, state: "missing" };
+    return { available: false, error: error.message };
+  }
+}
+
 async function readTaskReport(record) {
   try {
     const report = JSON.parse(await readFile(taskReportPath(record.id), "utf8"));
@@ -58,6 +91,12 @@ async function readTaskReport(record) {
       report.taskId !== record.id ||
       report.kind !== record.kind ||
       (report.lifecycle !== undefined && record.lifecycle !== undefined && report.lifecycle !== record.lifecycle) ||
+      (record.contract === "review" &&
+        (report.contract !== "review" ||
+          report.parentTaskId !== record.parentTaskId ||
+          report.reviewedHead !== record.reviewedHead ||
+          report.payload?.parentTaskId !== record.parentTaskId ||
+          report.payload?.reviewedHead !== record.reviewedHead)) ||
       report.token !== record.reportToken ||
       !report.payload ||
       typeof report.payload !== "object"
@@ -80,6 +119,12 @@ function publicTaskReport(result) {
   if (!result.available) return result;
   const { token: _token, ...report } = result.report;
   return { available: true, path: result.path, report };
+}
+
+function publicCandidateJournal(result) {
+  if (!result.available) return result;
+  const { token: _token, ...journal } = result.journal;
+  return { available: true, path: result.path, journal };
 }
 
 async function run(command, args, options = {}) {
@@ -187,9 +232,15 @@ async function loadKinds(config, configAbsolute) {
     if (!KIND_NAME_RE.test(name) || !rawKind || typeof rawKind !== "object") {
       throw new CrewdeckError(`Invalid kind '${name}'`, "invalid_config");
     }
-    const kind = { ...rawKind };
+    const kind = { contract: "standard", ...rawKind };
     if (!LIFECYCLES.has(kind.lifecycle)) {
       throw new CrewdeckError(`Kind ${name}: lifecycle must be report or change`, "invalid_config");
+    }
+    if (!CONTRACTS.has(kind.contract)) {
+      throw new CrewdeckError(`Kind ${name}: contract must be standard or review`, "invalid_config");
+    }
+    if (kind.contract === "review" && kind.lifecycle !== "report") {
+      throw new CrewdeckError(`Kind ${name}: review contracts must use the report lifecycle`, "invalid_config");
     }
     if (typeof kind.description !== "string" || kind.description.trim().length < 8) {
       throw new CrewdeckError(`Kind ${name}: description is required`, "invalid_config");
@@ -310,6 +361,10 @@ export async function loadConfig(configPath) {
   if (!Number.isInteger(config.maxWorkers) || config.maxWorkers < 1 || config.maxWorkers > 5) {
     throw new CrewdeckError("maxWorkers must be an integer from 1 to 5", "invalid_config");
   }
+  config.maxReviewRounds ??= 3;
+  if (!Number.isInteger(config.maxReviewRounds) || config.maxReviewRounds < 1 || config.maxReviewRounds > 10) {
+    throw new CrewdeckError("maxReviewRounds must be an integer from 1 to 10", "invalid_config");
+  }
   if (!config.projects || typeof config.projects !== "object") {
     throw new CrewdeckError("projects must be an object", "invalid_config");
   }
@@ -357,6 +412,17 @@ function validateTaskInput(task, config) {
       "invalid_task",
     );
   }
+  task.workflow ||= "direct";
+  if (!WORKFLOWS.has(task.workflow)) {
+    throw new CrewdeckError(`Task ${task.id} has an invalid workflow`, "invalid_task");
+  }
+  const kind = config.kinds[task.kind];
+  if (task.workflow === "reviewed-pr" && kind.lifecycle !== "change") {
+    throw new CrewdeckError("Only change tasks can use workflow=reviewed-pr", "invalid_task");
+  }
+  if (kind.contract === "review" && (!task.parentTaskId || !task.reviewedHead)) {
+    throw new CrewdeckError("Review tasks must be spawned with parentTaskId and reviewedHead", "invalid_review_contract");
+  }
 }
 
 function agentName(id) {
@@ -364,26 +430,46 @@ function agentName(id) {
 }
 
 function workerPrompt(task, project, kind) {
-  const delivery =
-    kind.lifecycle === "report"
-      ? [
-          `This is a ${task.kind} report task: ${kind.description}`,
-          "Filesystem access is strictly read-only and no shell is available. Analyze only; a recommendation never authorizes implementation.",
-          "Finish by calling crew_complete exactly once with a self-contained report: conclusion, findings, evidence, recommendations, and openQuestions.",
-        ]
-      : [
-          `This is a ${task.kind} change task: ${kind.description}`,
-          "Implement the accepted scope, run relevant tests, and commit the result on the current branch.",
-          "Finish by calling crew_complete exactly once with summary, the exact HEAD commit hash, tests, risks, and openQuestions.",
-        ];
+  let delivery;
+  if (kind.contract === "review") {
+    delivery = [
+      `This is a ${task.kind} review task: ${kind.description}`,
+      `Review exactly commit ${task.reviewedHead} for parent build ${task.parentTaskId}. The detached worktree is immutable review evidence; never review another HEAD.`,
+      "Filesystem access is strictly read-only and no shell is available. Do not message or steer the build agent.",
+      "Finish by calling crew_complete exactly once with the bound parentTaskId/reviewedHead, verdict, summary, structured findings, checks, and openQuestions.",
+    ];
+  } else if (kind.lifecycle === "report") {
+    delivery = [
+      `This is a ${task.kind} report task: ${kind.description}`,
+      "Filesystem access is strictly read-only and no shell is available. Analyze only; a recommendation never authorizes implementation.",
+      "Finish by calling crew_complete exactly once with a self-contained report: conclusion, findings, evidence, recommendations, and openQuestions.",
+    ];
+  } else if (task.workflow === "reviewed-pr") {
+    delivery = [
+      `This is a ${task.kind} change task using the reviewed-pr workflow: ${kind.description}`,
+      "Implement the accepted scope, run relevant tests, and commit the result on the current crew/<id> branch.",
+      `Submit each clean exact HEAD with crew_submit_candidate. It stores a versioned candidate without ending this agent; remain available for orchestrator steering. At most ${task.maxReviewRounds} rounds are allowed.`,
+      "Do not call crew_complete for a reviewed-pr candidate.",
+    ];
+  } else {
+    delivery = [
+      `This is a ${task.kind} change task: ${kind.description}`,
+      "Implement the accepted scope, run relevant tests, and commit the result on the current branch.",
+      "Finish by calling crew_complete exactly once with summary, the exact HEAD commit hash, tests, risks, and openQuestions.",
+    ];
+  }
   if (kind.prompt) delivery.splice(1, 0, kind.prompt);
+  const finalInstruction =
+    task.workflow === "reviewed-pr"
+      ? "A candidate is accepted only when crew_submit_candidate confirms its durable version and exact HEAD."
+      : "The task is not complete until crew_complete accepts the structured result.";
   return [
     `# Task\n${task.task.trim()}`,
     `# Project\nYou are already in an isolated Git worktree of ${project.name}. Read and follow this worktree's AGENTS.md and inspect the project before acting.`,
     `# Delivery\n${delivery.join("\n")}`,
     "Stay inside this worktree. Do not push, merge, rebase, switch branches, remove the worktree, or modify another checkout.",
     "Do not wait for the orchestrator unless a real product decision or blocker prevents progress.",
-    "The task is not complete until crew_complete accepts the structured result.",
+    finalInstruction,
   ].join("\n\n");
 }
 
@@ -391,11 +477,51 @@ function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'\\''`)}'`;
 }
 
+function githubRepositoryFromUrl(value) {
+  const url = String(value || "").trim();
+  const match = url.match(
+    /^(?:git@github\.com:|ssh:\/\/(?:git@)?github\.com\/|https?:\/\/github\.com\/)([^/\s]+)\/([^/\s]+?)(?:\.git)?$/i,
+  );
+  return match ? `${match[1]}/${match[2]}` : undefined;
+}
+
+function validRemoteName(value) {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value || "");
+}
+
+function validRepositoryName(value) {
+  return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value || "") && !value.includes("..");
+}
+
+function validBranchName(value) {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 240 &&
+    !value.startsWith("-") &&
+    !value.startsWith("/") &&
+    !value.endsWith("/") &&
+    !value.endsWith(".") &&
+    !value.includes("..") &&
+    !value.includes("//") &&
+    !value.includes("@{") &&
+    !/[~^:?*[\\\s]/.test(value) &&
+    !value.split("/").some((part) => !part || part.endsWith(".lock"))
+  );
+}
+
 async function bindWorkerEnvironment(paneId, record) {
   const values = {
     CREWDECK_TASK_ID: record.id,
     CREWDECK_TASK_KIND: record.kind,
     CREWDECK_TASK_LIFECYCLE: record.lifecycle,
+    CREWDECK_TASK_CONTRACT: record.contract || "standard",
+    CREWDECK_TASK_WORKFLOW: record.workflow || "direct",
+    CREWDECK_TASK_BRANCH: record.branch || "",
+    CREWDECK_TASK_BASE: record.base || "",
+    CREWDECK_PARENT_TASK_ID: record.parentTaskId || "",
+    CREWDECK_REVIEWED_HEAD: record.reviewedHead || "",
+    CREWDECK_MAX_REVIEW_ROUNDS: record.maxReviewRounds || 3,
     CREWDECK_REPORT_TOKEN: record.reportToken,
     CREWDECK_REPORT_DIR: reportsRoot(),
   };
@@ -491,13 +617,15 @@ async function ensureProjectWorkspace(project) {
 async function createOne(config, project, sourceWorkspace, task, profileName) {
   validateTaskInput(task, config);
   const kind = config.kinds[task.kind];
+  task.maxReviewRounds = config.maxReviewRounds;
   const selectedProfile = task.profile || profileName || config.defaultProfile;
   const profile = config.profiles[selectedProfile];
   if (!profile) throw new CrewdeckError(`Unknown profile '${selectedProfile}'`, "unknown_profile");
   if (!profile.allowedKinds.includes(task.kind)) {
     throw new CrewdeckError(`Profile '${selectedProfile}' does not allow kind=${task.kind}`, "profile_kind_mismatch");
   }
-  const branch = `crew/${task.id}`;
+  const detached = kind.lifecycle === "report";
+  const branch = detached ? null : `crew/${task.id}`;
   const worktree = path.join(config.worktreeRoot, project.name, task.id);
   const name = agentName(task.id);
 
@@ -509,35 +637,91 @@ async function createOne(config, project, sourceWorkspace, task, profileName) {
       "task_exists",
     );
   }
-  try {
-    await git(project.path, ["show-ref", "--verify", `refs/heads/${branch}`]);
-    throw new CrewdeckError(`Branch ${branch} already exists`, "branch_exists");
-  } catch (error) {
-    if (error instanceof CrewdeckError && error.code === "branch_exists") throw error;
-    if (!(error instanceof CrewdeckError) || error.details?.exitCode === 0) throw error;
+  if (!detached) {
+    try {
+      await git(project.path, ["show-ref", "--verify", `refs/heads/${branch}`]);
+      throw new CrewdeckError(`Branch ${branch} already exists`, "branch_exists");
+    } catch (error) {
+      if (error instanceof CrewdeckError && error.code === "branch_exists") throw error;
+      if (!(error instanceof CrewdeckError) || error.details?.exitCode === 0) throw error;
+    }
   }
 
   await mkdir(path.dirname(worktree), { recursive: true });
-  const created = await runJson("herdr", [
-    "worktree",
-    "create",
-    "--workspace",
-    sourceWorkspace.id,
-    "--branch",
-    branch,
-    "--base",
-    project.base,
-    "--path",
-    worktree,
-    "--label",
-    `crew:${task.id}`,
-    "--no-focus",
-  ]);
+  let created;
+  if (detached) {
+    const checkoutRef = task.reviewedHead || project.base;
+    await git(project.path, ["worktree", "add", "--detach", worktree, checkoutRef], { timeout: 30_000 });
+    try {
+      created = await runJson("herdr", [
+        "worktree",
+        "open",
+        "--workspace",
+        sourceWorkspace.id,
+        "--path",
+        worktree,
+        "--label",
+        `crew:${task.id}`,
+        "--no-focus",
+      ]);
+    } catch (error) {
+      try {
+        await git(project.path, ["worktree", "remove", "--force", worktree]);
+      } catch {
+        // Preserve failed detached resources if Git cannot prove safe removal.
+      }
+      throw error;
+    }
+  } else {
+    created = await runJson("herdr", [
+      "worktree",
+      "create",
+      "--workspace",
+      sourceWorkspace.id,
+      "--branch",
+      branch,
+      "--base",
+      project.base,
+      "--path",
+      worktree,
+      "--label",
+      `crew:${task.id}`,
+      "--no-focus",
+    ]);
+  }
   const workspaceId = created?.result?.workspace?.workspace_id;
   const paneId = created?.result?.root_pane?.pane_id;
-  if (!workspaceId || !paneId) {
-    throw new CrewdeckError("Herdr created a worktree without workspace/pane identifiers", "invalid_herdr_response");
+  const detachedConfirmed =
+    !detached ||
+    (created?.result?.worktree?.is_detached === true &&
+      (await git(worktree, ["branch", "--show-current"])).stdout === "");
+  if (!workspaceId || !paneId || !detachedConfirmed) {
+    if (detached) {
+      let removedByHerdr = false;
+      if (workspaceId) {
+        try {
+          await runJson("herdr", ["worktree", "remove", "--workspace", workspaceId], { timeout: 30_000 });
+          removedByHerdr = true;
+        } catch {
+          // Fall back to the exact Git worktree only when Herdr cannot clean its partial response.
+        }
+      }
+      if (!removedByHerdr) {
+        try {
+          await git(project.path, ["worktree", "remove", "--force", worktree]);
+        } catch {
+          // Preserve failed detached resources if Git cannot prove safe removal.
+        }
+      }
+    }
+    throw new CrewdeckError(
+      detached && !detachedConfirmed
+        ? "Herdr did not prove that the report worktree remained detached"
+        : "Herdr created a worktree without workspace/pane identifiers",
+      detached && !detachedConfirmed ? "detached_worktree_unproven" : "invalid_herdr_response",
+    );
   }
+  const checkoutHead = (await git(worktree, ["rev-parse", "HEAD"])).stdout;
 
   const record = {
     id: task.id,
@@ -545,10 +729,18 @@ async function createOne(config, project, sourceWorkspace, task, profileName) {
     description: task.task.trim(),
     kind: task.kind,
     lifecycle: kind.lifecycle,
+    contract: kind.contract,
+    workflow: task.workflow,
     cleanup: kind.cleanup,
     profile: selectedProfile,
     status: "starting",
     branch,
+    detached,
+    checkoutHead,
+    ...(task.parentTaskId ? { parentTaskId: task.parentTaskId } : {}),
+    ...(task.reviewedHead ? { reviewedHead: task.reviewedHead } : {}),
+    ...(task.candidateVersion ? { candidateVersion: task.candidateVersion } : {}),
+    maxReviewRounds: config.maxReviewRounds,
     base: project.base,
     repo: project.path,
     worktree,
@@ -578,7 +770,10 @@ async function createOne(config, project, sourceWorkspace, task, profileName) {
     REPORTER_EXTENSION,
     "--no-skills",
     "--tools",
-    [...kind.tools, "crew_complete"].join(","),
+    [
+      ...kind.tools,
+      ...(task.workflow === "reviewed-pr" ? ["crew_submit_candidate"] : ["crew_complete"]),
+    ].join(","),
   ];
   for (const skill of kind.resolvedSkills) piArgs.push("--skill", skill);
   if (kind.lifecycle === "report") {
@@ -648,6 +843,130 @@ export async function spawnBatch(configPath, { project: projectName, tasks, prof
   );
 }
 
+export async function spawnReview(
+  configPath,
+  { id, parentTaskId, reviewedHead, task, profile },
+) {
+  if (process.env.HERDR_ENV !== "1") {
+    throw new CrewdeckError("Crewdeck must run inside a Herdr-managed pane", "not_in_herdr");
+  }
+  if (!TASK_ID_RE.test(parentTaskId || "") || !/^[0-9a-f]{40}$/.test(reviewedHead || "")) {
+    throw new CrewdeckError("Review requires a valid parentTaskId and full reviewedHead SHA", "invalid_review_contract");
+  }
+  const config = await loadConfig(configPath);
+  const reviewKinds = Object.entries(config.kinds).filter(([, kind]) => kind.contract === "review");
+  if (reviewKinds.length !== 1) {
+    throw new CrewdeckError("Configure exactly one review contract kind", "invalid_review_kind_configuration");
+  }
+  const [kindName] = reviewKinds[0];
+  const state = await loadState();
+  const parent = state.tasks[parentTaskId];
+  if (!parent) throw new CrewdeckError(`Unknown parent task '${parentTaskId}'`, "unknown_task");
+  parent.kind ||= parent.profile === "scout" ? "scout" : "build";
+  parent.lifecycle ||= config.kinds[parent.kind]?.lifecycle || "change";
+  parent.workflow ||= "direct";
+  if (parent.lifecycle !== "change" || parent.workflow !== "reviewed-pr") {
+    throw new CrewdeckError("Reviews require a reviewed-pr change parent", "invalid_review_parent");
+  }
+  if (parent.status === "cleaned" || parent.cleanedAt || ["integrated", "abandoned"].includes(parent.status)) {
+    throw new CrewdeckError("Review parent is terminal", "invalid_review_parent");
+  }
+  const journal = await readCandidateJournal(parent);
+  if (!journal.available) {
+    throw new CrewdeckError(journal.error || "Parent has no submitted candidates", "missing_candidate");
+  }
+  const candidate = journal.journal.candidates.at(-1);
+  if (!candidate || candidate.head !== reviewedHead) {
+    throw new CrewdeckError("reviewedHead is not the current submitted candidate", "stale_candidate");
+  }
+  if ((parent.candidateCollectedVersion || 0) < candidate.version) {
+    throw new CrewdeckError("Collect the durable candidate inbox event before review", "candidate_not_collected");
+  }
+  if (candidate.version > config.maxReviewRounds) {
+    throw new CrewdeckError("Review round limit reached; escalation is required", "review_round_limit");
+  }
+  const snapshot = await gitSnapshot(parent);
+  if (!snapshot.available || !snapshot.clean) {
+    throw new CrewdeckError("Build worktree must be available and clean", "dirty_worktree", snapshot);
+  }
+  if (snapshot.head !== reviewedHead) {
+    throw new CrewdeckError("Build HEAD changed after candidate submission", "stale_candidate");
+  }
+  if (snapshot.ahead < 1) throw new CrewdeckError("Candidate has no commits ahead of base", "no_commits");
+  const agent = await liveAgent(parent);
+  if (agent.available && !["idle", "done"].includes(agent.state)) {
+    throw new CrewdeckError(`Build writer is ${agent.state}; wait until it settles`, "worker_not_settled");
+  }
+  if (!agent.available && !/agent[^\n]*(not[_ -]?found|missing)|not[_ -]?found[^\n]*agent/i.test(agent.error || "")) {
+    throw new CrewdeckError("Cannot prove build writer state before review", "agent_state_unknown", agent);
+  }
+  const reviews = Object.values(state.tasks).filter((record) => record.parentTaskId === parentTaskId);
+  if (reviews.some((record) => record.reviewedHead === reviewedHead)) {
+    throw new CrewdeckError("This candidate already has its single reviewer", "review_already_exists");
+  }
+  if (reviews.some((record) => !record.cleanedAt && !["cleaned", "orphan-reconciled"].includes(record.status))) {
+    throw new CrewdeckError("Another reviewer for this build is still open", "reviewer_already_active");
+  }
+
+  const reservedAt = new Date().toISOString();
+  await withStateLock(async () => {
+    const next = await loadState();
+    const nextParent = next.tasks[parentTaskId];
+    if (!nextParent) throw new CrewdeckError("Review parent disappeared", "state_changed");
+    const nextReviews = Object.values(next.tasks).filter((record) => record.parentTaskId === parentTaskId);
+    if (nextReviews.some((record) => record.reviewedHead === reviewedHead)) {
+      throw new CrewdeckError("This candidate already has its single reviewer", "review_already_exists");
+    }
+    if (nextReviews.some((record) => !record.cleanedAt && !["cleaned", "orphan-reconciled"].includes(record.status))) {
+      throw new CrewdeckError("Another reviewer for this build is still open", "reviewer_already_active");
+    }
+    const reservation = nextParent.reviewReservation;
+    if (reservation) {
+      const reservedTask = next.tasks[reservation.reviewTaskId];
+      const reservationActive = reservedTask
+        ? !reservedTask.cleanedAt && !["cleaned", "orphan-reconciled"].includes(reservedTask.status)
+        : Date.now() - Date.parse(reservation.reservedAt) < 120_000;
+      if (reservationActive) {
+        throw new CrewdeckError("Another reviewer reservation is active", "reviewer_already_active");
+      }
+    }
+    nextParent.reviewReservation = { reviewTaskId: id, reviewedHead, reservedAt };
+    await saveState(next);
+  });
+
+  const project = resolveProject(config, parent.project);
+  try {
+    await validateProject(project);
+    const sourceWorkspace = await ensureProjectWorkspace(project);
+    return await createOne(
+      config,
+      project,
+      sourceWorkspace,
+      {
+        id,
+        kind: kindName,
+        task,
+        profile,
+        workflow: "direct",
+        parentTaskId,
+        reviewedHead,
+        candidateVersion: candidate.version,
+      },
+      profile,
+    );
+  } catch (error) {
+    await withStateLock(async () => {
+      const next = await loadState();
+      const nextParent = next.tasks[parentTaskId];
+      if (nextParent?.reviewReservation?.reviewTaskId === id && !next.tasks[id]) {
+        delete nextParent.reviewReservation;
+        await saveState(next);
+      }
+    });
+    throw error;
+  }
+}
+
 async function liveAgent(record) {
   try {
     const response = await runJson("herdr", ["agent", "get", record.agentName], { timeout: 10_000 });
@@ -696,6 +1015,8 @@ export async function getStatus(configPath, id) {
         kind: storedRecord.kind || (storedRecord.profile === "scout" ? "scout" : "build"),
       };
       record.lifecycle ||= config.kinds[record.kind]?.lifecycle || (record.kind === "scout" ? "report" : "change");
+      record.contract ||= config.kinds[record.kind]?.contract || "standard";
+      record.workflow ||= "direct";
       record.cleanup ||= config.kinds[record.kind]?.cleanup ||
         (record.lifecycle === "report" ? "after-collection" : "after-integration");
       if (
@@ -709,21 +1030,53 @@ export async function getStatus(configPath, id) {
           agent: { available: false, state: "closed" },
           git: { available: false, state: "worktree-removed" },
         };
-        if (["abandoned", "orphan-reconciled"].includes(record.status)) {
+        if (["abandoned", "orphan-reconciled"].includes(record.status) || record.contract === "review") {
           terminal.result = publicTaskReport(await readTaskReport(record));
+        }
+        if (record.contract === "review") {
+          const parent = state.tasks[record.parentTaskId];
+          const parentSnapshot = parent ? await gitSnapshot(parent) : { available: false };
+          terminal.reviewValidity = {
+            reviewedHead: record.reviewedHead,
+            validForCurrentHead: parentSnapshot.available && parentSnapshot.head === record.reviewedHead,
+          };
         }
         return terminal;
       }
-      const [agent, snapshot, result] = await Promise.all([
+      const [agent, snapshot, result, candidates] = await Promise.all([
         liveAgent(record),
         gitSnapshot(record),
         readTaskReport(record),
+        readCandidateJournal(record),
       ]);
       let observedStatus = record.status;
       if (record.status === "abandoned" && !record.cleanedAt) observedStatus = "abandon-cleanup-pending";
       if (record.status === "running" && agent.state === "blocked") observedStatus = "blocked";
       if (record.lifecycle === "report" && result.available) {
         observedStatus = record.resultCollectedAt ? "report-collected" : "report-ready";
+        if (record.contract === "review") {
+          const parent = state.tasks[record.parentTaskId];
+          const parentSnapshot = parent ? await gitSnapshot(parent) : { available: false };
+          const stillCurrent =
+            parentSnapshot.available &&
+            parentSnapshot.head === record.reviewedHead &&
+            result.report.reviewedHead === record.reviewedHead;
+          observedStatus = stillCurrent
+            ? record.resultCollectedAt ? "report-collected" : "review-ready"
+            : "review-stale";
+        }
+      }
+      if (record.workflow === "reviewed-pr" && candidates.available) {
+        const candidate = candidates.journal.candidates.at(-1);
+        if (candidate) {
+          const review = (record.reviewInbox || [])
+            .filter((item) => item.reviewedHead === candidate.head)
+            .at(-1);
+          if (!snapshot.available || snapshot.head !== candidate.head) observedStatus = "candidate-stale";
+          else if ((record.candidateCollectedVersion || 0) < candidate.version) observedStatus = "candidate-submitted";
+          else if (review?.validAtCollection) observedStatus = `review-${review.verdict}`;
+          else observedStatus = "candidate";
+        }
       }
       const reportedCommit = result.available ? result.report.payload?.commit : undefined;
       const commitMatches =
@@ -746,6 +1099,7 @@ export async function getStatus(configPath, id) {
         agent,
         git: snapshot,
         result: publicTaskReport(result),
+        candidates: publicCandidateJournal(candidates),
       };
     }),
   );
@@ -756,13 +1110,25 @@ export async function getPendingResultIds(configPath) {
   const state = await loadState();
   const pending = [];
   for (const storedRecord of Object.values(state.tasks)) {
-    if (storedRecord.resultCollectedAt || storedRecord.status === "cleaned") continue;
     const record = { ...storedRecord };
     record.kind ||= record.profile === "scout" ? "scout" : "build";
     record.lifecycle ||= config.kinds[record.kind]?.lifecycle ||
       (record.kind === "scout" ? "report" : "change");
-    const result = await readTaskReport(record);
-    if (result.available) pending.push(record.id);
+    record.workflow ||= "direct";
+    if (record.workflow === "reviewed-pr") {
+      const candidates = await readCandidateJournal(record);
+      if (candidates.available) {
+        for (const candidate of candidates.journal.candidates) {
+          if (candidate.version > (record.candidateCollectedVersion || 0)) {
+            pending.push(`${record.id}@candidate-${candidate.version}`);
+          }
+        }
+      }
+    }
+    if (!record.resultCollectedAt && record.status !== "cleaned") {
+      const result = await readTaskReport(record);
+      if (result.available) pending.push(record.id);
+    }
   }
   return pending.sort();
 }
@@ -818,30 +1184,113 @@ export async function promptTask(configPath, id, message, { wait = false } = {})
 export async function collectResults(configPath, ids, { cleanupReports, cleanupScouts } = {}) {
   const config = await loadConfig(configPath);
   const state = await loadState();
-  const selectedIds = ids?.length
-    ? ids
-    : Object.values(state.tasks)
-        .filter((record) => !record.resultCollectedAt && record.status !== "cleaned")
-        .map((record) => record.id);
+  const selectedKeys = ids?.length ? ids : await getPendingResultIds(configPath);
   const collected = [];
-  for (const id of selectedIds) {
+  const candidateAcks = new Map();
+  const resultAcks = new Map();
+  const reviewInboxAdds = [];
+  const seenCandidates = new Set();
+  const seenResults = new Set();
+
+  for (const key of selectedKeys) {
+    const match = String(key).match(/^([a-z][a-z0-9-]{0,23})(?:@candidate-([1-9][0-9]*))?$/);
+    if (!match) throw new CrewdeckError(`Invalid inbox key '${key}'`, "invalid_inbox_key");
+    const [, id, requestedVersionText] = match;
+    const requestedVersion = requestedVersionText ? Number(requestedVersionText) : undefined;
     const record = state.tasks[id];
     if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
     record.kind ||= record.profile === "scout" ? "scout" : "build";
     record.lifecycle ||= config.kinds[record.kind]?.lifecycle || (record.kind === "scout" ? "report" : "change");
+    record.contract ||= config.kinds[record.kind]?.contract || "standard";
+    record.workflow ||= "direct";
     record.cleanup ||= config.kinds[record.kind]?.cleanup ||
       (record.lifecycle === "report" ? "after-collection" : "after-integration");
+
+    if (record.workflow === "reviewed-pr") {
+      const journal = await readCandidateJournal(record);
+      if (journal.available) {
+        const upper = requestedVersion ?? journal.journal.candidates.length;
+        if (upper > journal.journal.candidates.length) {
+          throw new CrewdeckError(`Candidate v${upper} does not exist`, "missing_candidate");
+        }
+        for (const candidate of journal.journal.candidates) {
+          if (candidate.version <= (record.candidateCollectedVersion || 0) || candidate.version > upper) continue;
+          const candidateKey = `${id}@candidate-${candidate.version}`;
+          if (seenCandidates.has(candidateKey)) continue;
+          seenCandidates.add(candidateKey);
+          collected.push({
+            inboxKey: candidateKey,
+            task: publicTaskRecord(record),
+            candidate: { ...candidate },
+          });
+          candidateAcks.set(id, Math.max(candidateAcks.get(id) || 0, candidate.version));
+        }
+      } else if (requestedVersion !== undefined) {
+        throw new CrewdeckError(journal.error || "Candidate journal is missing", "missing_candidate");
+      }
+    } else if (requestedVersion !== undefined) {
+      throw new CrewdeckError("Only reviewed-pr builds have candidate inbox events", "invalid_inbox_key");
+    }
+
+    if (requestedVersion !== undefined || seenResults.has(id)) continue;
+    seenResults.add(id);
     const result = await readTaskReport(record);
     if (!result.available) continue;
-    record.resultCollectedAt ||= new Date().toISOString();
-    collected.push({ task: publicTaskRecord(record), result: publicTaskReport(result) });
+    const collectedAt = record.resultCollectedAt || new Date().toISOString();
+    record.resultCollectedAt = collectedAt;
+    resultAcks.set(id, collectedAt);
+    const item = { task: publicTaskRecord(record), result: publicTaskReport(result) };
+    collected.push(item);
+
+    if (record.contract === "review") {
+      const parent = state.tasks[record.parentTaskId];
+      if (!parent) throw new CrewdeckError("Review parent is missing from durable state", "invalid_review_parent");
+      const parentSnapshot = await gitSnapshot(parent);
+      const parentJournal = await readCandidateJournal(parent);
+      const currentCandidate = parentJournal.available ? parentJournal.journal.candidates.at(-1) : undefined;
+      const validAtCollection =
+        parentSnapshot.available &&
+        parentSnapshot.head === record.reviewedHead &&
+        currentCandidate?.head === record.reviewedHead;
+      reviewInboxAdds.push({
+        parentTaskId: record.parentTaskId,
+        entry: {
+          reviewTaskId: record.id,
+          candidateVersion: record.candidateVersion,
+          reviewedHead: record.reviewedHead,
+          verdict: result.report.payload.verdict,
+          summary: result.report.payload.summary,
+          findings: result.report.payload.findings,
+          checks: result.report.payload.checks,
+          openQuestions: result.report.payload.openQuestions,
+          completedAt: result.report.completedAt,
+          collectedAt,
+          validAtCollection,
+          ...(validAtCollection ? {} : { staleAt: collectedAt }),
+        },
+      });
+    }
   }
-  if (collected.length > 0) {
+
+  if (candidateAcks.size > 0 || resultAcks.size > 0 || reviewInboxAdds.length > 0) {
     await withStateLock(async () => {
       const next = await loadState();
-      for (const item of collected) {
-        next.tasks[item.task.id].resultCollectedAt = item.task.resultCollectedAt;
-        next.tasks[item.task.id].kind ||= item.task.kind;
+      for (const [id, version] of candidateAcks) {
+        if (!next.tasks[id]) throw new CrewdeckError(`Task '${id}' disappeared`, "state_changed");
+        next.tasks[id].candidateCollectedVersion = Math.max(next.tasks[id].candidateCollectedVersion || 0, version);
+        next.tasks[id].candidateCollectedAt = new Date().toISOString();
+      }
+      for (const [id, collectedAt] of resultAcks) {
+        if (!next.tasks[id]) throw new CrewdeckError(`Task '${id}' disappeared`, "state_changed");
+        next.tasks[id].resultCollectedAt ||= collectedAt;
+      }
+      for (const { parentTaskId, entry } of reviewInboxAdds) {
+        const parent = next.tasks[parentTaskId];
+        if (!parent) throw new CrewdeckError("Review parent disappeared", "state_changed");
+        parent.reviewInbox ||= [];
+        if (!parent.reviewInbox.some((item) => item.reviewTaskId === entry.reviewTaskId)) {
+          parent.reviewInbox.push(entry);
+        }
       }
       await saveState(next);
     });
@@ -851,6 +1300,7 @@ export async function collectResults(configPath, ids, { cleanupReports, cleanupS
   if (shouldCleanupReports) {
     for (const item of collected) {
       if (
+        !item.result ||
         item.task.lifecycle !== "report" ||
         item.task.cleanup !== "after-collection" ||
         item.task.status === "cleaned"
@@ -865,6 +1315,225 @@ export async function collectResults(configPath, ids, { cleanupReports, cleanupS
   return collected;
 }
 
+export async function forwardReviewFindings(configPath, reviewId, { wait = false } = {}) {
+  const config = await loadConfig(configPath);
+  const state = await loadState();
+  const review = state.tasks[reviewId];
+  if (!review) throw new CrewdeckError(`Unknown review task '${reviewId}'`, "unknown_task");
+  review.contract ||= config.kinds[review.kind]?.contract || "standard";
+  if (review.contract !== "review") throw new CrewdeckError("Task is not a review", "review_task_required");
+  if (!review.resultCollectedAt) {
+    throw new CrewdeckError("Collect the review into the durable parent inbox first", "review_not_collected");
+  }
+  const parent = state.tasks[review.parentTaskId];
+  if (!parent) throw new CrewdeckError("Review parent is missing", "invalid_review_parent");
+  const inbox = (parent.reviewInbox || []).find((item) => item.reviewTaskId === reviewId);
+  if (!inbox) throw new CrewdeckError("Durable parent review inbox entry is missing", "review_inbox_missing");
+  if (inbox.forwardedAt) {
+    return { forwarded: true, idempotent: true, reviewTaskId: reviewId, parentTaskId: parent.id, forwardedAt: inbox.forwardedAt };
+  }
+  const [snapshot, journal] = await Promise.all([gitSnapshot(parent), readCandidateJournal(parent)]);
+  const currentCandidate = journal.available ? journal.journal.candidates.at(-1) : undefined;
+  if (!snapshot.available || snapshot.head !== inbox.reviewedHead || currentCandidate?.head !== inbox.reviewedHead) {
+    throw new CrewdeckError("Review is stale because the build HEAD changed", "stale_review");
+  }
+  if (!inbox.validAtCollection) throw new CrewdeckError("Review was stale when collected", "stale_review");
+  if (inbox.verdict === "approved") {
+    throw new CrewdeckError("Approved reviews have no correction round to forward", "review_already_approved");
+  }
+  if (
+    inbox.verdict === "blocked" ||
+    inbox.verdict === "inconclusive" ||
+    inbox.candidateVersion >= config.maxReviewRounds
+  ) {
+    const escalatedAt = new Date().toISOString();
+    await withStateLock(async () => {
+      const next = await loadState();
+      const nextParent = next.tasks[parent.id];
+      const nextInbox = (nextParent?.reviewInbox || []).find((item) => item.reviewTaskId === reviewId);
+      if (!nextInbox) throw new CrewdeckError("Review inbox changed", "state_changed");
+      nextInbox.escalatedAt ||= escalatedAt;
+      nextParent.reviewEscalation = {
+        reviewTaskId: reviewId,
+        reviewedHead: inbox.reviewedHead,
+        verdict: inbox.verdict,
+        reason:
+          inbox.candidateVersion >= config.maxReviewRounds
+            ? `review round limit ${config.maxReviewRounds} reached`
+            : `review verdict ${inbox.verdict} requires orchestration decision`,
+        escalatedAt: nextInbox.escalatedAt,
+      };
+      await saveState(next);
+    });
+    return {
+      forwarded: false,
+      escalationRequired: true,
+      reviewTaskId: reviewId,
+      parentTaskId: parent.id,
+      verdict: inbox.verdict,
+      findings: inbox.findings,
+    };
+  }
+  if (inbox.verdict !== "changes-requested") {
+    throw new CrewdeckError(`Unsupported review verdict '${inbox.verdict}'`, "invalid_review_verdict");
+  }
+
+  const attemptAt = new Date().toISOString();
+  await withStateLock(async () => {
+    const next = await loadState();
+    const nextInbox = (next.tasks[parent.id]?.reviewInbox || []).find((item) => item.reviewTaskId === reviewId);
+    if (!nextInbox) throw new CrewdeckError("Review inbox changed", "state_changed");
+    if (nextInbox.forwardedAt) return;
+    nextInbox.forwardStatus = "pending";
+    nextInbox.forwardAttemptedAt = attemptAt;
+    nextInbox.forwardAttempts = (nextInbox.forwardAttempts || 0) + 1;
+    await saveState(next);
+  });
+
+  const message = [
+    `CREWDECK REVIEW ${reviewId}: changes requested for candidate v${inbox.candidateVersion} at ${inbox.reviewedHead}.`,
+    "Address the durable structured findings below, run tests, commit on your existing crew branch, then call crew_submit_candidate for the new exact HEAD.",
+    JSON.stringify({
+      reviewTaskId: reviewId,
+      reviewedHead: inbox.reviewedHead,
+      summary: inbox.summary,
+      findings: inbox.findings,
+      openQuestions: inbox.openQuestions,
+    }),
+  ].join("\n");
+  const response = await promptTask(configPath, parent.id, message, { wait });
+  const forwardedAt = new Date().toISOString();
+  await withStateLock(async () => {
+    const next = await loadState();
+    const nextInbox = (next.tasks[parent.id]?.reviewInbox || []).find((item) => item.reviewTaskId === reviewId);
+    if (!nextInbox) throw new CrewdeckError("Review inbox changed after steering", "state_changed");
+    nextInbox.forwardStatus = "delivered";
+    nextInbox.forwardedAt ||= forwardedAt;
+    await saveState(next);
+  });
+  return { forwarded: true, idempotent: false, reviewTaskId: reviewId, parentTaskId: parent.id, forwardedAt, response };
+}
+
+export async function resumeBuild(configPath, id) {
+  const config = await loadConfig(configPath);
+  const state = await loadState();
+  const record = state.tasks[id];
+  if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
+  record.kind ||= record.profile === "scout" ? "scout" : "build";
+  record.lifecycle ||= config.kinds[record.kind]?.lifecycle || "change";
+  record.workflow ||= "direct";
+  if (record.lifecycle !== "change" || record.workflow !== "reviewed-pr") {
+    throw new CrewdeckError("Only reviewed-pr builds can be safely resumed", "invalid_resume_task");
+  }
+  if (record.status === "cleaned" || record.cleanedAt || ["integrated", "abandoned"].includes(record.status)) {
+    throw new CrewdeckError("Terminal builds cannot be resumed", "invalid_resume_task");
+  }
+  const agent = await liveAgent(record);
+  if (agent.available) throw new CrewdeckError(`Agent still exists with state ${agent.state}`, "writer_already_present");
+  if (!/agent[^\n]*(not[_ -]?found|missing)|not[_ -]?found[^\n]*agent/i.test(agent.error || "")) {
+    throw new CrewdeckError("Cannot prove the previous build writer is absent", "agent_state_unknown", agent);
+  }
+  await runJson("herdr", ["workspace", "get", record.workspaceId], { timeout: 10_000 });
+  const project = resolveProject(config, record.project);
+  if (
+    record.branch !== `crew/${id}` ||
+    path.resolve(record.worktree) !== path.join(config.worktreeRoot, record.project, id) ||
+    path.resolve(record.repo) !== project.path
+  ) {
+    throw new CrewdeckError("Build does not reference its expected isolated resources", "unsafe_task_resources");
+  }
+  const branch = (await git(record.worktree, ["branch", "--show-current"])).stdout;
+  if (branch !== record.branch) throw new CrewdeckError("Build worktree is not on its owned branch", "wrong_branch");
+  const kind = config.kinds[record.kind];
+  const profile = config.profiles[record.profile];
+  if (!kind || !profile || !profile.allowedKinds.includes(record.kind)) {
+    throw new CrewdeckError("Stored build kind/profile is no longer configured", "invalid_resume_task");
+  }
+  const piArgs = [
+    "--model", `${profile.provider}/${profile.model}`,
+    "--thinking", profile.thinking,
+    "--name", `crew:${record.id}`,
+    "--no-extensions", "-e", REPORTER_EXTENSION,
+    "--no-skills",
+    "--tools", [...kind.tools, "crew_submit_candidate"].join(","),
+  ];
+  for (const skill of kind.resolvedSkills) piArgs.push("--skill", skill);
+  if (project.trustProjectResources === true) piArgs.push("--approve");
+  const reservationToken = randomBytes(12).toString("hex");
+  const reservedAt = new Date().toISOString();
+  await withStateLock(async () => {
+    const next = await loadState();
+    const stored = next.tasks[id];
+    if (!stored || stored.cleanedAt || ["integrated", "abandoned"].includes(stored.status)) {
+      throw new CrewdeckError("Build state changed during adoption", "state_changed");
+    }
+    if (
+      stored.resumeReservation &&
+      Date.now() - Date.parse(stored.resumeReservation.reservedAt) < 120_000
+    ) {
+      throw new CrewdeckError("Another build adoption is already starting", "resume_in_progress");
+    }
+    stored.resumeReservation = { token: reservationToken, reservedAt };
+    await saveState(next);
+  });
+
+  try {
+    await bindWorkerEnvironment(record.paneId, record);
+    await startAgentWhenShellReady(record.agentName, record.paneId, piArgs);
+    const latestInbox = (record.reviewInbox || []).at(-1);
+    const resumePrompt = [
+      workerPrompt(
+        {
+          id: record.id,
+          kind: record.kind,
+          task: record.description,
+          workflow: "reviewed-pr",
+          maxReviewRounds: record.maxReviewRounds || config.maxReviewRounds,
+        },
+        project,
+        kind,
+      ),
+      "# Recovery\nYou are the sole replacement writer adopted after Crewdeck proved the previous agent absent. Inspect the existing worktree before changing anything.",
+      latestInbox ? `Latest durable review inbox entry:\n${JSON.stringify(latestInbox)}` : "No review has been collected yet.",
+    ].join("\n\n");
+    await run("herdr", ["agent", "prompt", record.agentName, resumePrompt], { timeout: 15_000 });
+    const resumedAt = new Date().toISOString();
+    let resumedRecord;
+    await withStateLock(async () => {
+      const next = await loadState();
+      const stored = next.tasks[id];
+      if (
+        !stored ||
+        stored.cleanedAt ||
+        ["integrated", "abandoned"].includes(stored.status) ||
+        stored.resumeReservation?.token !== reservationToken
+      ) {
+        throw new CrewdeckError("Build state changed during adoption", "state_changed");
+      }
+      stored.status = "running";
+      stored.resumedAt = resumedAt;
+      stored.resumeCount = (stored.resumeCount || 0) + 1;
+      delete stored.resumeReservation;
+      delete stored.error;
+      resumedRecord = { ...stored };
+      await saveState(next);
+    });
+    return publicTaskRecord(resumedRecord);
+  } catch (error) {
+    await withStateLock(async () => {
+      const next = await loadState();
+      const stored = next.tasks[id];
+      if (stored?.resumeReservation?.token === reservationToken) {
+        delete stored.resumeReservation;
+        stored.resumeLastFailedAt = new Date().toISOString();
+        stored.resumeLastError = error.message;
+        await saveState(next);
+      }
+    });
+    throw error;
+  }
+}
+
 export async function prepareIntegration(configPath, id) {
   const config = await loadConfig(configPath);
   const state = await loadState();
@@ -872,6 +1541,10 @@ export async function prepareIntegration(configPath, id) {
   if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
   record.kind ||= record.profile === "scout" ? "scout" : "build";
   record.lifecycle ||= config.kinds[record.kind]?.lifecycle || (record.kind === "scout" ? "report" : "change");
+  record.workflow ||= "direct";
+  if (record.workflow === "reviewed-pr") {
+    throw new CrewdeckError("reviewed-pr builds publish a draft PR and are not prepared for local merge", "reviewed_pr_no_local_merge");
+  }
   const project = resolveProject(config, record.project);
   if (record.lifecycle !== "change") {
     throw new CrewdeckError("Report tasks cannot be integrated", "read_only_task");
@@ -1024,8 +1697,11 @@ export async function reconcileOrphanReport(configPath, id, { reason } = {}) {
     throw new CrewdeckError("Orphan reconciliation requires a non-empty durable reason", "invalid_reason");
   }
   const project = resolveProject(config, record.project);
+  const expectedGitIdentity = record.detached === true
+    ? record.branch === null && /^[0-9a-f]{40}$/.test(record.checkoutHead || "")
+    : record.branch === `crew/${id}`;
   if (
-    record.branch !== `crew/${id}` ||
+    !expectedGitIdentity ||
     path.resolve(record.worktree) !== path.join(config.worktreeRoot, record.project, id) ||
     path.resolve(record.repo) !== project.path
   ) {
@@ -1055,7 +1731,7 @@ export async function reconcileOrphanReport(configPath, id, { reason } = {}) {
   }
 
   const baseHead = (await git(record.repo, ["rev-parse", record.base])).stdout;
-  const branchExists = (await git(record.repo, [
+  const branchExists = record.detached !== true && (await git(record.repo, [
     "branch", "--list", record.branch, "--format=%(refname)",
   ])).stdout === `refs/heads/${record.branch}`;
   if (branchExists) {
@@ -1076,8 +1752,8 @@ export async function reconcileOrphanReport(configPath, id, { reason } = {}) {
       const space = line.indexOf(" ");
       return space < 0 ? [line, true] : [line.slice(0, space), line.slice(space + 1)];
     })));
-  const branchRef = `refs/heads/${record.branch}`;
-  const unexpectedCheckout = worktrees.find(
+  const branchRef = record.detached === true ? undefined : `refs/heads/${record.branch}`;
+  const unexpectedCheckout = branchRef && worktrees.find(
     (item) => item.branch === branchRef && path.resolve(item.worktree) !== path.resolve(record.worktree),
   );
   if (unexpectedCheckout) {
@@ -1085,8 +1761,11 @@ export async function reconcileOrphanReport(configPath, id, { reason } = {}) {
   }
   const staleRegistration = worktrees.find((item) => path.resolve(item.worktree) === path.resolve(record.worktree));
   if (staleRegistration) {
-    if (staleRegistration.branch !== branchRef) {
-      throw new CrewdeckError("Stale worktree metadata references an unexpected branch", "unsafe_git_metadata", staleRegistration);
+    const metadataMatches = record.detached === true
+      ? staleRegistration.detached === true && staleRegistration.HEAD === record.checkoutHead
+      : staleRegistration.branch === branchRef;
+    if (!metadataMatches) {
+      throw new CrewdeckError("Stale worktree metadata references an unexpected Git identity", "unsafe_git_metadata", staleRegistration);
     }
     await git(record.repo, ["worktree", "remove", "--force", record.worktree]);
   }
@@ -1111,6 +1790,291 @@ export async function reconcileOrphanReport(configPath, id, { reason } = {}) {
     await saveState(next);
   });
   return publicTaskRecord(record);
+}
+
+export async function publishPullRequest(
+  configPath,
+  id,
+  { remote, repo, base, head, title, body },
+) {
+  const config = await loadConfig(configPath);
+  if (!validRemoteName(remote) || !validRepositoryName(repo) || !validBranchName(base) || !validBranchName(head)) {
+    throw new CrewdeckError("remote, repo, base, and head must be explicit valid GitHub publication targets", "invalid_publication_target");
+  }
+  if (typeof title !== "string" || !title.trim() || typeof body !== "string" || !body.trim()) {
+    throw new CrewdeckError("Draft PR title and body are required", "invalid_publication_target");
+  }
+  const state = await loadState();
+  const record = state.tasks[id];
+  if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
+  record.kind ||= record.profile === "scout" ? "scout" : "build";
+  record.lifecycle ||= config.kinds[record.kind]?.lifecycle || "change";
+  record.workflow ||= "direct";
+  if (record.lifecycle !== "change" || record.workflow !== "reviewed-pr") {
+    throw new CrewdeckError("Draft PR publication requires a reviewed-pr build", "invalid_publication_task");
+  }
+  if (record.status === "cleaned" || record.cleanedAt || ["integrated", "abandoned"].includes(record.status)) {
+    throw new CrewdeckError("Terminal builds cannot be published", "invalid_publication_task");
+  }
+  const project = resolveProject(config, record.project);
+  if (
+    record.branch !== `crew/${id}` ||
+    head !== record.branch ||
+    base !== record.base ||
+    head === base ||
+    path.resolve(record.worktree) !== path.join(config.worktreeRoot, record.project, id) ||
+    path.resolve(record.repo) !== project.path
+  ) {
+    throw new CrewdeckError("Publication must push only the task-owned crew branch, never the base", "unsafe_publication_ref");
+  }
+  const agent = await liveAgent(record);
+  if (agent.available && !["idle", "done"].includes(agent.state)) {
+    throw new CrewdeckError(`Build writer is ${agent.state}; publication requires a settled writer`, "worker_not_settled");
+  }
+  if (!agent.available && !/agent[^\n]*(not[_ -]?found|missing)|not[_ -]?found[^\n]*agent/i.test(agent.error || "")) {
+    throw new CrewdeckError("Cannot prove build writer state before publication", "agent_state_unknown", agent);
+  }
+  const [snapshot, journal] = await Promise.all([gitSnapshot(record), readCandidateJournal(record)]);
+  if (!snapshot.available || !snapshot.clean) {
+    throw new CrewdeckError("Publication refuses a dirty or unavailable build worktree", "dirty_worktree", snapshot);
+  }
+  if (snapshot.ahead < 1) throw new CrewdeckError("Current candidate has no commits ahead of base", "no_commits");
+  const candidate = journal.available ? journal.journal.candidates.at(-1) : undefined;
+  if (!candidate) throw new CrewdeckError("No reviewed-pr candidate is available", "missing_candidate");
+  if (snapshot.head !== candidate.head) {
+    throw new CrewdeckError("Build HEAD changed after candidate submission", "stale_candidate");
+  }
+  if ((record.candidateCollectedVersion || 0) < candidate.version) {
+    throw new CrewdeckError("Current candidate has not been collected", "candidate_not_collected");
+  }
+  const approval = (record.reviewInbox || [])
+    .filter((item) => item.reviewedHead === snapshot.head && item.verdict === "approved" && item.validAtCollection)
+    .at(-1);
+  if (!approval) throw new CrewdeckError("Current HEAD has no collected approved review", "review_not_approved");
+  if (record.reviewEscalation && record.reviewEscalation.reviewedHead === snapshot.head) {
+    throw new CrewdeckError("Current review requires escalation", "review_not_approved");
+  }
+
+  let remoteUrl;
+  try {
+    remoteUrl = (await git(record.worktree, ["remote", "get-url", "--push", remote])).stdout;
+  } catch (error) {
+    throw new CrewdeckError(`Git remote '${remote}' is unavailable`, "remote_unavailable", { error: error.message });
+  }
+  const remoteRepo = githubRepositoryFromUrl(remoteUrl);
+  if (!remoteRepo || remoteRepo.toLowerCase() !== repo.toLowerCase()) {
+    throw new CrewdeckError("Git remote is not the requested GitHub repository", "remote_repo_mismatch", { remoteUrl, repo });
+  }
+  try {
+    await run("gh", ["auth", "status", "--hostname", "github.com"], { timeout: 15_000 });
+  } catch (error) {
+    throw new CrewdeckError("GitHub credentials are unavailable", "credentials_unavailable", { error: error.message });
+  }
+  let forgeRepo;
+  try {
+    forgeRepo = await runJson("gh", ["repo", "view", repo, "--json", "nameWithOwner"], { timeout: 20_000 });
+  } catch (error) {
+    throw new CrewdeckError("GitHub repository is unavailable through gh", "forge_unavailable", { error: error.message });
+  }
+  if (forgeRepo?.nameWithOwner?.toLowerCase() !== repo.toLowerCase()) {
+    throw new CrewdeckError("gh resolved a different GitHub repository", "forge_repo_mismatch", forgeRepo);
+  }
+
+  const baseRef = `refs/heads/${base}`;
+  const remoteRef = `refs/heads/${head}`;
+  const readRemoteSha = async (ref) => {
+    const output = (await git(record.worktree, ["ls-remote", "--heads", remote, ref], { timeout: 30_000 })).stdout;
+    if (!output) return undefined;
+    const lines = output.split("\n").filter(Boolean);
+    if (lines.length !== 1) throw new CrewdeckError(`Remote ref ${ref} is ambiguous`, "ambiguous_remote_ref");
+    const [sha, foundRef] = lines[0].split(/\s+/);
+    if (!/^[0-9a-f]{40}$/.test(sha || "") || foundRef !== ref) {
+      throw new CrewdeckError(`Remote returned an invalid ref for ${ref}`, "invalid_remote_ref");
+    }
+    return sha;
+  };
+  if (!(await readRemoteSha(baseRef))) {
+    throw new CrewdeckError(`Remote base ${base} does not exist`, "remote_base_missing");
+  }
+
+  const validatePr = (pr) => {
+    const urlMatch = typeof pr?.url === "string"
+      ? pr.url.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9][0-9]*)$/i)
+      : undefined;
+    if (
+      !pr ||
+      !Number.isInteger(pr.number) ||
+      !urlMatch ||
+      urlMatch[1].toLowerCase() !== repo.toLowerCase() ||
+      Number(urlMatch[2]) !== pr.number ||
+      typeof pr.title !== "string" ||
+      typeof pr.body !== "string" ||
+      pr.isDraft !== true ||
+      pr.headRefName !== head ||
+      pr.baseRefName !== base ||
+      (pr.state !== undefined && pr.state !== "OPEN")
+    ) {
+      throw new CrewdeckError("Existing GitHub PR is not the expected open draft", "invalid_existing_pr", pr);
+    }
+    return pr;
+  };
+
+  const publication = record.publication;
+  if (
+    publication &&
+    (publication.remote !== remote ||
+      publication.repo.toLowerCase() !== repo.toLowerCase() ||
+      publication.base !== base ||
+      publication.remoteHead !== head)
+  ) {
+    throw new CrewdeckError("Publication target cannot change after first attempt", "publication_target_mismatch");
+  }
+  let existingPr;
+  if (publication?.number) {
+    try {
+      existingPr = validatePr(await runJson("gh", [
+        "pr", "view", String(publication.number), "--repo", repo,
+        "--json", "number,url,isDraft,headRefName,baseRefName,state,title,body",
+      ], { timeout: 20_000 }));
+    } catch (error) {
+      if (error instanceof CrewdeckError && error.code === "invalid_existing_pr") throw error;
+      throw new CrewdeckError("Stored draft PR is unavailable", "forge_unavailable", { error: error.message });
+    }
+  } else {
+    let listed;
+    try {
+      listed = await runJson("gh", [
+        "pr", "list", "--repo", repo, "--head", head, "--base", base, "--state", "open",
+        "--json", "number,url,isDraft,headRefName,baseRefName,state,title,body", "--limit", "2",
+      ], { timeout: 20_000 });
+    } catch (error) {
+      throw new CrewdeckError("Cannot query GitHub draft PRs", "forge_unavailable", { error: error.message });
+    }
+    if (!Array.isArray(listed) || listed.length > 1) {
+      throw new CrewdeckError("GitHub PR lookup is invalid or ambiguous", "ambiguous_pull_request", listed);
+    }
+    if (listed.length === 1) existingPr = validatePr(listed[0]);
+  }
+
+  let remoteSha = await readRemoteSha(remoteRef);
+  const ownedRemote =
+    !remoteSha ||
+    publication?.remoteSha === remoteSha ||
+    (remoteSha === snapshot.head && existingPr?.headRefName === head);
+  if (!ownedRemote) {
+    throw new CrewdeckError("Remote head exists but is not owned by this durable publication", "remote_head_changed", {
+      expected: publication?.remoteSha,
+      actual: remoteSha,
+    });
+  }
+  let pushedAt = publication?.pushedAt;
+  if (remoteSha !== snapshot.head) {
+    const lease = `--force-with-lease=${remoteRef}:${remoteSha || ""}`;
+    await git(record.worktree, ["push", lease, remote, `${snapshot.head}:${remoteRef}`], { timeout: 120_000 });
+    remoteSha = await readRemoteSha(remoteRef);
+    if (remoteSha !== snapshot.head) {
+      throw new CrewdeckError("Remote head does not equal the approved SHA after push", "push_verification_failed");
+    }
+    pushedAt = new Date().toISOString();
+  }
+  const afterPush = await gitSnapshot(record);
+  if (!afterPush.available || !afterPush.clean || afterPush.head !== snapshot.head) {
+    throw new CrewdeckError("Build HEAD changed during publication; review and CI are stale", "stale_candidate");
+  }
+
+  const attemptAt = new Date().toISOString();
+  await withStateLock(async () => {
+    const next = await loadState();
+    const stored = next.tasks[id];
+    if (!stored) throw new CrewdeckError("Build disappeared during publication", "state_changed");
+    stored.publication = {
+      ...(stored.publication || {}),
+      remote,
+      repo,
+      base,
+      remoteHead: head,
+      remoteSha,
+      title: title.trim(),
+      body: body.trim(),
+      headSha: snapshot.head,
+      pushedAt,
+      createdAt: stored.publication?.createdAt || attemptAt,
+      firstAttemptAt: stored.publication?.firstAttemptAt || attemptAt,
+      lastAttemptAt: attemptAt,
+    };
+    await saveState(next);
+  });
+
+  let pr = existingPr;
+  let prCreatedAt = publication?.prCreatedAt;
+  if (!pr) {
+    try {
+      await run("gh", [
+        "pr", "create", "--draft", "--repo", repo, "--base", base, "--head", head,
+        "--title", title.trim(), "--body", body.trim(),
+      ], { timeout: 60_000 });
+    } catch (error) {
+      throw new CrewdeckError("Draft PR creation failed; retry will reconcile by head/base", "pr_create_failed", {
+        error: error.message,
+        remoteSha,
+      });
+    }
+    const listed = await runJson("gh", [
+      "pr", "list", "--repo", repo, "--head", head, "--base", base, "--state", "open",
+      "--json", "number,url,isDraft,headRefName,baseRefName,state,title,body", "--limit", "2",
+    ], { timeout: 20_000 });
+    if (!Array.isArray(listed) || listed.length !== 1) {
+      throw new CrewdeckError("Created draft PR cannot be reconciled uniquely", "ambiguous_pull_request", listed);
+    }
+    pr = validatePr(listed[0]);
+    prCreatedAt = new Date().toISOString();
+  } else if (
+    pr.title !== title.trim() ||
+    pr.body !== body.trim() ||
+    publication?.headSha !== snapshot.head
+  ) {
+    await run("gh", [
+      "pr", "edit", String(pr.number), "--repo", repo, "--base", base,
+      "--title", title.trim(), "--body", body.trim(),
+    ], { timeout: 30_000 });
+    pr = validatePr(await runJson("gh", [
+      "pr", "view", String(pr.number), "--repo", repo,
+      "--json", "number,url,isDraft,headRefName,baseRefName,state,title,body",
+    ], { timeout: 20_000 }));
+  }
+
+  const updatedAt = new Date().toISOString();
+  let finalRecord;
+  await withStateLock(async () => {
+    const next = await loadState();
+    const stored = next.tasks[id];
+    if (!stored?.publication || stored.publication.remoteSha !== snapshot.head) {
+      throw new CrewdeckError("Publication state changed before PR persistence", "state_changed");
+    }
+    stored.publication = {
+      ...stored.publication,
+      number: pr.number,
+      url: pr.url,
+      draft: true,
+      prCreatedAt: stored.publication.prCreatedAt || prCreatedAt || updatedAt,
+      updatedAt,
+      lastVerifiedAt: updatedAt,
+    };
+    finalRecord = { ...stored };
+    await saveState(next);
+  });
+  return {
+    published: true,
+    idempotent:
+      publication?.headSha === snapshot.head &&
+      publication?.title === title.trim() &&
+      publication?.body === body.trim() &&
+      existingPr?.number === pr.number &&
+      existingPr?.title === title.trim() &&
+      existingPr?.body === body.trim(),
+    task: publicTaskRecord(finalRecord),
+    publication: finalRecord.publication,
+  };
 }
 
 export async function mergeTask(configPath, id) {
@@ -1194,8 +2158,11 @@ export async function cleanupTask(configPath, id) {
   if ((!snapshot.available && !worktreeAlreadyRemoved) || (snapshot.available && !snapshot.clean)) {
     throw new CrewdeckError("Worktree is not clean", "dirty_worktree", snapshot);
   }
-  if (record.lifecycle === "report" && snapshot.ahead !== 0) {
-    throw new CrewdeckError("Report branch unexpectedly contains commits", "report_has_commits");
+  if (
+    record.lifecycle === "report" &&
+    (record.detached === true ? snapshot.head !== record.checkoutHead : snapshot.ahead !== 0)
+  ) {
+    throw new CrewdeckError("Report worktree no longer matches its immutable checkout", "report_has_commits");
   }
   try {
     await run("herdr", ["agent", "send-keys", record.agentName, "ctrl+d"], { timeout: 10_000 });
@@ -1212,16 +2179,18 @@ export async function cleanupTask(configPath, id) {
       // The isolated worktree is already absent; preserving an unknown workspace is safer than forcing cleanup.
     }
   }
-  try {
-    await git(record.repo, ["branch", record.status === "abandoned" ? "-D" : "-d", record.branch]);
-  } catch (error) {
-    if (record.status === "abandoned") {
-      throw new CrewdeckError("Abandoned worktree was removed but its isolated branch was preserved", "branch_cleanup_failed", {
-        branch: record.branch,
-        error: error.message,
-      });
+  if (record.detached !== true) {
+    try {
+      await git(record.repo, ["branch", record.status === "abandoned" ? "-D" : "-d", record.branch]);
+    } catch (error) {
+      if (record.status === "abandoned") {
+        throw new CrewdeckError("Abandoned worktree was removed but its isolated branch was preserved", "branch_cleanup_failed", {
+          branch: record.branch,
+          error: error.message,
+        });
+      }
+      // Integrated work is safe even if non-forced branch deletion is refused.
     }
-    // Integrated work is safe even if non-forced branch deletion is refused.
   }
   if (record.status !== "abandoned") record.status = "cleaned";
   record.cleanedAt = new Date().toISOString();

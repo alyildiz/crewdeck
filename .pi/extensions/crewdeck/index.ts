@@ -12,14 +12,18 @@ import {
   collectResults,
   getPendingResultIds,
   getStatus,
+  forwardReviewFindings,
   getTaskDiff,
   loadConfig,
   mergeTask,
   prepareIntegration,
   promptTask,
+  publishPullRequest,
   reconcileOrphanReport,
   reportDirectory,
+  resumeBuild,
   spawnBatch,
+  spawnReview,
 } from "../../../src/core.mjs";
 
 const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
@@ -65,10 +69,11 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
   const completionWake = createCompletionWakeController({
     listPending: () => getPendingResultIds(CONFIG),
     sendFollowUp: (ready: string[]) => {
-      const noun = ready.length === 1 ? "worker has" : "workers have";
+      const taskIds = [...new Set(ready.map((key) => key.split("@")[0]))];
       pi.sendUserMessage(
-        `CREWDECK COMPLETION: ${noun} submitted durable results: ${ready.join(", ")}. ` +
-          "Call crew_status, then crew_collect_results for these task ids. Inspect change-task diffs before integration.",
+        `CREWDECK COMPLETION: durable inbox events are ready: ${ready.join(", ")}. ` +
+          `Call crew_status for task ids ${taskIds.join(", ")}, then crew_collect_results with the exact inbox keys. ` +
+          "For a collected changes-requested review, use crew_forward_review so durable structured findings reach the parent build through steering; never message it from the reviewer.",
         { deliverAs: "followUp" },
       );
     },
@@ -96,6 +101,7 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
           }),
           task: Type.String({ description: "Concrete task and acceptance criteria" }),
           profile: Type.Optional(Type.String({ description: "Optional per-task profile override" })),
+          workflow: Type.Optional(Type.String({ description: "direct (default) or reviewed-pr for change tasks" })),
         }),
         { minItems: 1, maxItems: 5 },
       ),
@@ -103,6 +109,29 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     async execute(_id, params, _signal, _update, ctx) {
       await validateProfiles(params, ctx);
       return text(await spawnBatch(CONFIG, params));
+    },
+  });
+
+  pi.registerTool({
+    name: "crew_spawn_review",
+    label: "Spawn Exact-SHA Reviewer",
+    description:
+      "Launch the one configured read-only review kind in a proven detached worktree for exactly the current collected candidate SHA of a reviewed-pr build. Refuses concurrent or duplicate reviewers.",
+    parameters: Type.Object({
+      id: Type.String({ description: "Unique review task id" }),
+      parentTaskId: Type.String({ description: "Reviewed-pr build task id" }),
+      reviewedHead: Type.String({ description: "Exact 40-character current candidate SHA" }),
+      task: Type.String({ description: "Concrete review scope and acceptance criteria" }),
+      profile: Type.Optional(Type.String({ description: "Optional reviewer profile" })),
+    }),
+    async execute(_id, params, _signal, _update, ctx) {
+      const config = await loadConfig(CONFIG);
+      const reviewKinds = Object.entries(config.kinds).filter(([, kind]: any) => kind.contract === "review");
+      if (reviewKinds.length !== 1) throw new Error("Configure exactly one review contract kind");
+      await validateProfiles({
+        tasks: [{ kind: reviewKinds[0][0], profile: params.profile, task: params.task, id: params.id }],
+      }, ctx);
+      return text(await spawnReview(CONFIG, params));
     },
   });
 
@@ -156,6 +185,50 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     }),
     async execute(_id, params) {
       return text(await promptTask(CONFIG, params.id, params.message, { wait: params.wait }));
+    },
+  });
+
+  pi.registerTool({
+    name: "crew_forward_review",
+    label: "Forward Durable Review",
+    description:
+      "After collecting a review, forward its exact durable changes-requested findings to the parent build through Herdr steering. Refuses stale or approved reviews and escalates blocked/inconclusive or exhausted rounds.",
+    parameters: Type.Object({
+      reviewId: Type.String(),
+      wait: Type.Optional(Type.Boolean({ default: false })),
+    }),
+    async execute(_id, params) {
+      return text(await forwardReviewFindings(CONFIG, params.reviewId, { wait: params.wait }));
+    },
+  });
+
+  pi.registerTool({
+    name: "crew_resume_build",
+    label: "Resume Reviewed-PR Build",
+    description:
+      "Safely adopt a reviewed-pr build only after proving its prior Herdr agent absent and its owned crew branch/workspace intact. Preserves a single writer.",
+    parameters: Type.Object({ id: Type.String() }),
+    async execute(_id, params) {
+      return text(await resumeBuild(CONFIG, params.id));
+    },
+  });
+
+  pi.registerTool({
+    name: "crew_publish_pr",
+    label: "Publish Draft Pull Request",
+    description:
+      "Idempotently push only the approved current SHA from the isolated crew branch and create or update its GitHub draft PR. Validates remote/repo/base/head, clean state, approval, credentials, forge, and remote ownership. Never merges.",
+    parameters: Type.Object({
+      id: Type.String(),
+      remote: Type.String(),
+      repo: Type.String({ description: "GitHub owner/name" }),
+      base: Type.String(),
+      head: Type.String({ description: "Remote head; must equal the task-owned crew/<id> branch" }),
+      title: Type.String(),
+      body: Type.String(),
+    }),
+    async execute(_id, params) {
+      return text(await publishPullRequest(CONFIG, params.id, params));
     },
   });
 

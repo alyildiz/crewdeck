@@ -7,34 +7,34 @@ profiles:
     provider: vllm_qwen38
     model: qwen3.8-27b-fp8
     thinking: off
-    allowedKinds: [scout, build]
+    allowedKinds: [scout, review, build]
 
   local-fast:
     provider: vllm_qwen38
     model: qwen3.8-27b-fp8
     thinking: low
-    allowedKinds: [scout]
+    allowedKinds: [scout, review]
 
   local-medium:
     provider: vllm_qwen38
     model: qwen3.8-27b-fp8
     thinking: medium
-    allowedKinds: [scout, build]
+    allowedKinds: [scout, review, build]
 
   local-deep:
     provider: vllm_qwen38
     model: qwen3.8-27b-fp8
     thinking: xhigh
-    allowedKinds: [scout]
+    allowedKinds: [scout, review]
 
   cloud-medium:
     provider: openai-codex
     model: gpt-5.6-sol
     thinking: medium
-    allowedKinds: [scout, build]
+    allowedKinds: [scout, review, build]
 
   cloud-deep:
     provider: openai-codex
     model: gpt-5.6-sol
     thinking: xhigh
-    allowedKinds: [scout, build]
+    allowedKinds: [scout, review, build]

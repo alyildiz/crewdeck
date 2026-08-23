@@ -78,6 +78,7 @@ test("loads a minimal valid configuration", async () => {
   const { configPath } = await fixture();
   const config = await loadConfig(configPath);
   assert.equal(config.maxWorkers, 5);
+  assert.equal(config.maxReviewRounds, 3);
   assert.equal(config.profiles.worker.thinking, "medium");
   assert.equal(config.profiles.worker.provider, "test");
   assert.equal(config.kinds.scout.lifecycle, "report");

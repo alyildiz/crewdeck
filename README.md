@@ -1,47 +1,43 @@
 # Crewdeck
 
-Crewdeck is a lightweight Pi and Herdr orchestrator for running visible coding agents in isolated Git worktrees.
+Crewdeck is a lightweight Pi/Herdr orchestrator for visible coding agents in isolated Git worktrees. Workers load the target project's own `AGENTS.md`; the orchestrator keeps task authority, durable delivery, exact-SHA review, and controlled Git/GitHub operations.
 
-You talk to one Pi session in this repository. Its project-local skill decides how to divide work; its extension performs deterministic Herdr and Git operations. Workers start inside target-project worktrees, so Pi loads each project's own `AGENTS.md` instead of Crewdeck's instructions.
+## v0.3 scope
 
-## v0.2 scope
+- YAML-configured `report` and `change` lifecycles plus an explicit `review` contract
+- direct builds remain compatible with immutable, terminating `crew_complete`
+- reviewed-pr builds submit versioned exact-HEAD candidates without terminating their agent
+- one distinct read-only reviewer per candidate, bound to `parentTaskId` and `reviewedHead`
+- durable review inbox, completion-queue wakeup, orchestrator follow-up, and lossless steering back to the original build
+- every review/CI claim becomes stale when build HEAD changes
+- one writer on `crew/<id>`; safe adoption only after Crewdeck proves the previous agent absent
+- detached branchless worktrees for scouts/reviewers; branch worktrees for builds
+- deterministic/idempotent push and GitHub draft-PR create/update after exact-SHA approval
+- no automatic merge, no PR-ready transition, no stacked reviewers, and no no-mistakes integration
+- preserved scout, historical task, direct prepare/merge, abandonment, and orphan-report lifecycles
 
-- configurable task kinds in human-editable YAML, backed by safe `report` and `change` lifecycles
-- per-kind tool and explicit skill allowlists; skill discovery is disabled for every worker
-- provider/model/thinking profiles in a separate human-editable YAML file
-- profile validation against Pi's effective model registry
-- up to five Pi workers per batch on Herdr 0.8+
-- one visible Herdr worktree workspace per task
-- strict scouts with only `read`, `grep`, `find`, `ls`, and `crew_complete`
-- durable structured scout reports and build results outside worktrees
-- durable result reconciliation plus an automatic Pi follow-up whenever a worker completes
-- automatic safe report-task cleanup after result collection when configured
-- sequential build rebase, verification, local fast-forward merge, safe cleanup, and explicit abandonment of obsolete unintegrated changes
-- explicitly confirmed reconciliation of report tasks whose Herdr workspace and Git worktree were already removed manually
-- orchestrator skill allowlist: only the project-local `crewdeck` skill
-- no push, PR creation, remote workers, dirty-worktree deletion, or background LLM polling
+The Herdr 0.8 API was verified rather than assumed: `worktree create` without `--branch` creates a random branch, while a Git `worktree add --detach` followed by Herdr `worktree open --path` reports `is_detached: true`. Crewdeck uses only that proven detached path and otherwise fails closed.
 
-Conflict reconciliation between two concurrently developed build branches is the next milestone and intentionally remains outside v0.2.
-
-## Layout
+## Layout and durable state
 
 ```text
-~/projects/crewdeck/                         orchestrator cwd
-~/.local/share/crewdeck/worktrees/<project>/<task>/
-                                            worker cwd
-~/.local/state/crewdeck/state.json          durable runtime state
-~/.local/state/crewdeck/reports/<task>.json durable worker results
+~/projects/crewdeck/                                      orchestrator cwd
+~/.local/share/crewdeck/worktrees/<project>/<task>/      worker cwd
+~/.local/state/crewdeck/state.json                       tasks, inbox, publication
+~/.local/state/crewdeck/reports/<task>.json              final scout/review/direct result
+~/.local/state/crewdeck/reports/<task>.candidates.json   reviewed-pr candidate journal
 ```
 
-Worktrees deliberately live outside this repository. Pi loads context files from its current directory and parents; nesting workers below Crewdeck would leak the orchestrator's `AGENTS.md` into worker contexts.
+State uses atomic writes under a lock. Candidate versions, collection acknowledgements, structured review findings, forwarding attempts, escalation, remote SHA, PR URL/number, and timestamps survive orchestrator restart. The completion watcher rescans the durable inbox at session start, so missed filesystem events still generate a Pi follow-up.
 
 ## Configuration
 
-[`crewdeck.json`](crewdeck.json) owns projects and general behavior:
+[`crewdeck.json`](crewdeck.json) owns projects and review limits:
 
 ```json
 {
   "maxWorkers": 5,
+  "maxReviewRounds": 3,
   "worktreeRoot": "~/.local/share/crewdeck/worktrees",
   "profilesFile": "config/profiles.yml",
   "kindsFile": "config/kinds.yml",
@@ -56,14 +52,25 @@ Worktrees deliberately live outside this repository. Pi loads context files from
 }
 ```
 
-[`config/kinds.yml`](config/kinds.yml) defines task behavior independently from model selection:
+`maxReviewRounds` is 1–10 and defaults to 3 for historical configs.
+
+[`config/kinds.yml`](config/kinds.yml) separates permissions from model selection:
 
 ```yaml
 version: 1
 kinds:
   scout:
     lifecycle: report
-    description: Strictly read-only investigation that produces an evidence-based report
+    description: Strictly read-only investigation
+    permissions: { filesystem: read-only, shell: false }
+    tools: [read, grep, find, ls]
+    skills: []
+    cleanup: after-collection
+
+  review:
+    lifecycle: report
+    contract: review
+    description: Read-only review of one exact build candidate SHA
     permissions: { filesystem: read-only, shell: false }
     tools: [read, grep, find, ls]
     skills: []
@@ -78,127 +85,163 @@ kinds:
     cleanup: after-integration
 ```
 
-Every worker starts with `--no-skills`. A kind may opt into reviewed skills by listing file or directory paths under `skills`; relative paths resolve from the directory containing `kinds.yml` and are passed as repeatable explicit `--skill` arguments. Report lifecycles are always read-only and shell-free. Change lifecycles must allow writes and shell, include `bash` plus `edit` or `write`, and use integration-gated cleanup. Crewdeck rejects kind definitions that weaken these invariants.
+A review contract must be a shell-free, read-only report. Crewdeck requires exactly one configured review kind when spawning a reviewer. Every worker starts with discovered skills disabled; only explicit kind skills are loaded.
 
-[`config/profiles.yml`](config/profiles.yml) maps friendly profile names to Pi's canonical provider plus model id:
-
-```yaml
-version: 1
-defaultProfile: cloud-medium
-profiles:
-  local-fast:
-    provider: vllm_qwen38
-    model: qwen3.8-27b-fp8
-    thinking: low
-    allowedKinds: [scout]
-
-  cloud-medium:
-    provider: openai-codex
-    model: gpt-5.6-sol
-    thinking: medium
-    allowedKinds: [scout, build]
-```
-
-Crewdeck launches `provider/model`, for example `vllm_qwen38/qwen3.8-27b-fp8`. Pi's effective model registry is the runtime authority; a model may originate from `~/.pi/agent/models.json`, a built-in provider, or an extension. Crewdeck refuses unavailable models and profile/kind mismatches instead of silently falling back.
-
-A profile selects model execution only. The kind owns permissions: listing a report kind in `allowedKinds` never grants it write or shell tools.
-
-Set a report kind's `cleanup` to `manual` to preserve collected workers until explicit cleanup. `after-collection` closes only a clean report task with a valid durable result and no commits.
+[`config/profiles.yml`](config/profiles.yml) maps profile names to provider/model/thinking and `allowedKinds`. Profiles never grant permissions. Pi's effective model registry and provider authentication remain runtime authority.
 
 ## Setup
 
-Requirements:
-
-- Pi
-- Herdr 0.8 or newer
-- Git
-- Node.js
-
-Install the one runtime dependency and verify Crewdeck:
+Requirements: Node.js, Git, Pi, Herdr 0.8+, and `gh` for draft-PR publication.
 
 ```bash
-cd /home/baris/projects/crewdeck
 npm install
 npm test
+npm run check
 ```
 
-Register another project:
+Register a project:
 
 ```bash
 bin/crewdeck project add my-project /absolute/path/to/project --base main --trust
 ```
 
-`--trust` applies only to change-lifecycle workers. Report workers launch with `--no-approve`. All workers disable discovered extensions and skills, explicitly load Crewdeck's reporter plus only the skills listed by their kind, and still receive the project's `AGENTS.md` because Pi context files load independently of project trust.
-
-Start the orchestrator inside a Herdr pane through its dedicated launcher:
+Launch only through the restricted launcher:
 
 ```bash
-cd /home/baris/projects/crewdeck
 bin/crewdeck-pi --model <orchestrator-model> --thinking xhigh
 ```
 
-The launcher uses Pi's official `--no-skills` plus one explicit `--skill` path. Consequently, only the `crewdeck` skill is visible to the orchestrator; global skills such as `frontend-design`, `harness-creator`, or `skill-creator` cannot trigger or consume its context. Additional `--skill` arguments are refused. Workers also disable skill discovery, but each kind may explicitly allow reviewed skill paths in `config/kinds.yml`.
+It disables skill discovery and loads only [`.agents/skills/crewdeck/SKILL.md`](.agents/skills/crewdeck/SKILL.md). Workers disable extension/skill discovery, load only the reporter and configured skills, and receive permissions from their kind.
 
-Do not start the orchestrator with bare `pi`. Trust Crewdeck when Pi asks, then restart through `bin/crewdeck-pi` so its project extension loads.
+## Contracts
 
-Example:
+### Historical/direct result
 
-```text
-On my-project, use local-fast to analyze the pricing page without changing code, and use cloud-medium to build the already-approved expiration test.
-```
-
-Use `/crew` to display active or actionable workers without an LLM turn, `/crew all` to display the complete durable task history, and `/crew clear` to hide the widget. The default view hides terminal `report-collected`, `orphan-reconciled`, `integrated`, completed `abandoned`, and `cleaned` tasks; `/crew all` retains them. An interrupted abandonment remains visible as `abandon-cleanup-pending`, and a missing Herdr agent remains visible when its task is not terminal. When `crew_complete` stores a result, the orchestrator extension reconciles all durable uncollected reports, groups nearby completions, and calls `pi.sendUserMessage(..., { deliverAs: "followUp" })`. This necessarily wakes the orchestrator so it can inspect status and collect the named results. The same reconciliation runs at session start, so results produced while Pi was stopped or missed by `fs.watch` are delivered at least once; collection is the acknowledgement.
-
-## Task contracts
-
-The default kinds map to these two lifecycle contracts.
-
-### Scout (`report` lifecycle)
+Scouts and direct builds retain the v0.2 contract. `crew_complete` writes one immutable result and returns `terminate: true`; a second call is refused. Historical records without `contract`, `workflow`, or `maxReviewRounds` normalize to `standard`, `direct`, and the configured default.
 
 ```text
-running → report-ready → report-collected → cleaned
+scout:       running → report-ready → report-collected → cleaned
+direct build running → candidate → ready → integrated → cleaned
+                                      ↘ conflict/obsolete → abandoned
 ```
 
-A scout cannot call `write`, `edit`, or `bash`. It must submit `crew_complete` with conclusion, findings, file/line evidence, recommendations, and open questions. Collecting the durable report normally closes and removes the clean scout immediately.
+Local merge still requires the existing explicit user request plus independent confirmation and never pushes.
 
-If someone has already removed a report task's Herdr workspace and Git worktree manually, normal cleanup can no longer finish. The dedicated `reconcile-orphan` operation provides an explicit recovery transition:
+### Reviewed-pr candidate
+
+A build spawned with `workflow: reviewed-pr` owns `crew/<id>`. Its active tool is `crew_submit_candidate`, not `crew_complete`. Submission verifies:
+
+- branch is exactly `crew/<id>`
+- worktree is clean
+- supplied 40-character commit equals exact HEAD
+- HEAD contains at least one commit ahead of the configured base
+- candidate count is within `maxReviewRounds`
+
+It atomically appends candidate `vN`. Repeating an identical HEAD/payload is idempotent; changing the payload for an already submitted SHA is refused. The result has no `terminate`, so the same build remains available for review steering.
 
 ```text
-starting/running (including report-collected) → orphan-reconciled
+running → candidate v1 → exact-SHA review
+                     approved ───────────────→ draft PR publication
+                     changes-requested ──────→ durable inbox → steering → candidate v2
+                     blocked/inconclusive ───→ escalation
+                     final round not approved → escalation
 ```
 
-This transition is never inferred from missing resources. It requires separate confirmation and a non-empty durable reason, accepts report lifecycles only, and proves that the agent, workspace, and worktree are absent. It refuses uncertain Herdr state, any surviving workspace/agent/worktree, dirty worktrees, unexpected resource paths, and branches with commits not integrated into base. It removes only stale metadata and a safely deletable isolated report branch; it does not close other resources, modify base, or push. Existing durable reports, collection timestamps, and task history are retained. Repeating the operation returns `already_reconciled`. The terminal task disappears from `/crew` and remains in `/crew all`.
+Candidate events use keys such as `build-id@candidate-1` in the existing completion queue.
 
-Use this recovery for a `report-collected` task when automatic cleanup previously failed with `workspace_not_found`; do not edit `state.json` or use it for change tasks. Change tasks continue to use the separately controlled abandonment lifecycle below.
+### Review
 
-### Build (`change` lifecycle)
+`crew_spawn_review` requires the parent reviewed-pr build, a collected current candidate, and its full SHA. It refuses a moving writer, stale SHA, duplicate reviewer, another open reviewer, or exhausted rounds. The review task is detached at that exact commit and exposes no shell/write/steering tool.
 
-```text
-running → candidate → ready → integrated → cleaned
-         ↘ conflict/obsolete → abandoned
+Its terminating result contains:
+
+```json
+{
+  "parentTaskId": "build-id",
+  "reviewedHead": "0123456789abcdef0123456789abcdef01234567",
+  "verdict": "approved | changes-requested | blocked | inconclusive",
+  "summary": "...",
+  "findings": [{
+    "severity": "blocking | major | minor | nit",
+    "title": "...",
+    "detail": "...",
+    "location": "path:line",
+    "recommendation": "..."
+  }],
+  "checks": ["..."],
+  "openQuestions": []
+}
 ```
 
-A build must commit and call `crew_complete` with its exact HEAD, tests, risks, and open questions. `candidate` additionally requires a settled agent, clean worktree, at least one commit, and a result commit matching HEAD. Builds remain alive for integration and possible correction.
+Approval cannot contain a blocking finding; `changes-requested` requires a finding. Collection copies this exact payload into the parent's durable `reviewInbox`, recording whether parent HEAD was still current. There is no reviewer-to-build message path.
 
-`abandoned` is a separate terminal outcome and never means integrated. The independently confirmed abandon operation accepts only a settled, clean, non-integrated change task. It first records `abandonedAt`, the prior status, and an optional reason, then closes the worker/workspace and removes only the isolated worktree and branch. It never changes the base branch or pushes. Dirty worktrees, report tasks, and integrated, cleaned, or already abandoned tasks are refused. Durable reports and task history remain in the Crewdeck state directory. If cleanup is interrupted after the durable transition, a separately confirmed `cleanup` may resume cleanup of that already abandoned task without changing its terminal status.
+`crew_forward_review` accepts only a collected, current `changes-requested` review. It persists a forwarding attempt, then sends the stored structured JSON through Herdr's agent prompt. Retry is idempotent after confirmed delivery and at-least-once if interruption leaves a pending attempt. `blocked`, `inconclusive`, and exhausted rounds record escalation instead.
+
+`crew_resume_build` is a fail-closed recovery operation. It accepts only reviewed-pr builds, proves the old agent is specifically absent (not merely unreachable), verifies the expected worktree/path/branch/workspace, then starts one replacement writer with durable review context. Any existing or uncertain agent is refused.
+
+## Draft PR publication
+
+After collecting `approved` for the **current** candidate, call `crew_publish_pr` with explicit values:
+
+- remote name, for example `origin`
+- GitHub repository `owner/name`
+- base branch, equal to the task's configured base
+- remote head, exactly `crew/<id>`
+- title and body
+
+Before side effects, publication refuses:
+
+- non-reviewed, terminal, dirty, moving, missing, or stale builds
+- candidate not collected or current review missing/not approved/stale/escalated
+- invalid or mismatched remote/repository/base/head
+- any request where head is base or is not the owned Crewdeck branch
+- a non-GitHub remote, missing remote base, unavailable `gh` credentials/repository
+- an unowned/diverged remote head, ambiguous PR, non-draft PR, or wrong PR base/head
+
+Crewdeck pushes the approved SHA explicitly to `refs/heads/crew/<id>` with `--force-with-lease`; it never pushes the base. It verifies remote SHA, rechecks local HEAD/cleanliness, and creates or updates one open draft PR with `gh`. State records `remote`, `repo`, `base`, `remoteHead`, `remoteSha`, `pushedAt`, `number`, `url`, `prCreatedAt`, `updatedAt`, and verification/attempt timestamps.
+
+Retry is deterministic: if push succeeded before interruption, the lease/remote SHA is reconciled; if PR creation succeeded but its response was lost, lookup by exact head/base adopts the unique matching draft. Repeating a completed publication with identical inputs is idempotent.
+
+Publication never runs `gh pr ready`, `gh pr merge`, or a local merge.
+
+## Pi extension API
+
+The project extension exposes:
+
+- `crew_spawn_batch` (`workflow` may be `direct` or `reviewed-pr`)
+- `crew_spawn_review`
+- `crew_status`, `crew_collect_results`, `crew_diff`
+- `crew_steer`, `crew_forward_review`, `crew_resume_build`
+- `crew_publish_pr`
+- existing `crew_prepare_integration`, confirmed `crew_merge`, confirmed `crew_abandon`, confirmed `crew_reconcile_orphan_report`, and confirmed `crew_cleanup`
+
+When durable events arrive, the extension uses `pi.sendUserMessage(..., { deliverAs: "followUp" })`. The orchestrator must call status and collection; no background LLM polling occurs.
 
 ## Manual CLI
 
 ```bash
-bin/crewdeck project list
-bin/crewdeck spawn my-project scout pricing-analysis "Analyze column Z without changing code" --profile local-fast
-bin/crewdeck spawn my-project build pricing-fix "Fix the price shown in column Z" --profile cloud-medium
-bin/crewdeck status
-bin/crewdeck collect pricing-analysis
-# Add --keep-reports to preserve an auto-cleanup report kind
-bin/crewdeck diff pricing-fix
-bin/crewdeck prepare pricing-fix
-bin/crewdeck merge pricing-fix --confirm
-# For a superseded, clean change that must not be integrated:
-bin/crewdeck abandon obsolete-fix --confirm --reason "superseded by pricing-fix"
-# Only when a report workspace and worktree were already removed outside Crewdeck:
+# Direct compatibility
+bin/crewdeck spawn my-project scout inspect "Inspect without changing code" --profile local-fast
+bin/crewdeck spawn my-project build direct-fix "Implement the accepted fix" --profile cloud-medium
+bin/crewdeck collect inspect
+bin/crewdeck prepare direct-fix
+bin/crewdeck merge direct-fix --confirm
+
+# Reviewed PR
+bin/crewdeck spawn my-project build reviewed-fix "Implement the accepted fix" --profile cloud-medium --reviewed-pr
+bin/crewdeck collect reviewed-fix@candidate-1
+bin/crewdeck review reviewed-fix reviewed-fix-r1 <40-char-sha> "Review correctness and regressions" --profile cloud-deep
+bin/crewdeck collect reviewed-fix-r1
+bin/crewdeck forward-review reviewed-fix-r1
+# after a later approved current SHA:
+bin/crewdeck publish reviewed-fix \
+  --remote origin --repo owner/repo --base main --head crew/reviewed-fix \
+  --title "Reviewed fix" --body "Draft PR body"
+
+# Recovery/control
+bin/crewdeck resume reviewed-fix
+bin/crewdeck abandon obsolete-fix --confirm --reason "superseded"
 bin/crewdeck reconcile-orphan old-report --confirm --reason "manual removal during maintenance"
-bin/crewdeck cleanup pricing-fix --confirm
 ```
 
-The CLI's `--confirm` is intended for a human at a shell. Orphan reconciliation additionally requires `--reason`. The Pi extension independently displays separate interactive confirmations before build merge, abandonment, orphan-report reconciliation, and manual cleanup.
+Use `/crew` for active/actionable tasks, `/crew all` for durable history, and `/crew clear` to hide the widget. Do not bypass refusals by editing state or issuing raw Git, Herdr, or GitHub commands.
