@@ -25,6 +25,12 @@
       "base": "master",
       "trustProjectResources": true,
       "verify": []
+    },
+    "crewdeck-e2e-dummy": {
+      "path": "/home/baris/projects/crewdeck-e2e-dummy",
+      "base": "main",
+      "trustProjectResources": true,
+      "verify": []
     }
   }
 }
