@@ -2199,6 +2199,11 @@ export async function publishPullRequest(
     throw new CrewdeckError(`Remote base ${base} does not exist`, "remote_base_missing");
   }
 
+  const prFields = [
+    "number", "url", "isDraft", "headRefName", "baseRefName", "headRefOid",
+    "isCrossRepository", "headRepository", "headRepositoryOwner", "state", "title", "body",
+  ].join(",");
+  const [repoOwner] = repo.split("/");
   const validatePr = (pr, expectedHeadSha = undefined) => {
     const urlMatch = typeof pr?.url === "string"
       ? pr.url.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9][0-9]*)$/i)
@@ -2214,6 +2219,11 @@ export async function publishPullRequest(
       pr.isDraft !== true ||
       pr.headRefName !== head ||
       pr.baseRefName !== base ||
+      pr.isCrossRepository !== false ||
+      typeof pr.headRepository?.nameWithOwner !== "string" ||
+      pr.headRepository.nameWithOwner.toLowerCase() !== repo.toLowerCase() ||
+      typeof pr.headRepositoryOwner?.login !== "string" ||
+      pr.headRepositoryOwner.login.toLowerCase() !== repoOwner.toLowerCase() ||
       (pr.state !== undefined && pr.state !== "OPEN") ||
       (expectedHeadSha !== undefined && pr.headRefOid !== expectedHeadSha)
     ) {
@@ -2237,7 +2247,7 @@ export async function publishPullRequest(
     try {
       existingPr = validatePr(await runJson("gh", [
         "pr", "view", String(publication.number), "--repo", repo,
-        "--json", "number,url,isDraft,headRefName,baseRefName,headRefOid,state,title,body",
+        "--json", prFields,
       ], { timeout: 20_000 }));
     } catch (error) {
       if (error instanceof CrewdeckError && error.code === "invalid_existing_pr") throw error;
@@ -2248,7 +2258,7 @@ export async function publishPullRequest(
     try {
       listed = await runJson("gh", [
         "pr", "list", "--repo", repo, "--head", head, "--base", base, "--state", "open",
-        "--json", "number,url,isDraft,headRefName,baseRefName,headRefOid,state,title,body", "--limit", "2",
+        "--json", prFields, "--limit", "2",
       ], { timeout: 20_000 });
     } catch (error) {
       throw new CrewdeckError("Cannot query GitHub draft PRs", "forge_unavailable", { error: error.message });
@@ -2324,7 +2334,7 @@ export async function publishPullRequest(
     }
     const listed = await runJson("gh", [
       "pr", "list", "--repo", repo, "--head", head, "--base", base, "--state", "open",
-      "--json", "number,url,isDraft,headRefName,baseRefName,headRefOid,state,title,body", "--limit", "2",
+      "--json", prFields, "--limit", "2",
     ], { timeout: 20_000 });
     if (!Array.isArray(listed) || listed.length !== 1) {
       throw new CrewdeckError("Created draft PR cannot be reconciled uniquely", "ambiguous_pull_request", listed);
@@ -2342,7 +2352,7 @@ export async function publishPullRequest(
     ], { timeout: 30_000 });
     pr = validatePr(await runJson("gh", [
       "pr", "view", String(pr.number), "--repo", repo,
-      "--json", "number,url,isDraft,headRefName,baseRefName,headRefOid,state,title,body",
+      "--json", prFields,
     ], { timeout: 20_000 }));
   }
 
@@ -2372,7 +2382,6 @@ export async function publishPullRequest(
     existingPr?.number === pr.number &&
     existingPr?.title === title.trim() &&
     existingPr?.body === body.trim();
-  const prFields = "number,url,isDraft,headRefName,baseRefName,headRefOid,state,title,body";
   const readExactCommentPr = async () => {
     try {
       return validatePr(await runJson("gh", [

@@ -197,7 +197,7 @@ Before side effects, publication refuses:
 - invalid or mismatched remote/repository/base/head
 - any request where head is base or is not the owned Crewdeck branch
 - a non-GitHub remote, missing remote base, unavailable `gh` credentials/repository
-- an unowned/diverged remote head, ambiguous PR, non-draft PR, or wrong PR base/head
+- an unowned/diverged remote head, ambiguous PR, cross-repository/fork head, non-draft PR, or wrong PR repository/base/head
 
 Crewdeck pushes the approved SHA explicitly to `refs/heads/crew/<id>` with `--force-with-lease`; it never pushes the base. It verifies remote SHA, rechecks local HEAD/cleanliness, and creates or updates one open draft PR with `gh`. State records `remote`, `repo`, `base`, `remoteHead`, `remoteSha`, `pushedAt`, `number`, `url`, `prCreatedAt`, `updatedAt`, and verification/attempt timestamps.
 

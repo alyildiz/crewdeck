@@ -184,7 +184,10 @@ let state={}; try{state=JSON.parse(fs.readFileSync(file,"utf8"))}catch{}
 const save=()=>fs.writeFileSync(file,JSON.stringify(state));
 const value=(name)=>args[args.indexOf(name)+1];
 const headOid=()=>cp.execFileSync(process.env.CREW_REAL_GIT,["--git-dir",process.env.CREW_FAKE_REMOTE,"rev-parse","refs/heads/crew/build-one"],{encoding:"utf8"}).trim();
-const currentPr=()=>state.pr?{...state.pr,headRefOid:headOid()}:undefined;
+const headIdentity=()=>process.env.CREW_GH_CROSS_REPO==="1"
+  ? {isCrossRepository:true,headRepository:{nameWithOwner:"attacker/demo"},headRepositoryOwner:{login:"attacker"}}
+  : {isCrossRepository:false,headRepository:{nameWithOwner:"acme/demo"},headRepositoryOwner:{login:"acme"}};
+const currentPr=()=>state.pr?{...state.pr,...headIdentity(),headRefOid:headOid()}:undefined;
 if(args[0]==="auth"&&args[1]==="status") process.exit(0);
 if(args[0]==="repo"&&args[1]==="view"){console.log(JSON.stringify({nameWithOwner:"acme/demo"}));process.exit(0)}
 if(args[0]==="pr"&&args[1]==="list"){const pr=currentPr();console.log(JSON.stringify(pr?[pr]:[]));process.exit(0)}
@@ -249,6 +252,7 @@ console.error("unexpected gh "+args.join(" "));process.exit(1)
     CREW_GH_STALE_BEFORE_COMMENT: staleBeforeComment ? "1" : "0",
     CREW_GH_STALE_AFTER_COMMENT: staleAfterComment ? "1" : "0",
     CREW_GH_COMMENT_DELAY_MS: String(commentPostDelayMs),
+    CREW_GH_CROSS_REPO: "0",
   };
   return { root, repo, worktree, remote, statePath, stateDir, ghState, ghLog, herdrLog, head, env };
 }
@@ -447,6 +451,33 @@ test("approved exact SHA publication retries deterministically and is idempotent
     [item.head, secondHead],
   );
   assert.equal(git(item.repo, "rev-parse", "main"), git(item.remote, "rev-parse", "main"));
+});
+
+test("a same-SHA same-name draft PR from a fork is refused before edit or comment POST", async (t) => {
+  const item = await fixture({ verdict: "approved", failCreateOnce: true });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  await collectCandidateAndReview(item);
+
+  let result = publish(item);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /pr_create_failed/);
+  item.env.CREW_GH_CROSS_REPO = "1";
+  result = publish(item);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /invalid_existing_pr/);
+  const ghState = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(ghState.commentPosts || 0, 0);
+  assert.deepEqual(ghState.comments || [], []);
+  const log = await readFile(item.ghLog, "utf8");
+  const prReads = log.split("\n").filter((line) => /pr (?:list|view)/.test(line));
+  assert.ok(prReads.length > 0);
+  assert.ok(prReads.every((line) =>
+    line.includes("isCrossRepository") &&
+    line.includes("headRepository") &&
+    line.includes("headRepositoryOwner")
+  ));
+  assert.equal((log.match(/pr edit/g) || []).length, 0);
+  assert.doesNotMatch(log, /--method POST/);
 });
 
 test("exact marker lookup adopts an immutable comment beyond the first bounded page", async (t) => {
