@@ -237,7 +237,7 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     name: "crew_reconcile_merged_pr",
     label: "Reconcile Externally Merged PR",
     description:
-      "Finalize a reviewed-pr build only after proving its exact durable GitHub PR is MERGED and its latest collected approved/publication SHA is contained in the merge commit or current remote base. Refuses ambiguous publication, stale/newer candidates, uncertain or active agents, dirty worktrees, and unsafe cleanup. Never pushes, merges, or changes a base; preserves all audit history and always asks for independent confirmation.",
+      "Finalize a reviewed-pr build only after proving its exact durable GitHub PR is MERGED and its latest collected approved/publication SHA is contained in the merge commit or current remote base. Refuses present ambiguous, dispatched, partial, or divergent verdict evidence; only a wholly absent legacy verdict journal may bootstrap as legacy-absent after every other proof succeeds. Never mutates GitHub comments, pushes, merges, or changes a base; preserves all audit history and always asks for independent confirmation.",
     parameters: Type.Object({ id: Type.String({ description: "Reviewed-pr build task id" }) }),
     async execute(_id, params, _signal, _update, ctx) {
       if (!ctx.hasUI) throw new Error("crew_reconcile_merged_pr requires interactive confirmation");

@@ -2659,6 +2659,14 @@ function exactPullRequestUrl(value, repo, number) {
   }
 }
 
+function exactHeadRepository(value, repo) {
+  const [, expectedName] = repo.split("/");
+  if (typeof value?.nameWithOwner === "string") {
+    return value.nameWithOwner.toLowerCase() === repo.toLowerCase();
+  }
+  return typeof value?.name === "string" && value.name.toLowerCase() === expectedName.toLowerCase();
+}
+
 function exactIssueCommentUrl(value, repo, number, commentId) {
   try {
     const url = new URL(value);
@@ -2856,35 +2864,79 @@ export async function reconcileMergedPullRequest(configPath, id) {
     throw new CrewdeckError("Published candidate has unresolved review escalation", "review_not_approved");
   }
 
-  const verdicts = publication.verdictComments;
-  if (
-    !Array.isArray(verdicts) ||
-    verdicts.length === 0 ||
-    verdicts.some((item) =>
-      item?.status !== "published" ||
-      !/^[0-9a-f]{40}$/.test(item.headSha || "") ||
-      item.marker !== `<!-- crewdeck-verdict:${id}:${item.headSha} -->` ||
-      item.prNumber !== publication.number ||
-      !Number.isInteger(item.candidateVersion) ||
-      !TASK_ID_RE.test(item.reviewerTaskId || "") ||
-      !/^[0-9a-f]{64}$/.test(item.contentSha256 || "") ||
-      !Number.isInteger(item.comment?.id) ||
-      item.comment.id < 1 ||
-      !exactIssueCommentUrl(item.comment?.url, publication.repo, publication.number, item.comment?.id)
-    ) ||
-    new Set(verdicts.map((item) => item.headSha)).size !== verdicts.length
-  ) {
-    throw new CrewdeckError("Durable publication is missing or ambiguous", "ambiguous_publication");
-  }
-  const matchingVerdicts = verdicts.filter((item) =>
-    item.headSha === candidate.head &&
-    item.candidateVersion === candidate.version &&
-    item.reviewerTaskId === approval.reviewTaskId
-  );
-  if (matchingVerdicts.length !== 1) {
-    throw new CrewdeckError("Approved candidate has no unique published verdict", "ambiguous_publication", {
-      matches: matchingVerdicts.length,
-    });
+  const hasVerdictJournal = Object.hasOwn(publication, "verdictComments");
+  let verdictEvidence;
+  if (!hasVerdictJournal) {
+    // Publications completed by a process that loaded the pre-verdict implementation
+    // have no journal at all. Absence is distinct from any present, incomplete intent.
+    verdictEvidence = {
+      status: "legacy-absent",
+      headSha: candidate.head,
+      candidateVersion: candidate.version,
+      reviewerTaskId: approval.reviewTaskId,
+    };
+  } else {
+    const verdicts = publication.verdictComments;
+    if (
+      !Array.isArray(verdicts) ||
+      verdicts.length === 0 ||
+      verdicts.some((item) => {
+        if (
+          item?.status !== "published" ||
+          !/^[0-9a-f]{40}$/.test(item.headSha || "") ||
+          item.marker !== `<!-- crewdeck-verdict:${id}:${item.headSha} -->` ||
+          item.prNumber !== publication.number ||
+          !Number.isInteger(item.candidateVersion) ||
+          !TASK_ID_RE.test(item.reviewerTaskId || "") ||
+          !/^[0-9a-f]{64}$/.test(item.contentSha256 || "") ||
+          !Number.isInteger(item.comment?.id) ||
+          item.comment.id < 1 ||
+          !exactIssueCommentUrl(item.comment?.url, publication.repo, publication.number, item.comment?.id)
+        ) {
+          return true;
+        }
+        const intentCandidate = journalResult.journal.candidates.find((entry) =>
+          entry.head === item.headSha && entry.version === item.candidateVersion
+        );
+        const intentApprovals = (record.reviewInbox || []).filter((entry) =>
+          entry.reviewTaskId === item.reviewerTaskId &&
+          entry.reviewedHead === item.headSha &&
+          entry.candidateVersion === item.candidateVersion &&
+          entry.verdict === "approved" &&
+          entry.validAtCollection === true
+        );
+        if (!intentCandidate || intentApprovals.length !== 1) return true;
+        try {
+          const rendered = renderVerdictComment(id, intentCandidate, intentApprovals[0]);
+          return item.marker !== rendered.marker || item.contentSha256 !== rendered.contentSha256;
+        } catch {
+          return true;
+        }
+      }) ||
+      new Set(verdicts.map((item) => item.headSha)).size !== verdicts.length
+    ) {
+      throw new CrewdeckError("Durable publication is missing or ambiguous", "ambiguous_publication");
+    }
+    const matchingVerdicts = verdicts.filter((item) =>
+      item.headSha === candidate.head &&
+      item.candidateVersion === candidate.version &&
+      item.reviewerTaskId === approval.reviewTaskId
+    );
+    if (matchingVerdicts.length !== 1) {
+      throw new CrewdeckError("Approved candidate has no unique published verdict", "ambiguous_publication", {
+        matches: matchingVerdicts.length,
+      });
+    }
+    const [matchingVerdict] = matchingVerdicts;
+    verdictEvidence = {
+      status: "published",
+      headSha: matchingVerdict.headSha,
+      candidateVersion: matchingVerdict.candidateVersion,
+      reviewerTaskId: matchingVerdict.reviewerTaskId,
+      marker: matchingVerdict.marker,
+      contentSha256: matchingVerdict.contentSha256,
+      comment: { ...matchingVerdict.comment },
+    };
   }
   let remoteUrl;
   try {
@@ -2939,13 +2991,30 @@ export async function reconcileMergedPullRequest(configPath, id) {
     pr?.baseRefName !== publication.base ||
     pr?.headRefOid !== candidate.head ||
     pr?.isCrossRepository !== false ||
-    pr?.headRepository?.nameWithOwner?.toLowerCase() !== publication.repo.toLowerCase() ||
+    !exactHeadRepository(pr?.headRepository, publication.repo) ||
     pr?.headRepositoryOwner?.login?.toLowerCase() !== repoOwner.toLowerCase() ||
     !/^[0-9a-f]{40}$/.test(mergeCommit || "") ||
     typeof pr?.mergedAt !== "string" ||
     Number.isNaN(Date.parse(pr.mergedAt))
   ) {
     throw new CrewdeckError("GitHub PR is not the exact merged publication", "pull_request_not_merged", pr);
+  }
+  if (verdictEvidence.status === "legacy-absent") {
+    const rendered = renderVerdictComment(id, candidate, approval);
+    const untrackedVerdict = await findVerdictComment(
+      publication.repo,
+      publication.number,
+      rendered.marker,
+      rendered.body,
+    );
+    if (untrackedVerdict) {
+      throw new CrewdeckError(
+        "Legacy publication has an untracked GitHub verdict comment",
+        "ambiguous_publication",
+        { prNumber: publication.number, marker: rendered.marker },
+      );
+    }
+    verdictEvidence.verifiedAt = new Date().toISOString();
   }
 
   const localBaseBefore = (await git(record.repo, ["rev-parse", record.base])).stdout;
@@ -3061,6 +3130,7 @@ export async function reconcileMergedPullRequest(configPath, id) {
       version: candidate.version,
       reviewerTaskId: approval.reviewTaskId,
     },
+    verdict: verdictEvidence,
     containment: {
       remoteBaseSha,
       mergeCommit,

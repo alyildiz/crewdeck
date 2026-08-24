@@ -36,7 +36,7 @@ async function assertUntouched(item) {
   assert.equal(git(item.repo, "rev-parse", "main"), item.localBase);
 }
 
-async function fixture({ agent = "idle", contained = true } = {}) {
+async function fixture({ agent = "idle", contained = true, legacyPublication = false } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "crewdeck-merged-pr-"));
   const repo = path.join(root, "repo");
   const worktree = path.join(root, "worktrees", "demo", "build-one");
@@ -44,6 +44,7 @@ async function fixture({ agent = "idle", contained = true } = {}) {
   const stateDir = path.join(root, "state");
   const fakeBin = path.join(root, "bin");
   const ghState = path.join(root, "gh-state.json");
+  const ghLog = path.join(root, "gh.log");
   const herdrLog = path.join(root, "herdr.log");
   const workspaceRemoved = path.join(root, "workspace-removed");
   const agentClosed = path.join(root, "agent-closed");
@@ -61,10 +62,18 @@ async function fixture({ agent = "idle", contained = true } = {}) {
   git(repo, "remote", "add", "origin", "git@github.com:acme/demo.git");
   await mkdir(path.dirname(worktree), { recursive: true });
   git(repo, "worktree", "add", "-q", "-b", "crew/build-one", worktree, "main");
+  let priorHead;
+  if (legacyPublication) {
+    await writeFile(path.join(worktree, "change.txt"), "candidate v1\n");
+    git(worktree, "add", "change.txt");
+    git(worktree, "commit", "-qm", "candidate v1");
+    priorHead = git(worktree, "rev-parse", "HEAD");
+  }
   await writeFile(path.join(worktree, "change.txt"), "approved candidate\n");
   git(worktree, "add", "change.txt");
   git(worktree, "commit", "-qm", "approved candidate");
   const head = git(worktree, "rev-parse", "HEAD");
+  const candidateVersion = legacyPublication ? 2 : 1;
 
   const kindsPath = path.join(root, "kinds.yml");
   const profilesPath = path.join(root, "profiles.yml");
@@ -93,14 +102,28 @@ async function fixture({ agent = "idle", contained = true } = {}) {
     profile: "worker", status: "running", branch: "crew/build-one", detached: false,
     base: "main", repo, worktree, workspaceId: "build-workspace", paneId: "build-pane",
     agentName: "cd_build_one", sourceWorkspaceId: "source", sourceWorkspaceOwned: false,
-    reportToken: buildToken, maxReviewRounds: 3, candidateCollectedVersion: 1,
+    reportToken: buildToken, maxReviewRounds: 3, candidateCollectedVersion: candidateVersion,
     candidateCollectedAt: now, createdAt: now,
-    reviewInbox: [{
-      reviewTaskId: "review-one", candidateVersion: 1, reviewedHead: head,
-      verdict: "approved", summary: "approved exact SHA", findings: [],
-      checks: ["fixture review"], openQuestions: [], completedAt: now,
-      collectedAt: now, validAtCollection: true,
-    }],
+    reviewInbox: [
+      ...(legacyPublication ? [{
+        reviewTaskId: "review-prior", candidateVersion: 1, reviewedHead: priorHead,
+        verdict: "changes-requested", summary: "v1 requires changes", findings: [{
+          severity: "major", title: "v1 finding", detail: "fix provenance",
+          location: "src/core.mjs", recommendation: "submit v2",
+        }],
+        checks: ["fixture v1 review"], openQuestions: [], completedAt: now,
+        collectedAt: now, validAtCollection: true,
+      }] : []),
+      {
+        reviewTaskId: "review-one", candidateVersion, reviewedHead: head,
+        verdict: "approved", summary: "approved exact SHA", findings: [],
+        checks: ["fixture review"], openQuestions: [], completedAt: now,
+        collectedAt: now, validAtCollection: true,
+      },
+    ],
+    ...(legacyPublication ? { reviewReservation: {
+      reviewTaskId: "review-one", reviewedHead: head, reservedAt: now,
+    } } : {}),
   };
   const review = {
     id: "review-one", project: "demo", description: "Review candidate", kind: "review",
@@ -109,19 +132,36 @@ async function fixture({ agent = "idle", contained = true } = {}) {
     base: "main", repo, worktree: path.join(root, "worktrees", "demo", "review-one"),
     workspaceId: "review-workspace", agentName: "cd_review_one", sourceWorkspaceId: "source",
     sourceWorkspaceOwned: false, reportToken: reviewToken, parentTaskId: "build-one",
-    reviewedHead: head, candidateVersion: 1, resultCollectedAt: now, cleanedAt: now, createdAt: now,
+    reviewedHead: head, candidateVersion, resultCollectedAt: now, cleanedAt: now, createdAt: now,
   };
+  const priorReview = legacyPublication ? {
+    ...review,
+    id: "review-prior", reportToken: "c".repeat(48), reviewedHead: priorHead,
+    candidateVersion: 1, worktree: path.join(root, "worktrees", "demo", "review-prior"),
+    workspaceId: "review-prior-workspace", agentName: "cd_review_prior",
+  } : undefined;
   await mkdir(path.join(stateDir, "reports"), { recursive: true });
   const statePath = path.join(stateDir, "state.json");
   const candidatePath = path.join(stateDir, "reports", "build-one.candidates.json");
   const reviewPath = path.join(stateDir, "reports", "review-one.json");
-  await writeFile(statePath, JSON.stringify({ version: 1, tasks: { "build-one": build, "review-one": review } }));
+  const priorReviewPath = path.join(stateDir, "reports", "review-prior.json");
+  await writeFile(statePath, JSON.stringify({ version: 1, tasks: {
+    "build-one": build,
+    ...(priorReview ? { "review-prior": priorReview } : {}),
+    "review-one": review,
+  } }));
   await writeFile(candidatePath, JSON.stringify({
     schemaVersion: 1, taskId: "build-one", kind: "build", workflow: "reviewed-pr", token: buildToken,
-    candidates: [{
-      version: 1, head, submittedAt: now,
-      payload: { summary: "candidate", commit: head, tests: [], risks: [], openQuestions: [] },
-    }],
+    candidates: [
+      ...(legacyPublication ? [{
+        version: 1, head: priorHead, submittedAt: now,
+        payload: { summary: "candidate v1", commit: priorHead, tests: [], risks: [], openQuestions: [] },
+      }] : []),
+      {
+        version: candidateVersion, head, submittedAt: now,
+        payload: { summary: "candidate", commit: head, tests: [], risks: [], openQuestions: [] },
+      },
+    ],
   }));
   await writeFile(reviewPath, JSON.stringify({
     schemaVersion: 1, taskId: "review-one", kind: "review", lifecycle: "report", contract: "review",
@@ -131,7 +171,22 @@ async function fixture({ agent = "idle", contained = true } = {}) {
       findings: [], checks: ["fixture review"], openQuestions: [],
     },
   }));
+  if (legacyPublication) {
+    await writeFile(priorReviewPath, JSON.stringify({
+      schemaVersion: 1, taskId: "review-prior", kind: "review", lifecycle: "report", contract: "review",
+      parentTaskId: "build-one", reviewedHead: priorHead, token: priorReview.reportToken, completedAt: now,
+      payload: {
+        parentTaskId: "build-one", reviewedHead: priorHead, verdict: "changes-requested",
+        summary: "v1 requires changes", findings: [{
+          severity: "major", title: "v1 finding", detail: "fix provenance",
+          location: "src/core.mjs", recommendation: "submit v2",
+        }],
+        checks: ["fixture v1 review"], openQuestions: [],
+      },
+    }));
+  }
   await writeFile(ghState, JSON.stringify({ comments: [] }));
+  await writeFile(ghLog, "");
 
   await mkdir(fakeBin);
   const fakeGit = path.join(fakeBin, "git");
@@ -189,6 +244,7 @@ esac
   await writeFile(gh, `#!/usr/bin/env node
 const fs=require("fs");
 const args=process.argv.slice(2); const file=process.env.CREW_GH_STATE;
+fs.appendFileSync(process.env.CREW_GH_LOG,args.join(" ")+"\\n");
 let state=JSON.parse(fs.readFileSync(file,"utf8"));
 const save=()=>fs.writeFileSync(file,JSON.stringify(state));
 const value=(name)=>args[args.indexOf(name)+1];
@@ -233,6 +289,7 @@ console.error("unexpected gh "+args.join(" "));process.exit(1)
     CREW_FIXTURE_REPO: repo,
     CREW_FIXTURE_WORKTREE: worktree,
     CREW_GH_STATE: ghState,
+    CREW_GH_LOG: ghLog,
     CREW_HEAD: head,
     CREW_HERDR_LOG: herdrLog,
     CREW_AGENT_MODE: "idle",
@@ -248,6 +305,15 @@ console.error("unexpected gh "+args.join(" "));process.exit(1)
     "--base", "main", "--head", "crew/build-one", "--title", "Reviewed change", "--body", "Draft body",
   );
   assert.equal(publish.status, 0, publish.stderr);
+  if (legacyPublication) {
+    await mutateJson(statePath, (state) => {
+      delete state.tasks["build-one"].publication.verdictComments;
+    });
+    await mutateJson(ghState, (github) => {
+      github.comments = [];
+      github.pr.headRepository = { name: "demo" };
+    });
+  }
   env.CREW_AGENT_MODE = agent;
 
   let mergeCommit = localBase;
@@ -273,8 +339,8 @@ console.error("unexpected gh "+args.join(" "));process.exit(1)
   await writeFile(ghState, JSON.stringify(github));
 
   return {
-    root, repo, worktree, remote, statePath, stateDir, candidatePath, reviewPath,
-    ghState, herdrLog, workspaceRemoved, agentClosed, head, mergeCommit, localBase, env,
+    root, repo, worktree, remote, statePath, stateDir, candidatePath, reviewPath, priorReviewPath,
+    ghState, ghLog, herdrLog, workspaceRemoved, agentClosed, head, priorHead, mergeCommit, localBase, env,
   };
 }
 
@@ -308,6 +374,48 @@ test("reproduces a GitHub-merged reviewed publication that remains active in /cr
   assert.match(widget, /build-one\s+review-approved/);
 });
 
+test("reconciles a historical v2 publication with no verdict field or GitHub comment", async (t) => {
+  const item = await fixture({ legacyPublication: true });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  const candidateHistory = await readFile(item.candidatePath, "utf8");
+  const reviewHistory = await readFile(item.reviewPath, "utf8");
+  const priorReviewHistory = await readFile(item.priorReviewPath, "utf8");
+  const before = await persisted(item);
+  const publicationHistory = before.tasks["build-one"].publication;
+  assert.equal(before.tasks["build-one"].candidateCollectedVersion, 2);
+  assert.equal(Object.hasOwn(publicationHistory, "verdictComments"), false);
+  assert.deepEqual(JSON.parse(await readFile(item.ghState, "utf8")).comments, []);
+  await writeFile(item.ghLog, "");
+
+  const result = runCli(item, "reconcile-merged-pr", "build-one", "--confirm");
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.task.status, "pr-merged");
+  assert.equal(output.reconciliation.status, "merged-reconciled");
+  assert.equal(output.reconciliation.evidence.candidate.version, 2);
+  assert.equal(output.reconciliation.evidence.candidate.sha, item.head);
+  assert.equal(output.reconciliation.evidence.verdict.status, "legacy-absent");
+  assert.equal(output.reconciliation.evidence.verdict.headSha, item.head);
+
+  assert.notEqual(spawnSync(realGit, ["-C", item.repo, "show-ref", "--verify", "refs/heads/crew/build-one"]).status, 0);
+  await assert.rejects(() => readFile(path.join(item.worktree, "change.txt")), /ENOENT/);
+  assert.equal(await readFile(item.candidatePath, "utf8"), candidateHistory);
+  assert.equal(await readFile(item.reviewPath, "utf8"), reviewHistory);
+  assert.equal(await readFile(item.priorReviewPath, "utf8"), priorReviewHistory);
+  const after = await persisted(item);
+  assert.deepEqual(after.tasks["build-one"].publication, publicationHistory);
+  assert.equal(after.tasks["build-one"].mergeReconciliation.evidence.verdict.status, "legacy-absent");
+  assert.deepEqual(JSON.parse(await readFile(item.ghState, "utf8")).comments, []);
+  assert.doesNotMatch(await readFile(item.ghLog, "utf8"), /api .*--method (?:POST|PATCH|DELETE)/);
+
+  const status = runCli(item, "status", "build-one");
+  assert.equal(status.status, 0, status.stderr);
+  const [history] = JSON.parse(status.stdout);
+  assert.equal(history.observedStatus, "pr-merged");
+  assert.equal(history.mergeReconciliation.evidence.verdict.status, "legacy-absent");
+  assert.equal(history.candidates.journal.candidates.at(-1).version, 2);
+});
+
 test("reconciles the exact external merge, cleans only isolated resources, and preserves history", async (t) => {
   const item = await fixture();
   t.after(() => rm(item.root, { recursive: true, force: true }));
@@ -315,6 +423,9 @@ test("reconciles the exact external merge, cleans only isolated resources, and p
   const reviewHistory = await readFile(item.reviewPath, "utf8");
   const before = await persisted(item);
   const publicationHistory = before.tasks["build-one"].publication;
+  const githubComments = JSON.parse(await readFile(item.ghState, "utf8")).comments;
+  assert.equal(githubComments.length, 1);
+  await writeFile(item.ghLog, "");
 
   const result = runCli(item, "reconcile-merged-pr", "build-one", "--confirm");
   assert.equal(result.status, 0, result.stderr);
@@ -328,6 +439,9 @@ test("reconciles the exact external merge, cleans only isolated resources, and p
   assert.equal(output.reconciliation.evidence.pr.url, "https://github.com/acme/demo/pull/17");
   assert.equal(output.reconciliation.evidence.pr.mergeCommit, item.mergeCommit);
   assert.equal(output.reconciliation.evidence.candidate.sha, item.head);
+  assert.equal(output.reconciliation.evidence.verdict.status, "published");
+  assert.equal(output.reconciliation.evidence.verdict.headSha, item.head);
+  assert.equal(output.reconciliation.evidence.verdict.comment.id, 501);
   assert.ok(output.reconciliation.reconciledAt);
   assert.ok(output.reconciliation.cleanup.workspaceClosedAt);
 
@@ -343,6 +457,8 @@ test("reconciles the exact external merge, cleans only isolated resources, and p
   const after = await persisted(item);
   assert.deepEqual(after.tasks["build-one"].publication, publicationHistory);
   assert.equal(after.tasks["review-one"].status, "cleaned");
+  assert.deepEqual(JSON.parse(await readFile(item.ghState, "utf8")).comments, githubComments);
+  assert.doesNotMatch(await readFile(item.ghLog, "utf8"), /api .*--method (?:POST|PATCH|DELETE)/);
   assert.doesNotMatch(await crewWidget(item), /build-one/);
   assert.match(await crewWidget(item, "all"), /build-one\s+pr-merged/);
 
@@ -379,6 +495,7 @@ test("refuses an open PR and every mismatched GitHub PR identity without cleanup
     ["head", (github) => { github.pr.headRefName = "crew/other"; }],
     ["sha", (github) => { github.pr.headRefOid = "f".repeat(40); }],
     ["repository", (github) => { github.pr.headRepository.nameWithOwner = "other/demo"; }],
+    ["repository-name", (github) => { github.pr.headRepository = { name: "other" }; }],
   ];
   for (const [name, mutate] of cases) {
     await t.test(name, async (t) => {
@@ -487,24 +604,59 @@ test("refuses a newer candidate and preserves its branch", async (t) => {
   assert.equal(await readFile(path.join(item.worktree, "newer.txt"), "utf8"), "new candidate\n");
 });
 
-test("refuses missing or ambiguous durable publication evidence", async (t) => {
-  const missing = await fixture();
-  t.after(() => rm(missing.root, { recursive: true, force: true }));
-  await mutateJson(missing.statePath, (state) => { delete state.tasks["build-one"].publication; });
-  let result = runCli(missing, "reconcile-merged-pr", "build-one", "--confirm");
+test("refuses missing durable publication identity", async (t) => {
+  const item = await fixture();
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  await mutateJson(item.statePath, (state) => { delete state.tasks["build-one"].publication; });
+
+  const result = runCli(item, "reconcile-merged-pr", "build-one", "--confirm");
   assert.equal(result.status, 1);
   assert.match(result.stderr, /invalid_publication_identity/);
-  await assertUntouched(missing);
+  await assertUntouched(item);
+});
 
-  const ambiguous = await fixture();
-  t.after(() => rm(ambiguous.root, { recursive: true, force: true }));
-  await mutateJson(ambiguous.statePath, (state) => {
-    state.tasks["build-one"].publication.verdictComments[0].status = "ambiguous";
+test("refuses ambiguous, dispatched, partial, empty, divergent, or untracked verdict evidence", async (t) => {
+  const cases = [
+    ["ambiguous", (publication) => { publication.verdictComments[0].status = "ambiguous"; }],
+    ["dispatched", (publication) => { publication.verdictComments[0].status = "dispatched"; }],
+    ["partial", (publication) => { delete publication.verdictComments[0].comment.url; }],
+    ["empty", (publication) => { publication.verdictComments = []; }],
+    ["divergent", (publication) => { publication.verdictComments[0].contentSha256 = "f".repeat(64); }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, async (t) => {
+      const item = await fixture();
+      t.after(() => rm(item.root, { recursive: true, force: true }));
+      await mutateJson(item.statePath, (state) => mutate(state.tasks["build-one"].publication));
+      const comments = JSON.parse(await readFile(item.ghState, "utf8")).comments;
+      await writeFile(item.ghLog, "");
+
+      const result = runCli(item, "reconcile-merged-pr", "build-one", "--confirm");
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /ambiguous_publication/);
+      await assertUntouched(item);
+      assert.deepEqual(JSON.parse(await readFile(item.ghState, "utf8")).comments, comments);
+      assert.doesNotMatch(await readFile(item.ghLog, "utf8"), /api .*--method (?:POST|PATCH|DELETE)/);
+    });
+  }
+
+  await t.test("absent journal with an untracked GitHub verdict", async (t) => {
+    const item = await fixture();
+    t.after(() => rm(item.root, { recursive: true, force: true }));
+    await mutateJson(item.statePath, (state) => {
+      delete state.tasks["build-one"].publication.verdictComments;
+    });
+    const comments = JSON.parse(await readFile(item.ghState, "utf8")).comments;
+    assert.equal(comments.length, 1);
+    await writeFile(item.ghLog, "");
+
+    const result = runCli(item, "reconcile-merged-pr", "build-one", "--confirm");
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /ambiguous_publication/);
+    await assertUntouched(item);
+    assert.deepEqual(JSON.parse(await readFile(item.ghState, "utf8")).comments, comments);
+    assert.doesNotMatch(await readFile(item.ghLog, "utf8"), /api .*--method (?:POST|PATCH|DELETE)/);
   });
-  result = runCli(ambiguous, "reconcile-merged-pr", "build-one", "--confirm");
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /ambiguous_publication/);
-  await assertUntouched(ambiguous);
 });
 
 test("does not mark terminal on cleanup failure and safely resumes cleanup", async (t) => {
