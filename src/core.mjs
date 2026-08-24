@@ -2235,7 +2235,6 @@ export async function publishPullRequest(
     "number", "url", "isDraft", "headRefName", "baseRefName", "headRefOid",
     "isCrossRepository", "headRepository", "headRepositoryOwner", "state", "title", "body",
   ].join(",");
-  const [repoOwner] = repo.split("/");
   const validatePr = (pr, expectedHeadSha = undefined) => {
     const urlMatch = typeof pr?.url === "string"
       ? pr.url.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9][0-9]*)$/i)
@@ -2252,10 +2251,7 @@ export async function publishPullRequest(
       pr.headRefName !== head ||
       pr.baseRefName !== base ||
       pr.isCrossRepository !== false ||
-      typeof pr.headRepository?.nameWithOwner !== "string" ||
-      pr.headRepository.nameWithOwner.toLowerCase() !== repo.toLowerCase() ||
-      typeof pr.headRepositoryOwner?.login !== "string" ||
-      pr.headRepositoryOwner.login.toLowerCase() !== repoOwner.toLowerCase() ||
+      !exactHeadRepository(pr.headRepository, pr.headRepositoryOwner, repo) ||
       (pr.state !== undefined && pr.state !== "OPEN") ||
       (expectedHeadSha !== undefined && pr.headRefOid !== expectedHeadSha)
     ) {
@@ -2659,12 +2655,23 @@ function exactPullRequestUrl(value, repo, number) {
   }
 }
 
-function exactHeadRepository(value, repo) {
-  const [, expectedName] = repo.split("/");
-  if (typeof value?.nameWithOwner === "string") {
-    return value.nameWithOwner.toLowerCase() === repo.toLowerCase();
+function exactHeadRepository(value, owner, repo) {
+  const [expectedOwner, expectedName, extra] = repo.split("/");
+  if (!expectedOwner || !expectedName || extra || !value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
   }
-  return typeof value?.name === "string" && value.name.toLowerCase() === expectedName.toLowerCase();
+  if (Object.hasOwn(value, "nameWithOwner")) {
+    return (
+      typeof value.nameWithOwner === "string" &&
+      value.nameWithOwner.toLowerCase() === repo.toLowerCase()
+    );
+  }
+  return (
+    typeof value.name === "string" &&
+    value.name.toLowerCase() === expectedName.toLowerCase() &&
+    typeof owner?.login === "string" &&
+    owner.login.toLowerCase() === expectedOwner.toLowerCase()
+  );
 }
 
 function exactIssueCommentUrl(value, repo, number, commentId) {
@@ -2979,7 +2986,6 @@ export async function reconcileMergedPullRequest(configPath, id) {
   } catch (error) {
     throw new CrewdeckError("Stored GitHub PR is unavailable", "forge_unavailable", { error: error.message });
   }
-  const [repoOwner] = publication.repo.split("/");
   const mergeCommit = pr?.mergeCommit?.oid;
   if (
     pr?.number !== publication.number ||
@@ -2991,8 +2997,7 @@ export async function reconcileMergedPullRequest(configPath, id) {
     pr?.baseRefName !== publication.base ||
     pr?.headRefOid !== candidate.head ||
     pr?.isCrossRepository !== false ||
-    !exactHeadRepository(pr?.headRepository, publication.repo) ||
-    pr?.headRepositoryOwner?.login?.toLowerCase() !== repoOwner.toLowerCase() ||
+    !exactHeadRepository(pr?.headRepository, pr?.headRepositoryOwner, publication.repo) ||
     !/^[0-9a-f]{40}$/.test(mergeCommit || "") ||
     typeof pr?.mergedAt !== "string" ||
     Number.isNaN(Date.parse(pr.mergedAt))
