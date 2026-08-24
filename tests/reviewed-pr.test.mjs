@@ -55,6 +55,8 @@ async function fixture({
   staleAfterComment = false,
   commentPostDelayMs = 0,
   headIdentity = gh245HeadIdentity,
+  restFailure = "",
+  restMismatch = "",
 } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "crewdeck-reviewed-pr-"));
   const repo = path.join(root, "repo");
@@ -189,9 +191,10 @@ fs.appendFileSync(log,logged.join(" ")+"\\n");
 let state={}; try{state=JSON.parse(fs.readFileSync(file,"utf8"))}catch{}
 const save=()=>fs.writeFileSync(file,JSON.stringify(state));
 const value=(name)=>args[args.indexOf(name)+1];
+const rawField=(name)=>{const prefix=name+"=";const field=args.find((arg)=>arg.startsWith(prefix));return field&&field.slice(prefix.length)};
 const headOid=()=>cp.execFileSync(process.env.CREW_REAL_GIT,["--git-dir",process.env.CREW_FAKE_REMOTE,"rev-parse","refs/heads/crew/build-one"],{encoding:"utf8"}).trim();
 const headIdentity=()=>JSON.parse(process.env.CREW_GH_HEAD_IDENTITY);
-const currentPr=()=>state.pr?{...state.pr,...headIdentity(),headRefOid:headOid()}:undefined;
+const currentPr=()=>state.pr?{...state.pr,...headIdentity(),headRefOid:state.headRefOidOverride||headOid()}:undefined;
 if(args[0]==="auth"&&args[1]==="status") process.exit(0);
 if(args[0]==="repo"&&args[1]==="view"){console.log(JSON.stringify({nameWithOwner:"acme/demo"}));process.exit(0)}
 if(args[0]==="pr"&&args[1]==="list"){const pr=currentPr();console.log(JSON.stringify(pr?[pr]:[]));process.exit(0)}
@@ -201,9 +204,23 @@ if(args[0]==="pr"&&args[1]==="create"){
   if(process.env.CREW_GH_FAIL_ONCE==="1"&&!state.failedOnce){state.failedOnce=true;save();console.error("simulated response loss");process.exit(1)}
   console.log(state.pr.url);process.exit(0)
 }
-if(args[0]==="pr"&&args[1]==="edit"){state.pr.title=value("--title");state.pr.body=value("--body");state.edits=(state.edits||0)+1;save();process.exit(0)}
+if(args[0]==="pr"&&args[1]==="edit"){console.error("Projects Classic projectCards must not be queried");process.exit(1)}
 if(args[0]==="api"){
   const endpoint=args.find((arg)=>arg.startsWith("repos/"));
+  if(args.includes("PATCH")){
+    if(endpoint!=="repos/acme/demo/pulls/17"){console.error("unexpected patch endpoint");process.exit(1)}
+    state.restPatches=(state.restPatches||0)+1;
+    if(process.env.CREW_GH_REST_FAILURE!=="rejected"){
+      state.pr.title=rawField("title");state.pr.body=rawField("body");state.pr.baseRefName=rawField("base");
+      if(process.env.CREW_GH_REST_MISMATCH==="title")state.pr.title="mismatched title";
+      if(process.env.CREW_GH_REST_MISMATCH==="body")state.pr.body="mismatched body";
+      if(process.env.CREW_GH_REST_MISMATCH==="base")state.pr.baseRefName="other";
+      if(process.env.CREW_GH_REST_MISMATCH==="head")state.headRefOidOverride="f".repeat(40);
+    }
+    save();
+    if(process.env.CREW_GH_REST_FAILURE){console.error("simulated REST response failure");process.exit(1)}
+    console.log(JSON.stringify(currentPr()));process.exit(0)
+  }
   const comments=state.comments||[];
   if(args.includes("POST")){
     state.commentPosts=(state.commentPosts||0)+1;
@@ -257,6 +274,8 @@ console.error("unexpected gh "+args.join(" "));process.exit(1)
     CREW_GH_STALE_AFTER_COMMENT: staleAfterComment ? "1" : "0",
     CREW_GH_COMMENT_DELAY_MS: String(commentPostDelayMs),
     CREW_GH_HEAD_IDENTITY: JSON.stringify(headIdentity),
+    CREW_GH_REST_FAILURE: restFailure,
+    CREW_GH_REST_MISMATCH: restMismatch,
   };
   return { root, repo, worktree, remote, statePath, stateDir, ghState, ghLog, herdrLog, head, env };
 }
@@ -269,6 +288,39 @@ async function collectCandidateAndReview(item) {
   return collected;
 }
 
+async function addApprovedCandidate(item) {
+  await writeFile(path.join(item.worktree, "change.txt"), "approved candidate two\n");
+  git(item.worktree, "add", "change.txt");
+  git(item.worktree, "commit", "-qm", "approved candidate two");
+  const head = git(item.worktree, "rev-parse", "HEAD");
+  const journalPath = path.join(item.stateDir, "reports", "build-one.candidates.json");
+  const journal = JSON.parse(await readFile(journalPath, "utf8"));
+  journal.candidates.push({
+    version: 2, head, submittedAt: new Date().toISOString(),
+    payload: { summary: "approved candidate two", commit: head, tests: [], risks: [], openQuestions: [] },
+  });
+  await writeFile(journalPath, JSON.stringify(journal));
+  const durable = JSON.parse(await readFile(item.statePath, "utf8"));
+  const token = "c".repeat(48);
+  durable.tasks["review-two"] = {
+    ...durable.tasks["review-one"],
+    id: "review-two", reportToken: token, reviewedHead: head, checkoutHead: head,
+    candidateVersion: 2, agentName: "cd_review_two", resultCollectedAt: undefined,
+  };
+  await writeFile(item.statePath, JSON.stringify(durable));
+  await writeFile(path.join(item.stateDir, "reports", "review-two.json"), JSON.stringify({
+    schemaVersion: 1, taskId: "review-two", kind: "review", lifecycle: "report", contract: "review",
+    parentTaskId: "build-one", reviewedHead: head, token, completedAt: new Date().toISOString(),
+    payload: {
+      parentTaskId: "build-one", reviewedHead: head, verdict: "approved", summary: "second approval",
+      findings: [], checks: ["exact second SHA"], openQuestions: [],
+    },
+  }));
+  const result = runCli(item, "collect", "build-one@candidate-2", "review-two", "--keep-reports");
+  assert.equal(result.status, 0, result.stderr);
+  return head;
+}
+
 const publishArgs = [
   "publish", "build-one",
   "--remote", "origin",
@@ -279,8 +331,11 @@ const publishArgs = [
   "--body", "Draft body",
 ];
 
-function publish(item) {
-  return runCli(item, ...publishArgs);
+function publish(item, { title = "Reviewed change", body = "Draft body" } = {}) {
+  const args = [...publishArgs];
+  args[args.indexOf("--title") + 1] = title;
+  args[args.indexOf("--body") + 1] = body;
+  return runCli(item, ...args);
 }
 
 test("reviewers and scouts use Herdr-opened detached worktrees while builds keep crew branches", async (t) => {
@@ -406,35 +461,7 @@ test("approved exact SHA publication with the gh 2.45 repository shape retries d
   assert.equal(ghDurable.commentPosts, 1);
   assert.equal(ghDurable.comments.length, 1);
 
-  await writeFile(path.join(item.worktree, "change.txt"), "approved candidate two\n");
-  git(item.worktree, "add", "change.txt");
-  git(item.worktree, "commit", "-qm", "approved candidate two");
-  const secondHead = git(item.worktree, "rev-parse", "HEAD");
-  const journalPath = path.join(item.stateDir, "reports", "build-one.candidates.json");
-  const journal = JSON.parse(await readFile(journalPath, "utf8"));
-  journal.candidates.push({
-    version: 2, head: secondHead, submittedAt: new Date().toISOString(),
-    payload: { summary: "approved candidate two", commit: secondHead, tests: [], risks: [], openQuestions: [] },
-  });
-  await writeFile(journalPath, JSON.stringify(journal));
-  durable = JSON.parse(await readFile(item.statePath, "utf8"));
-  const token = "c".repeat(48);
-  durable.tasks["review-two"] = {
-    ...durable.tasks["review-one"],
-    id: "review-two", reportToken: token, reviewedHead: secondHead, checkoutHead: secondHead,
-    candidateVersion: 2, agentName: "cd_review_two", resultCollectedAt: undefined,
-  };
-  await writeFile(item.statePath, JSON.stringify(durable));
-  await writeFile(path.join(item.stateDir, "reports", "review-two.json"), JSON.stringify({
-    schemaVersion: 1, taskId: "review-two", kind: "review", lifecycle: "report", contract: "review",
-    parentTaskId: "build-one", reviewedHead: secondHead, token, completedAt: new Date().toISOString(),
-    payload: {
-      parentTaskId: "build-one", reviewedHead: secondHead, verdict: "approved", summary: "second approval",
-      findings: [], checks: ["exact second SHA"], openQuestions: [],
-    },
-  }));
-  result = runCli(item, "collect", "build-one@candidate-2", "review-two", "--keep-reports");
-  assert.equal(result.status, 0, result.stderr);
+  const secondHead = await addApprovedCandidate(item);
   result = publish(item);
   assert.equal(result.status, 0, result.stderr);
   output = JSON.parse(result.stdout);
@@ -443,9 +470,14 @@ test("approved exact SHA publication with the gh 2.45 repository shape retries d
   assert.equal(git(item.remote, "rev-parse", "refs/heads/crew/build-one"), secondHead);
   log = await readFile(item.ghLog, "utf8");
   assert.equal((log.match(/pr create/g) || []).length, 1);
-  assert.equal((log.match(/pr edit/g) || []).length, 1);
-  assert.doesNotMatch(log, /api .*--method (?:PATCH|DELETE)|pr (?:review|ready|merge)/);
+  assert.equal((log.match(/pr edit/g) || []).length, 0);
+  assert.match(
+    log,
+    /api --method PATCH repos\/acme\/demo\/pulls\/17 --raw-field title=Reviewed change --raw-field body=<redacted> --raw-field base=main/,
+  );
+  assert.doesNotMatch(log, /--method DELETE|pr (?:edit|review|ready|merge)/);
   ghDurable = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(ghDurable.restPatches, 1);
   assert.equal(ghDurable.commentPosts, 2);
   assert.equal(ghDurable.comments.length, 2);
   assert.equal(ghDurable.comments[0].body, firstComment);
@@ -456,6 +488,202 @@ test("approved exact SHA publication with the gh 2.45 repository shape retries d
     [item.head, secondHead],
   );
   assert.equal(git(item.repo, "rev-parse", "main"), git(item.remote, "rev-parse", "main"));
+});
+
+test("updates an existing draft PR through REST and verifies title, body, base, and head", async (t) => {
+  const item = await fixture({ verdict: "approved" });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  await collectCandidateAndReview(item);
+
+  let result = publish(item);
+  assert.equal(result.status, 0, result.stderr);
+  const before = JSON.parse(await readFile(item.ghState, "utf8"));
+  const immutableComment = before.comments[0].body;
+  await writeFile(item.ghLog, "");
+
+  result = publish(item, { title: "Updated reviewed change", body: "Updated draft body" });
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.publication.title, "Updated reviewed change");
+  assert.equal(output.publication.body, "Updated draft body");
+  assert.equal(output.publication.base, "main");
+  assert.equal(output.publication.remoteSha, item.head);
+
+  const github = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(github.pr.title, "Updated reviewed change");
+  assert.equal(github.pr.body, "Updated draft body");
+  assert.equal(github.pr.baseRefName, "main");
+  assert.equal(github.restPatches, 1);
+  assert.equal(github.commentPosts, 1);
+  assert.equal(github.comments.length, 1);
+  assert.equal(github.comments[0].body, immutableComment);
+  const log = await readFile(item.ghLog, "utf8");
+  assert.match(
+    log,
+    /api --method PATCH repos\/acme\/demo\/pulls\/17 --raw-field title=Updated reviewed change --raw-field body=<redacted> --raw-field base=main/,
+  );
+  assert.match(log, /pr view 17[\s\S]*pr view 17/);
+  assert.doesNotMatch(log, /pr edit|--method (?:POST|DELETE)/);
+});
+
+test("a rejected REST update fails closed and retries after an already-pushed partial attempt", async (t) => {
+  const item = await fixture({ verdict: "approved", failCreateOnce: true });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  await collectCandidateAndReview(item);
+
+  let result = publish(item);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /pr_create_failed/);
+  assert.equal(git(item.remote, "rev-parse", "refs/heads/crew/build-one"), item.head);
+  const afterPush = JSON.parse(await readFile(item.statePath, "utf8"));
+  const pushedAt = afterPush.tasks["build-one"].publication.pushedAt;
+
+  item.env.CREW_GH_REST_FAILURE = "rejected";
+  result = publish(item, { title: "Recovered title", body: "Recovered body" });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /pr_update_failed/);
+  let github = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(github.restPatches, 1);
+  assert.equal(github.pr.title, "Reviewed change");
+  assert.equal(github.pr.body, "Draft body");
+  assert.equal(github.commentPosts || 0, 0);
+  let durable = JSON.parse(await readFile(item.statePath, "utf8"));
+  assert.deepEqual(durable.tasks["build-one"].publication.verdictComments || [], []);
+
+  item.env.CREW_GH_REST_FAILURE = "";
+  result = publish(item, { title: "Recovered title", body: "Recovered body" });
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.publication.pushedAt, pushedAt);
+  assert.equal(output.publication.remoteSha, item.head);
+  github = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(github.restPatches, 2);
+  assert.equal(github.pr.title, "Recovered title");
+  assert.equal(github.pr.body, "Recovered body");
+  assert.equal(github.pr.baseRefName, "main");
+  assert.equal(github.commentPosts, 1);
+  assert.equal(github.comments.length, 1);
+  durable = JSON.parse(await readFile(item.statePath, "utf8"));
+  assert.equal(durable.tasks["build-one"].publication.verdictComments.length, 1);
+  assert.equal(durable.tasks["build-one"].publication.verdictComments[0].status, "published");
+  assert.doesNotMatch(await readFile(item.ghLog, "utf8"), /pr edit|--method DELETE/);
+});
+
+test("retry recovers after the reviewed head was pushed but its existing-PR update failed", async (t) => {
+  const item = await fixture({ verdict: "approved" });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  await collectCandidateAndReview(item);
+
+  let result = publish(item);
+  assert.equal(result.status, 0, result.stderr);
+  let github = JSON.parse(await readFile(item.ghState, "utf8"));
+  const firstComment = github.comments[0].body;
+  const secondHead = await addApprovedCandidate(item);
+  item.env.CREW_GH_REST_FAILURE = "rejected";
+  await writeFile(item.ghLog, "");
+
+  result = publish(item);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /pr_update_failed/);
+  assert.equal(git(item.remote, "rev-parse", "refs/heads/crew/build-one"), secondHead);
+  let durable = JSON.parse(await readFile(item.statePath, "utf8"));
+  assert.equal(durable.tasks["build-one"].publication.remoteSha, secondHead);
+  assert.equal(durable.tasks["build-one"].publication.headSha, secondHead);
+  assert.deepEqual(
+    durable.tasks["build-one"].publication.verdictComments.map((entry) => entry.headSha),
+    [item.head],
+  );
+  github = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(github.restPatches, 1);
+  assert.equal(github.commentPosts, 1);
+  assert.equal(github.comments[0].body, firstComment);
+
+  item.env.CREW_GH_REST_FAILURE = "";
+  result = publish(item);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).publication.remoteSha, secondHead);
+  github = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(github.restPatches, 1);
+  assert.equal(github.commentPosts, 2);
+  assert.equal(github.comments.length, 2);
+  assert.equal(github.comments[0].body, firstComment);
+  assert.match(github.comments[1].body, new RegExp(`<!-- crewdeck-verdict:build-one:${secondHead} -->`));
+  durable = JSON.parse(await readFile(item.statePath, "utf8"));
+  assert.deepEqual(
+    durable.tasks["build-one"].publication.verdictComments.map((entry) => entry.headSha),
+    [item.head, secondHead],
+  );
+  const log = await readFile(item.ghLog, "utf8");
+  assert.equal((log.match(/--method PATCH/g) || []).length, 1);
+  assert.equal((log.match(/--method POST/g) || []).length, 1);
+  assert.doesNotMatch(log, /pr edit|--method DELETE/);
+});
+
+test("an applied REST update with a lost response is adopted without another PATCH or verdict comment", async (t) => {
+  const item = await fixture({ verdict: "approved" });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  await collectCandidateAndReview(item);
+
+  let result = publish(item);
+  assert.equal(result.status, 0, result.stderr);
+  let github = JSON.parse(await readFile(item.ghState, "utf8"));
+  const immutableComment = github.comments[0].body;
+  await writeFile(item.ghLog, "");
+
+  item.env.CREW_GH_REST_FAILURE = "lost-applied";
+  result = publish(item, { title: "Applied title", body: "Applied body" });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /pr_update_failed/);
+  github = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(github.restPatches, 1);
+  assert.equal(github.pr.title, "Applied title");
+  assert.equal(github.pr.body, "Applied body");
+  assert.equal(github.commentPosts, 1);
+  assert.equal(github.comments[0].body, immutableComment);
+
+  item.env.CREW_GH_REST_FAILURE = "";
+  result = publish(item, { title: "Applied title", body: "Applied body" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).idempotent, true);
+  github = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(github.restPatches, 1);
+  assert.equal(github.commentPosts, 1);
+  assert.equal(github.comments.length, 1);
+  assert.equal(github.comments[0].body, immutableComment);
+  const durable = JSON.parse(await readFile(item.statePath, "utf8"));
+  assert.equal(durable.tasks["build-one"].publication.verdictComments.length, 1);
+  const log = await readFile(item.ghLog, "utf8");
+  assert.equal((log.match(/--method PATCH/g) || []).length, 1);
+  assert.doesNotMatch(log, /pr edit|--method (?:POST|DELETE)/);
+});
+
+test("authoritative REST update verification refuses any mismatched field or head before verdict dispatch", async (t) => {
+  for (const mismatch of ["title", "body", "base", "head"]) {
+    await t.test(mismatch, async (t) => {
+      const item = await fixture({ verdict: "approved", failCreateOnce: true });
+      t.after(() => rm(item.root, { recursive: true, force: true }));
+      await collectCandidateAndReview(item);
+
+      let result = publish(item);
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /pr_create_failed/);
+      item.env.CREW_GH_REST_MISMATCH = mismatch;
+      await writeFile(item.ghLog, "");
+
+      result = publish(item, { title: "Verified title", body: "Verified body" });
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /invalid_existing_pr/);
+      const github = JSON.parse(await readFile(item.ghState, "utf8"));
+      assert.equal(github.restPatches, 1);
+      assert.equal(github.commentPosts || 0, 0);
+      assert.deepEqual(github.comments || [], []);
+      const durable = JSON.parse(await readFile(item.statePath, "utf8"));
+      assert.deepEqual(durable.tasks["build-one"].publication.verdictComments || [], []);
+      const log = await readFile(item.ghLog, "utf8");
+      assert.match(log, /--method PATCH[\s\S]*pr view 17/);
+      assert.doesNotMatch(log, /pr edit|--method (?:POST|DELETE)/);
+    });
+  }
 });
 
 test("idempotent pr view republication accepts the gh 2.45 shape without mutation", async (t) => {
@@ -573,6 +801,7 @@ test("invalid fallback head repository identities are refused before edit or com
       assert.match(result.stderr, /invalid_existing_pr/);
       const ghState = JSON.parse(await readFile(item.ghState, "utf8"));
       assert.equal(ghState.edits || 0, 0);
+      assert.equal(ghState.restPatches || 0, 0);
       assert.equal(ghState.commentPosts || 0, 0);
       assert.deepEqual(ghState.comments || [], []);
       const log = await readFile(item.ghLog, "utf8");
@@ -583,7 +812,7 @@ test("invalid fallback head repository identities are refused before edit or com
         line.includes("headRepository") &&
         line.includes("headRepositoryOwner")
       ));
-      assert.doesNotMatch(log, /pr edit|--method POST/);
+      assert.doesNotMatch(log, /pr edit|--method (?:PATCH|POST)/);
     });
   }
 });

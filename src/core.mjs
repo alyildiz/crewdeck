@@ -2135,6 +2135,8 @@ export async function publishPullRequest(
   if (typeof title !== "string" || !title.trim() || typeof body !== "string" || !body.trim()) {
     throw new CrewdeckError("Draft PR title and body are required", "invalid_publication_target");
   }
+  const intendedTitle = title.trim();
+  const intendedBody = body.trim();
   const state = await loadState();
   const record = state.tasks[id];
   if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
@@ -2259,6 +2261,21 @@ export async function publishPullRequest(
     }
     return pr;
   };
+  const validateExactPr = (pr, expectedHeadSha = undefined) => {
+    const validated = validatePr(pr, expectedHeadSha);
+    if (
+      validated.title !== intendedTitle ||
+      validated.body !== intendedBody ||
+      validated.baseRefName !== base
+    ) {
+      throw new CrewdeckError(
+        "GitHub PR title, body, or base does not match the intended publication",
+        "invalid_existing_pr",
+        validated,
+      );
+    }
+    return validated;
+  };
 
   const publication = record.publication;
   if (
@@ -2335,8 +2352,8 @@ export async function publishPullRequest(
       base,
       remoteHead: head,
       remoteSha,
-      title: title.trim(),
-      body: body.trim(),
+      title: intendedTitle,
+      body: intendedBody,
       headSha: snapshot.head,
       pushedAt,
       createdAt: stored.publication?.createdAt || attemptAt,
@@ -2352,7 +2369,7 @@ export async function publishPullRequest(
     try {
       await run("gh", [
         "pr", "create", "--draft", "--repo", repo, "--base", base, "--head", head,
-        "--title", title.trim(), "--body", body.trim(),
+        "--title", intendedTitle, "--body", intendedBody,
       ], { timeout: 60_000 });
     } catch (error) {
       throw new CrewdeckError("Draft PR creation failed; retry will reconcile by head/base", "pr_create_failed", {
@@ -2367,21 +2384,39 @@ export async function publishPullRequest(
     if (!Array.isArray(listed) || listed.length !== 1) {
       throw new CrewdeckError("Created draft PR cannot be reconciled uniquely", "ambiguous_pull_request", listed);
     }
-    pr = validatePr(listed[0]);
+    pr = validateExactPr(listed[0], snapshot.head);
     prCreatedAt = new Date().toISOString();
   } else if (
-    pr.title !== title.trim() ||
-    pr.body !== body.trim() ||
+    pr.title !== intendedTitle ||
+    pr.body !== intendedBody ||
+    pr.baseRefName !== base ||
     publication?.headSha !== snapshot.head
   ) {
-    await run("gh", [
-      "pr", "edit", String(pr.number), "--repo", repo, "--base", base,
-      "--title", title.trim(), "--body", body.trim(),
-    ], { timeout: 30_000 });
-    pr = validatePr(await runJson("gh", [
-      "pr", "view", String(pr.number), "--repo", repo,
-      "--json", prFields,
-    ], { timeout: 20_000 }));
+    try {
+      await run("gh", [
+        "api", "--method", "PATCH", `repos/${repo}/pulls/${pr.number}`,
+        "--raw-field", `title=${intendedTitle}`,
+        "--raw-field", `body=${intendedBody}`,
+        "--raw-field", `base=${base}`,
+      ], { timeout: 30_000 });
+    } catch (error) {
+      throw new CrewdeckError(
+        "Draft PR REST update failed; retry will re-read authoritative PR state",
+        "pr_update_failed",
+        { error: error.message, number: pr.number, remoteSha },
+      );
+    }
+    try {
+      pr = validateExactPr(await runJson("gh", [
+        "pr", "view", String(pr.number), "--repo", repo,
+        "--json", prFields,
+      ], { timeout: 20_000 }), snapshot.head);
+    } catch (error) {
+      if (error instanceof CrewdeckError && error.code === "invalid_existing_pr") throw error;
+      throw new CrewdeckError("Cannot verify the draft PR after REST update", "forge_unavailable", {
+        error: error.message,
+      });
+    }
   }
 
   const updatedAt = new Date().toISOString();
@@ -2405,14 +2440,15 @@ export async function publishPullRequest(
 
   const prWasIdempotent =
     publication?.headSha === snapshot.head &&
-    publication?.title === title.trim() &&
-    publication?.body === body.trim() &&
+    publication?.title === intendedTitle &&
+    publication?.body === intendedBody &&
     existingPr?.number === pr.number &&
-    existingPr?.title === title.trim() &&
-    existingPr?.body === body.trim();
+    existingPr?.title === intendedTitle &&
+    existingPr?.body === intendedBody &&
+    existingPr?.baseRefName === base;
   const readExactCommentPr = async () => {
     try {
-      return validatePr(await runJson("gh", [
+      return validateExactPr(await runJson("gh", [
         "pr", "view", String(pr.number), "--repo", repo, "--json", prFields,
       ], { timeout: 20_000 }), snapshot.head);
     } catch (error) {
@@ -2423,7 +2459,7 @@ export async function publishPullRequest(
     }
   };
 
-  // The exact PR and approved local state are checked after PR create/edit and
+  // The exact PR and approved local state are checked after PR create/REST update and
   // immediately around marker lookup. No comment POST is allowed before these checks.
   await readExactCommentPr();
   let current = await currentApprovedVerdict(
