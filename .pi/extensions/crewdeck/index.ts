@@ -217,7 +217,7 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     name: "crew_publish_pr",
     label: "Publish Draft Pull Request",
     description:
-      "Idempotently push only the approved current SHA from the isolated crew branch and create or update its GitHub draft PR. Validates remote/repo/base/head, clean state, approval, credentials, forge, and remote ownership. Never merges.",
+      "Idempotently push only the approved current SHA, create/update its GitHub draft PR, then append one bounded immutable verdict comment for task+SHA. Reconciles exact markers under a durable dispatch intent; ambiguity fails closed without repost, edit, delete, approval, ready, or merge.",
     parameters: Type.Object({
       id: Type.String(),
       remote: Type.String(),

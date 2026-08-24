@@ -21,7 +21,7 @@ Defaults are `scout`, `review`, and `build`. Scouts and reviewers use detached, 
 A build has one of two workflows:
 
 - `direct` (default, backward compatible): terminating immutable `crew_complete`, then the existing prepare/confirmed-local-merge lifecycle.
-- `reviewed-pr`: non-terminating, versioned `crew_submit_candidate`; exact-SHA review rounds; deterministic draft-PR publication. It is never prepared for local merge by this workflow.
+- `reviewed-pr`: non-terminating, versioned `crew_submit_candidate`; exact-SHA review rounds; deterministic draft-PR publication followed by one immutable append-only verdict comment per approved SHA. It is never prepared for local merge by this workflow.
 
 ## Intake and dispatch
 
@@ -59,7 +59,11 @@ For one reviewed-pr build:
 7. `blocked`/`inconclusive`, or `changes-requested` at `maxReviewRounds`, produces durable escalation rather than silently starting another round. Never stack several reviewers.
 8. After a collected `approved` verdict for the current HEAD, inspect `crew_diff`, then call `crew_publish_pr` with explicit `remote`, GitHub `owner/name`, `base`, owned `head=crew/<id>`, title, and body.
 
-`crew_publish_pr` is fail-closed and idempotent. It validates the GitHub remote/repository/base/head, exact current candidate and approval, clean worktree, settled/provably absent writer, credentials, forge repository, remote ref ownership, and draft PR identity. It pushes the approved SHA (never the base), uses a lease, creates or updates one draft PR, and durably stores URL, number, remote head/SHA, and timestamps. Retry reconciles a PR created before an interrupted response. It never marks a PR ready and never merges.
+`crew_publish_pr` is fail-closed and idempotent. It validates the GitHub remote/repository/base/head, exact current candidate and approval, clean worktree, settled/provably absent writer, credentials, forge repository, remote ref ownership, and same-repository non-fork draft PR identity. It pushes the approved SHA (never the base), uses a lease, creates or updates one draft PR, and durably stores URL, number, remote head/SHA, and timestamps. Retry reconciles a PR created before an interrupted response.
+
+After successful draft create/update it posts one bounded immutable audit comment for `taskId+full SHA`. The deterministic marker and exact expected body are searched on that exact PR before POST. One exact match is adopted; marker collision or divergent content is refused. A local durable `dispatched` intent is written immediately before the only allowed POST, so concurrent calls only relist. A lost response with an applied exact comment is adopted on retry; if absent, the intent becomes durably ambiguous and Crewdeck fails closed without a second POST. A later approved SHA intentionally appends another comment, while prior comments remain immutable history even if HEAD advances. Reviewer text is escaped, mention-neutralized, truncated, and capped before POST. The comment explicitly is not an official GitHub approval.
+
+Never edit/delete/roll back a verdict comment, never compensate an ambiguous dispatch, and never bypass the bounded model with a multi-host lease, heartbeat, global freeze, or durable-state edits. This contract does not promise general exactly-once delivery. `crew_publish_pr` never calls GitHub review approval, marks a PR ready, or merges.
 
 Do not use no-mistakes or add extra reviewers. Merge is outside reviewed-pr publication and remains governed by the existing explicit local merge authorization for direct tasks; never call GitHub merge commands.
 

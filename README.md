@@ -9,11 +9,12 @@ Crewdeck is a lightweight Pi/Herdr orchestrator for visible coding agents in iso
 - reviewed-pr builds submit versioned exact-HEAD candidates without terminating their agent
 - one distinct read-only reviewer per candidate, bound to `parentTaskId` and `reviewedHead`
 - durable review inbox, completion-queue wakeup, orchestrator follow-up, and lossless steering back to the original build
-- every review/CI claim becomes stale when build HEAD changes
+- current review/CI authority becomes stale when build HEAD changes; an already posted exact-SHA verdict comment remains immutable audit history
 - one writer on `crew/<id>`; safe adoption only after Crewdeck proves the previous agent absent
 - detached branchless worktrees for scouts/reviewers; branch worktrees for builds
 - deterministic/idempotent push and GitHub draft-PR create/update after exact-SHA approval
-- no automatic merge, no PR-ready transition, no stacked reviewers, and no no-mistakes integration
+- one bounded, immutable, append-only GitHub verdict comment per approved SHA, with durable dispatch intent and fail-closed ambiguity
+- no automatic merge, no PR-ready transition, no GitHub approval review, no stacked reviewers, and no no-mistakes integration
 - preserved scout, historical task, direct prepare/merge, abandonment, and orphan-report lifecycles
 
 The Herdr 0.8 API was verified rather than assumed: `worktree create` without `--branch` creates a random branch, while a Git `worktree add --detach` followed by Herdr `worktree open --path` reports `is_detached: true`. Crewdeck uses only that proven detached path and otherwise fails closed.
@@ -28,7 +29,7 @@ The Herdr 0.8 API was verified rather than assumed: `worktree create` without `-
 ~/.local/state/crewdeck/reports/<task>.candidates.json   reviewed-pr candidate journal
 ```
 
-State uses atomic writes under a lock. Candidate versions, collection acknowledgements, structured review findings, forwarding attempts, escalation, remote SHA, PR URL/number, and timestamps survive orchestrator restart. The completion watcher rescans the durable inbox at session start, so missed filesystem events still generate a Pi follow-up.
+State uses atomic writes under a lock. Candidate versions, collection acknowledgements, structured review findings, forwarding attempts, escalation, remote SHA, PR URL/number, exact-SHA verdict dispatch intents/comment identities, and timestamps survive orchestrator restart. The completion watcher rescans the durable inbox at session start, so missed filesystem events still generate a Pi follow-up.
 
 ## Configuration
 
@@ -196,13 +197,24 @@ Before side effects, publication refuses:
 - invalid or mismatched remote/repository/base/head
 - any request where head is base or is not the owned Crewdeck branch
 - a non-GitHub remote, missing remote base, unavailable `gh` credentials/repository
-- an unowned/diverged remote head, ambiguous PR, non-draft PR, or wrong PR base/head
+- an unowned/diverged remote head, ambiguous PR, cross-repository/fork head, non-draft PR, or wrong PR repository/base/head
 
 Crewdeck pushes the approved SHA explicitly to `refs/heads/crew/<id>` with `--force-with-lease`; it never pushes the base. It verifies remote SHA, rechecks local HEAD/cleanliness, and creates or updates one open draft PR with `gh`. State records `remote`, `repo`, `base`, `remoteHead`, `remoteSha`, `pushedAt`, `number`, `url`, `prCreatedAt`, `updatedAt`, and verification/attempt timestamps.
 
-Retry is deterministic: if push succeeded before interruption, the lease/remote SHA is reconciled; if PR creation succeeded but its response was lost, lookup by exact head/base adopts the unique matching draft. Repeating a completed publication with identical inputs is idempotent.
+After that PR create/update succeeds, Crewdeck publishes one immutable issue comment for the approved SHA. Its deterministic marker is `<!-- crewdeck-verdict:<task-id>:<full-sha> -->`. The bounded comment includes the `approved` verdict, full SHA, reviewer task id, candidate version, summary, checks, structured findings, open questions, and an explicit notice that it is **not an official GitHub approval**. Reviewer-controlled text is JSON-rendered inside escaped `<pre>` blocks, mention-neutralized, section-truncated, and capped at 48 KiB before POST.
 
-Publication never runs `gh pr ready`, `gh pr merge`, or a local merge.
+Verdict comments are strict append-only audit records:
+
+- Crewdeck never PATCHes or DELETEs a verdict comment and never compensates/rolls one back.
+- A later approved SHA intentionally appends a second comment; the prior SHA comment remains valid history even after PR HEAD advances.
+- Before the sole possible POST, Crewdeck paginates comments on the exact PR and searches the exact marker. One exact body is adopted/no-op; duplicate marker occurrences or divergent body refuse publication.
+- Under the local durable state lock, Crewdeck writes a SHA-bound `dispatched` intent immediately before POST. Concurrent callers seeing it may only relist/adopt, never POST.
+- If the POST response is lost, retry relists. An exact comment is adopted; absence changes the intent to durable `ambiguous` and fails closed forever for automatic reposting.
+- After a returned/adopted comment, only its GitHub identity is attached to the intent. If HEAD becomes stale after POST, the historical comment is retained and the returned `currentVerdictState` reports the current/stale relationship.
+
+This is deliberately bounded idempotence, not general exactly-once delivery. Crewdeck adds no multi-host lease, heartbeat, global freeze, distributed compensation, or automatic ambiguity recovery. An operator may resolve external ambiguity outside this automatic contract, but must not edit durable state or ask Crewdeck to replace an immutable comment.
+
+PR retry remains deterministic: if push succeeded before interruption, the lease/remote SHA is reconciled; if PR creation succeeded but its response was lost, lookup by exact head/base adopts the unique matching draft. Publication never runs `gh pr review --approve`, `gh pr ready`, `gh pr merge`, or a local merge.
 
 ## Pi extension API
 

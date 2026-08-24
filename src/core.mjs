@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -508,6 +508,133 @@ function validBranchName(value) {
     !/[~^:?*[\\\s]/.test(value) &&
     !value.split("/").some((part) => !part || part.endsWith(".lock"))
   );
+}
+
+const VERDICT_COMMENT_MAX_BYTES = 48 * 1024;
+const REVIEW_SEVERITIES = new Set(["blocking", "major", "minor", "nit"]);
+
+function truncateUtf8(value, maxBytes) {
+  const text = String(value);
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  const suffix = "\n… [truncated by Crewdeck]";
+  const available = maxBytes - Buffer.byteLength(suffix, "utf8");
+  let bytes = 0;
+  let truncated = "";
+  for (const character of text) {
+    const size = Buffer.byteLength(character, "utf8");
+    if (bytes + size > available) break;
+    truncated += character;
+    bytes += size;
+  }
+  return `${truncated}${suffix}`;
+}
+
+function safeReviewJson(value, maxBytes) {
+  const json = JSON.stringify(value, null, 2).replace(/[\u202a-\u202e\u2066-\u2069]/g, (character) =>
+    `\\u${character.codePointAt(0).toString(16).padStart(4, "0")}`,
+  );
+  const escaped = json
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("@", "&#64;&#8203;");
+  return truncateUtf8(escaped, maxBytes);
+}
+
+function validatedVerdictPayload(taskId, candidate, approval) {
+  if (
+    !TASK_ID_RE.test(taskId) ||
+    !approval ||
+    approval.verdict !== "approved" ||
+    approval.reviewedHead !== candidate.head ||
+    approval.candidateVersion !== candidate.version ||
+    !TASK_ID_RE.test(approval.reviewTaskId || "") ||
+    typeof approval.summary !== "string" ||
+    !approval.summary ||
+    !Array.isArray(approval.checks) ||
+    approval.checks.length > 100 ||
+    approval.checks.some((item) => typeof item !== "string") ||
+    !Array.isArray(approval.findings) ||
+    approval.findings.length > 100 ||
+    approval.findings.some((finding) =>
+      !finding ||
+      !REVIEW_SEVERITIES.has(finding.severity) ||
+      finding.severity === "blocking" ||
+      ["title", "detail", "location", "recommendation"].some(
+        (field) => typeof finding[field] !== "string",
+      )
+    ) ||
+    !Array.isArray(approval.openQuestions) ||
+    approval.openQuestions.length > 100 ||
+    approval.openQuestions.some((item) => typeof item !== "string")
+  ) {
+    throw new CrewdeckError("Approved reviewer data is invalid", "invalid_review_result");
+  }
+  return {
+    verdict: approval.verdict,
+    approvedSha: candidate.head,
+    reviewerTaskId: approval.reviewTaskId,
+    candidateVersion: candidate.version,
+    taskId,
+    summary: approval.summary,
+    checks: approval.checks,
+    findings: approval.findings,
+    openQuestions: approval.openQuestions,
+  };
+}
+
+function renderVerdictComment(taskId, candidate, approval) {
+  const payload = validatedVerdictPayload(taskId, candidate, approval);
+  const marker = `<!-- crewdeck-verdict:${taskId}:${candidate.head} -->`;
+  const body = [
+    marker,
+    "## Crewdeck immutable reviewed-PR verdict",
+    "",
+    "This append-only audit comment is bound to one exact commit. Crewdeck never edits or deletes it, even if the PR head later changes.",
+    "**This comment is not an official GitHub approval.**",
+    "",
+    "### Verdict identity",
+    "<pre>",
+    safeReviewJson({
+      verdict: payload.verdict,
+      approvedSha: payload.approvedSha,
+      reviewerTaskId: payload.reviewerTaskId,
+      candidateVersion: payload.candidateVersion,
+      taskId: payload.taskId,
+    }, 2 * 1024),
+    "</pre>",
+    "",
+    "### Summary",
+    "<pre>",
+    safeReviewJson(payload.summary, 7 * 1024),
+    "</pre>",
+    "",
+    "### Checks",
+    "<pre>",
+    safeReviewJson(payload.checks, 8 * 1024),
+    "</pre>",
+    "",
+    "### Findings",
+    "<pre>",
+    safeReviewJson(payload.findings, 20 * 1024),
+    "</pre>",
+    "",
+    "### Open questions",
+    "<pre>",
+    safeReviewJson(payload.openQuestions, 8 * 1024),
+    "</pre>",
+  ].join("\n");
+  if (
+    Buffer.byteLength(body, "utf8") > VERDICT_COMMENT_MAX_BYTES ||
+    body.split(marker).length !== 2
+  ) {
+    throw new CrewdeckError("Rendered verdict comment exceeds its safe bound", "verdict_comment_too_large");
+  }
+  return {
+    marker,
+    body,
+    contentSha256: createHash("sha256").update(body, "utf8").digest("hex"),
+  };
 }
 
 async function bindWorkerEnvironment(paneId, record) {
@@ -1792,6 +1919,181 @@ export async function reconcileOrphanReport(configPath, id, { reason } = {}) {
   return publicTaskRecord(record);
 }
 
+function verdictCommentIdentity(comment, repo, prNumber, expectedBody) {
+  if (
+    !comment ||
+    comment.body !== expectedBody ||
+    !Number.isInteger(comment.id) ||
+    comment.id < 1 ||
+    typeof comment.html_url !== "string"
+  ) {
+    throw new CrewdeckError("GitHub returned an invalid verdict comment identity", "invalid_comment_identity");
+  }
+  let commentUrl;
+  try {
+    commentUrl = new URL(comment.html_url);
+  } catch {
+    throw new CrewdeckError("GitHub returned an invalid verdict comment URL", "invalid_comment_identity");
+  }
+  if (
+    commentUrl.protocol !== "https:" ||
+    commentUrl.hostname.toLowerCase() !== "github.com" ||
+    commentUrl.pathname.toLowerCase() !== `/${repo}/pull/${prNumber}`.toLowerCase() ||
+    commentUrl.hash !== `#issuecomment-${comment.id}`
+  ) {
+    throw new CrewdeckError("Verdict comment identity does not belong to the exact PR", "invalid_comment_identity");
+  }
+  return { id: comment.id, url: comment.html_url };
+}
+
+async function findVerdictComment(repo, prNumber, marker, expectedBody) {
+  const comments = [];
+  for (let page = 1; page <= 100; page += 1) {
+    let listed;
+    try {
+      listed = await runJson("gh", [
+        "api", `repos/${repo}/issues/${prNumber}/comments?per_page=100&page=${page}`,
+      ], { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 });
+    } catch (error) {
+      throw new CrewdeckError("Cannot list immutable verdict comments", "forge_unavailable", {
+        error: error.message,
+      });
+    }
+    if (!Array.isArray(listed) || listed.length > 100) {
+      throw new CrewdeckError("GitHub comment page is invalid", "invalid_comment_lookup");
+    }
+    comments.push(...listed);
+    if (listed.length < 100) break;
+    if (page === 100) {
+      throw new CrewdeckError("GitHub comment lookup exceeds its 10,000-comment bound", "invalid_comment_lookup");
+    }
+  }
+  let markerCount = 0;
+  let markedComment;
+  for (const comment of comments) {
+    if (typeof comment?.body !== "string") continue;
+    let offset = 0;
+    while (true) {
+      const found = comment.body.indexOf(marker, offset);
+      if (found < 0) break;
+      markerCount += 1;
+      markedComment = comment;
+      offset = found + marker.length;
+    }
+  }
+  if (markerCount > 1) {
+    throw new CrewdeckError("The immutable verdict marker collides on this PR", "verdict_comment_collision", {
+      marker,
+      occurrences: markerCount,
+    });
+  }
+  if (markerCount === 0) return undefined;
+  if (markedComment.body !== expectedBody) {
+    throw new CrewdeckError("The immutable verdict marker has divergent content", "verdict_comment_divergent", {
+      marker,
+    });
+  }
+  return verdictCommentIdentity(markedComment, repo, prNumber, expectedBody);
+}
+
+function matchingVerdictIntent(publication, headSha) {
+  const entries = publication?.verdictComments || [];
+  if (!Array.isArray(entries)) {
+    throw new CrewdeckError("Durable verdict intent journal is invalid", "verdict_comment_divergent");
+  }
+  const matches = entries.filter((item) => item?.headSha === headSha);
+  if (matches.length > 1) {
+    throw new CrewdeckError("Durable verdict comment intent collides for this SHA", "verdict_comment_collision");
+  }
+  return matches[0];
+}
+
+function validateVerdictIntent(intent, { marker, contentSha256, prNumber, approval }) {
+  if (
+    !["dispatched", "ambiguous", "published"].includes(intent.status) ||
+    intent.marker !== marker ||
+    intent.contentSha256 !== contentSha256 ||
+    intent.prNumber !== prNumber ||
+    intent.reviewerTaskId !== approval.reviewTaskId ||
+    intent.candidateVersion !== approval.candidateVersion
+  ) {
+    throw new CrewdeckError("Durable verdict intent has divergent immutable content", "verdict_comment_divergent");
+  }
+}
+
+async function currentApprovedVerdict(id, fallbackRecord, expectedHead, expectedVersion, expectedReviewTaskId) {
+  const state = await loadState();
+  const record = state.tasks[id];
+  if (!record || record.cleanedAt || ["cleaned", "integrated", "abandoned"].includes(record.status)) {
+    throw new CrewdeckError("Build became terminal before verdict publication", "stale_candidate");
+  }
+  const [snapshot, journal] = await Promise.all([
+    gitSnapshot(record),
+    readCandidateJournal(record),
+  ]);
+  const candidate = journal.available ? journal.journal.candidates.at(-1) : undefined;
+  const approval = (record.reviewInbox || [])
+    .filter((item) =>
+      item.reviewTaskId === expectedReviewTaskId &&
+      item.reviewedHead === expectedHead &&
+      item.verdict === "approved" &&
+      item.validAtCollection
+    )
+    .at(-1);
+  if (
+    !snapshot.available ||
+    !snapshot.clean ||
+    snapshot.head !== expectedHead ||
+    candidate?.head !== expectedHead ||
+    candidate?.version !== expectedVersion ||
+    (record.candidateCollectedVersion || 0) < expectedVersion ||
+    !approval ||
+    (record.reviewEscalation && record.reviewEscalation.reviewedHead === expectedHead)
+  ) {
+    throw new CrewdeckError("Approved candidate became stale before verdict comment POST", "stale_candidate", {
+      approvedHead: expectedHead,
+      currentHead: snapshot.head,
+      currentCandidateHead: candidate?.head,
+    });
+  }
+  if (
+    record.repo !== fallbackRecord.repo ||
+    record.worktree !== fallbackRecord.worktree ||
+    record.branch !== fallbackRecord.branch
+  ) {
+    throw new CrewdeckError("Build resources changed before verdict publication", "state_changed");
+  }
+  validatedVerdictPayload(id, candidate, approval);
+  return { record, snapshot, candidate, approval };
+}
+
+async function observePublishedVerdict(id, approvedHead) {
+  try {
+    const state = await loadState();
+    const record = state.tasks[id];
+    if (!record) return { status: "unknown", approvedHead, error: "task missing" };
+    const [snapshot, journal] = await Promise.all([gitSnapshot(record), readCandidateJournal(record)]);
+    const candidate = journal.available ? journal.journal.candidates.at(-1) : undefined;
+    const stillApproved = (record.reviewInbox || []).some((item) =>
+      item.reviewedHead === approvedHead && item.verdict === "approved" && item.validAtCollection
+    );
+    const current =
+      snapshot.available &&
+      snapshot.clean &&
+      snapshot.head === approvedHead &&
+      candidate?.head === approvedHead &&
+      stillApproved;
+    return {
+      status: current ? "current" : "stale",
+      approvedHead,
+      currentHead: snapshot.head,
+      currentCandidateHead: candidate?.head,
+    };
+  } catch (error) {
+    return { status: "unknown", approvedHead, error: error.message };
+  }
+}
+
 export async function publishPullRequest(
   configPath,
   id,
@@ -1897,7 +2199,12 @@ export async function publishPullRequest(
     throw new CrewdeckError(`Remote base ${base} does not exist`, "remote_base_missing");
   }
 
-  const validatePr = (pr) => {
+  const prFields = [
+    "number", "url", "isDraft", "headRefName", "baseRefName", "headRefOid",
+    "isCrossRepository", "headRepository", "headRepositoryOwner", "state", "title", "body",
+  ].join(",");
+  const [repoOwner] = repo.split("/");
+  const validatePr = (pr, expectedHeadSha = undefined) => {
     const urlMatch = typeof pr?.url === "string"
       ? pr.url.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9][0-9]*)$/i)
       : undefined;
@@ -1912,7 +2219,13 @@ export async function publishPullRequest(
       pr.isDraft !== true ||
       pr.headRefName !== head ||
       pr.baseRefName !== base ||
-      (pr.state !== undefined && pr.state !== "OPEN")
+      pr.isCrossRepository !== false ||
+      typeof pr.headRepository?.nameWithOwner !== "string" ||
+      pr.headRepository.nameWithOwner.toLowerCase() !== repo.toLowerCase() ||
+      typeof pr.headRepositoryOwner?.login !== "string" ||
+      pr.headRepositoryOwner.login.toLowerCase() !== repoOwner.toLowerCase() ||
+      (pr.state !== undefined && pr.state !== "OPEN") ||
+      (expectedHeadSha !== undefined && pr.headRefOid !== expectedHeadSha)
     ) {
       throw new CrewdeckError("Existing GitHub PR is not the expected open draft", "invalid_existing_pr", pr);
     }
@@ -1934,7 +2247,7 @@ export async function publishPullRequest(
     try {
       existingPr = validatePr(await runJson("gh", [
         "pr", "view", String(publication.number), "--repo", repo,
-        "--json", "number,url,isDraft,headRefName,baseRefName,state,title,body",
+        "--json", prFields,
       ], { timeout: 20_000 }));
     } catch (error) {
       if (error instanceof CrewdeckError && error.code === "invalid_existing_pr") throw error;
@@ -1945,7 +2258,7 @@ export async function publishPullRequest(
     try {
       listed = await runJson("gh", [
         "pr", "list", "--repo", repo, "--head", head, "--base", base, "--state", "open",
-        "--json", "number,url,isDraft,headRefName,baseRefName,state,title,body", "--limit", "2",
+        "--json", prFields, "--limit", "2",
       ], { timeout: 20_000 });
     } catch (error) {
       throw new CrewdeckError("Cannot query GitHub draft PRs", "forge_unavailable", { error: error.message });
@@ -2021,7 +2334,7 @@ export async function publishPullRequest(
     }
     const listed = await runJson("gh", [
       "pr", "list", "--repo", repo, "--head", head, "--base", base, "--state", "open",
-      "--json", "number,url,isDraft,headRefName,baseRefName,state,title,body", "--limit", "2",
+      "--json", prFields, "--limit", "2",
     ], { timeout: 20_000 });
     if (!Array.isArray(listed) || listed.length !== 1) {
       throw new CrewdeckError("Created draft PR cannot be reconciled uniquely", "ambiguous_pull_request", listed);
@@ -2039,12 +2352,11 @@ export async function publishPullRequest(
     ], { timeout: 30_000 });
     pr = validatePr(await runJson("gh", [
       "pr", "view", String(pr.number), "--repo", repo,
-      "--json", "number,url,isDraft,headRefName,baseRefName,state,title,body",
+      "--json", prFields,
     ], { timeout: 20_000 }));
   }
 
   const updatedAt = new Date().toISOString();
-  let finalRecord;
   await withStateLock(async () => {
     const next = await loadState();
     const stored = next.tasks[id];
@@ -2060,21 +2372,236 @@ export async function publishPullRequest(
       updatedAt,
       lastVerifiedAt: updatedAt,
     };
-    finalRecord = { ...stored };
     await saveState(next);
   });
-  return {
-    published: true,
-    idempotent:
-      publication?.headSha === snapshot.head &&
-      publication?.title === title.trim() &&
-      publication?.body === body.trim() &&
-      existingPr?.number === pr.number &&
-      existingPr?.title === title.trim() &&
-      existingPr?.body === body.trim(),
-    task: publicTaskRecord(finalRecord),
-    publication: finalRecord.publication,
+
+  const prWasIdempotent =
+    publication?.headSha === snapshot.head &&
+    publication?.title === title.trim() &&
+    publication?.body === body.trim() &&
+    existingPr?.number === pr.number &&
+    existingPr?.title === title.trim() &&
+    existingPr?.body === body.trim();
+  const readExactCommentPr = async () => {
+    try {
+      return validatePr(await runJson("gh", [
+        "pr", "view", String(pr.number), "--repo", repo, "--json", prFields,
+      ], { timeout: 20_000 }), snapshot.head);
+    } catch (error) {
+      if (error instanceof CrewdeckError && error.code === "invalid_existing_pr") throw error;
+      throw new CrewdeckError("Cannot validate the exact draft PR before verdict POST", "forge_unavailable", {
+        error: error.message,
+      });
+    }
   };
+
+  // The exact PR and approved local state are checked after PR create/edit and
+  // immediately around marker lookup. No comment POST is allowed before these checks.
+  await readExactCommentPr();
+  let current = await currentApprovedVerdict(
+    id,
+    record,
+    snapshot.head,
+    candidate.version,
+    approval.reviewTaskId,
+  );
+  let rendered = renderVerdictComment(id, current.candidate, current.approval);
+  let foundComment = await findVerdictComment(repo, pr.number, rendered.marker, rendered.body);
+
+  const intentMetadata = {
+    headSha: snapshot.head,
+    marker: rendered.marker,
+    contentSha256: rendered.contentSha256,
+    prNumber: pr.number,
+    reviewerTaskId: current.approval.reviewTaskId,
+    candidateVersion: current.candidate.version,
+  };
+  const persistCommentIdentity = async (identity, { adopted = false } = {}) => {
+    let persisted;
+    await withStateLock(async () => {
+      const next = await loadState();
+      const stored = next.tasks[id];
+      if (
+        !stored?.publication ||
+        stored.publication.number !== pr.number ||
+        stored.publication.repo?.toLowerCase() !== repo.toLowerCase() ||
+        stored.publication.base !== base ||
+        stored.publication.remoteHead !== head
+      ) {
+        throw new CrewdeckError("Publication target changed before verdict identity persistence", "state_changed");
+      }
+      stored.publication.verdictComments ||= [];
+      let intent = matchingVerdictIntent(stored.publication, snapshot.head);
+      if (!intent) {
+        if (!adopted) {
+          throw new CrewdeckError("Durable verdict dispatch intent is missing", "state_changed");
+        }
+        intent = { ...intentMetadata, status: "published" };
+        stored.publication.verdictComments.push(intent);
+      } else {
+        validateVerdictIntent(intent, {
+          ...rendered,
+          prNumber: pr.number,
+          approval: current.approval,
+        });
+      }
+      if (intent.comment && (intent.comment.id !== identity.id || intent.comment.url !== identity.url)) {
+        throw new CrewdeckError("Durable verdict comment identity changed", "verdict_comment_collision");
+      }
+      intent.status = "published";
+      intent.comment = identity;
+      persisted = { record: { ...stored }, intent: { ...intent } };
+      await saveState(next);
+    });
+    return persisted;
+  };
+  const publicationResult = async (persisted, { adopted, idempotent }) => ({
+    published: true,
+    idempotent: prWasIdempotent && idempotent,
+    task: publicTaskRecord(persisted.record),
+    publication: persisted.record.publication,
+    verdictComment: {
+      ...persisted.intent.comment,
+      marker: persisted.intent.marker,
+      headSha: persisted.intent.headSha,
+      reviewerTaskId: persisted.intent.reviewerTaskId,
+      candidateVersion: persisted.intent.candidateVersion,
+      immutable: true,
+      adopted,
+    },
+    currentVerdictState: await observePublishedVerdict(id, snapshot.head),
+  });
+
+  if (foundComment) {
+    const persisted = await persistCommentIdentity(foundComment, { adopted: true });
+    return publicationResult(persisted, { adopted: true, idempotent: true });
+  }
+
+  // Recheck both authorities after lookup. This catches a stale HEAD/PR before
+  // the first and only possible comment POST for this task+SHA marker.
+  current = await currentApprovedVerdict(
+    id,
+    record,
+    snapshot.head,
+    candidate.version,
+    approval.reviewTaskId,
+  );
+  const rerendered = renderVerdictComment(id, current.candidate, current.approval);
+  if (rerendered.body !== rendered.body || rerendered.marker !== rendered.marker) {
+    throw new CrewdeckError("Approved verdict data changed before dispatch", "state_changed");
+  }
+  rendered = rerendered;
+  await readExactCommentPr();
+  current = await currentApprovedVerdict(
+    id,
+    record,
+    snapshot.head,
+    candidate.version,
+    approval.reviewTaskId,
+  );
+  if (renderVerdictComment(id, current.candidate, current.approval).body !== rendered.body) {
+    throw new CrewdeckError("Approved verdict data changed before dispatch", "state_changed");
+  }
+
+  let shouldPost = false;
+  let existingIntentStatus;
+  await withStateLock(async () => {
+    const next = await loadState();
+    const stored = next.tasks[id];
+    if (
+      !stored?.publication ||
+      stored.publication.number !== pr.number ||
+      stored.publication.headSha !== snapshot.head ||
+      stored.publication.remoteSha !== snapshot.head
+    ) {
+      throw new CrewdeckError("Publication changed before verdict dispatch", "state_changed");
+    }
+    const lockedApproval = (stored.reviewInbox || []).find((item) =>
+      item.reviewTaskId === approval.reviewTaskId &&
+      item.reviewedHead === snapshot.head &&
+      item.verdict === "approved" &&
+      item.validAtCollection
+    );
+    if (
+      stored.cleanedAt ||
+      ["cleaned", "integrated", "abandoned"].includes(stored.status) ||
+      (stored.candidateCollectedVersion || 0) < candidate.version ||
+      !lockedApproval ||
+      (stored.reviewEscalation && stored.reviewEscalation.reviewedHead === snapshot.head) ||
+      renderVerdictComment(id, current.candidate, lockedApproval).body !== rendered.body
+    ) {
+      throw new CrewdeckError("Approved candidate state changed before verdict dispatch", "stale_candidate");
+    }
+    stored.publication.verdictComments ||= [];
+    const intent = matchingVerdictIntent(stored.publication, snapshot.head);
+    if (intent) {
+      validateVerdictIntent(intent, {
+        ...rendered,
+        prNumber: pr.number,
+        approval: current.approval,
+      });
+      existingIntentStatus = intent.status;
+      return;
+    }
+    stored.publication.verdictComments.push({
+      ...intentMetadata,
+      status: "dispatched",
+      dispatchedAt: new Date().toISOString(),
+    });
+    shouldPost = true;
+    await saveState(next);
+  });
+
+  if (!shouldPost) {
+    // A concurrent or interrupted caller owns the sole dispatch. Reconcile only;
+    // absence is durably ambiguous and can never authorize an automatic repost.
+    foundComment = await findVerdictComment(repo, pr.number, rendered.marker, rendered.body);
+    if (foundComment) {
+      const persisted = await persistCommentIdentity(foundComment, { adopted: true });
+      return publicationResult(persisted, { adopted: true, idempotent: true });
+    }
+    await withStateLock(async () => {
+      const next = await loadState();
+      const stored = next.tasks[id];
+      const intent = matchingVerdictIntent(stored?.publication, snapshot.head);
+      if (intent && intent.status !== "published") {
+        validateVerdictIntent(intent, {
+          ...rendered,
+          prNumber: pr.number,
+          approval: current.approval,
+        });
+        intent.status = "ambiguous";
+        intent.ambiguousAt ||= new Date().toISOString();
+        await saveState(next);
+      }
+    });
+    throw new CrewdeckError(
+      existingIntentStatus === "published"
+        ? "Published immutable verdict comment is no longer present; Crewdeck will not replace it"
+        : "Verdict dispatch outcome is ambiguous; Crewdeck will not issue a second POST",
+      existingIntentStatus === "published" ? "verdict_comment_missing" : "verdict_comment_ambiguous",
+      { marker: rendered.marker, prNumber: pr.number },
+    );
+  }
+
+  let postedIdentity;
+  try {
+    const posted = await runJson("gh", [
+      "api", "--method", "POST", `repos/${repo}/issues/${pr.number}/comments`,
+      "--raw-field", `body=${rendered.body}`,
+    ], { timeout: 60_000, maxBuffer: 2 * 1024 * 1024 });
+    postedIdentity = verdictCommentIdentity(posted, repo, pr.number, rendered.body);
+  } catch (error) {
+    // The dispatched intent is intentionally left intact. A later invocation
+    // may only relist/adopt; it can never compensate or send another POST.
+    throw new CrewdeckError(
+      "Verdict comment POST may have been applied; retry will reconcile without reposting",
+      "verdict_comment_post_ambiguous",
+      { error: error.message, marker: rendered.marker, prNumber: pr.number },
+    );
+  }
+  const persisted = await persistCommentIdentity(postedIdentity);
+  return publicationResult(persisted, { adopted: false, idempotent: false });
 }
 
 export async function mergeTask(configPath, id) {
