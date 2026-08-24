@@ -19,6 +19,7 @@ import {
   prepareIntegration,
   promptTask,
   publishPullRequest,
+  reconcileMergedPullRequest,
   reconcileOrphanReport,
   reportDirectory,
   resumeBuild,
@@ -229,6 +230,23 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     }),
     async execute(_id, params) {
       return text(await publishPullRequest(CONFIG, params.id, params));
+    },
+  });
+
+  pi.registerTool({
+    name: "crew_reconcile_merged_pr",
+    label: "Reconcile Externally Merged PR",
+    description:
+      "Finalize a reviewed-pr build only after proving its exact durable GitHub PR is MERGED and its latest collected approved/publication SHA is contained in the merge commit or current remote base. Refuses ambiguous publication, stale/newer candidates, uncertain or active agents, dirty worktrees, and unsafe cleanup. Never pushes, merges, or changes a base; preserves all audit history and always asks for independent confirmation.",
+    parameters: Type.Object({ id: Type.String({ description: "Reviewed-pr build task id" }) }),
+    async execute(_id, params, _signal, _update, ctx) {
+      if (!ctx.hasUI) throw new Error("crew_reconcile_merged_pr requires interactive confirmation");
+      const confirmed = await ctx.ui.confirm(
+        "Reconcile externally merged pull request?",
+        `Verify the exact GitHub merge for task '${params.id}', then close only its isolated worker workspace and delete its proven-contained crew branch? Crewdeck will not push, merge, or change the local/remote base.`,
+      );
+      if (!confirmed) return text({ reconciled: false, reason: "user declined" });
+      return text(await reconcileMergedPullRequest(CONFIG, params.id));
     },
   });
 

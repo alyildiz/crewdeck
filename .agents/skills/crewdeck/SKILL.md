@@ -1,6 +1,6 @@
 ---
 name: crewdeck
-description: Coordinate multiple coding agents through Crewdeck and Herdr. Use whenever the user asks to delegate project work, run workers or scouts, parallelize coding tasks, review exact build candidates, publish a reviewed draft PR, inspect worker progress, collect results, integrate or abandon worker branches, or clean completed worktrees.
+description: Coordinate multiple coding agents through Crewdeck and Herdr. Use whenever the user asks to delegate project work, run workers or scouts, parallelize coding tasks, review exact build candidates, publish or reconcile an externally merged reviewed PR, inspect worker progress, collect results, integrate or abandon worker branches, or clean completed worktrees.
 compatibility: Requires Pi inside Herdr 0.8+, Git, and the Crewdeck Pi extension.
 ---
 
@@ -58,6 +58,7 @@ For one reviewed-pr build:
 6. The same build agent remains sole writer and submits the next candidate after corrections. If its agent is provably absent, `crew_resume_build` may adopt the intact owned branch/workspace; it refuses an existing/uncertain writer.
 7. `blocked`/`inconclusive`, or `changes-requested` at `maxReviewRounds`, produces durable escalation rather than silently starting another round. Never stack several reviewers.
 8. After a collected `approved` verdict for the current HEAD, inspect `crew_diff`, then call `crew_publish_pr` with explicit `remote`, GitHub `owner/name`, `base`, owned `head=crew/<id>`, title, and body.
+9. Publication is not completion. If that exact PR is later merged externally on GitHub, call `crew_reconcile_merged_pr` only with the user's explicit intent and accept its independent confirmation. Never substitute `crew_merge`, `crew_cleanup`, or `crew_abandon`.
 
 `crew_publish_pr` is fail-closed and idempotent. It validates the GitHub remote/repository/base/head, exact current candidate and approval, clean worktree, settled/provably absent writer, credentials, forge repository, remote ref ownership, and same-repository non-fork draft PR identity. It pushes the approved SHA (never the base), uses a lease, creates or updates one draft PR, and durably stores URL, number, remote head/SHA, and timestamps. Retry reconciles a PR created before an interrupted response.
 
@@ -66,6 +67,8 @@ After successful draft create/update it posts one bounded immutable audit commen
 Never edit/delete/roll back a verdict comment, never compensate an ambiguous dispatch, and never bypass the bounded model with a multi-host lease, heartbeat, global freeze, or durable-state edits. This contract does not promise general exactly-once delivery. `crew_publish_pr` never calls GitHub review approval, marks a PR ready, or merges.
 
 Do not use no-mistakes or add extra reviewers. Merge is outside reviewed-pr publication and remains governed by the existing explicit local merge authorization for direct tasks; never call GitHub merge commands.
+
+`crew_reconcile_merged_pr` is the only reviewed-pr terminalization path for an externally merged publication. It requires lifecycle `change`, `workflow=reviewed-pr`, exact durable publication/approval/candidate identity, an exact same-repository GitHub PR in `MERGED`, approved-SHA ancestry in its merge commit or current remote base, a settled/provably absent agent, clean exact worktree, no newer candidate, and no publication ambiguity. It never pushes, merges, updates either base, or claims local integration. On success it closes only isolated resources, deletes only the exact contained crew branch, preserves every candidate/review/report/publication record, and writes terminal `pr-merged` plus `merged-reconciled` evidence. On proof or cleanup failure it remains nonterminal and preserves dirty/uncontained work. The operation is separately confirmed and idempotent after success; `/crew` hides `pr-merged`, while `/crew all` retains it.
 
 ## Direct build integration
 
@@ -84,6 +87,6 @@ Use `crew_abandon` for a clean settled obsolete unintegrated change. It has inde
 
 Use `crew_steer` for ordinary missing requirements or conflict instructions. Use `crew_forward_review` instead for collected review findings.
 
-Use `crew_status` after restart; state, candidate journals, review inboxes, delivery acknowledgements, escalation, and publication metadata are durable. Missing agents are never deletion authority.
+Use `crew_status` after restart; state, candidate journals, review inboxes, delivery acknowledgements, escalation, publication metadata, and merged-PR reconciliation attempts are durable. A `cleanup-failed` merged-PR attempt must be retried through the same confirmed tool, never bypassed with raw cleanup. Missing agents alone are never deletion authority.
 
 For a report whose Herdr workspace and Git worktree were already removed manually, `crew_reconcile_orphan_report` requires a concrete reason and independent confirmation, proves resources absent, preserves reports/history, and refuses uncertainty, dirty data, or unintegrated commits. Never edit durable state directly or bypass Crewdeck with raw Herdr/Git/GitHub commands.

@@ -14,6 +14,7 @@ import {
   prepareIntegration,
   promptTask,
   publishPullRequest,
+  reconcileMergedPullRequest,
   reconcileOrphanReport,
   resumeBuild,
   spawnBatch,
@@ -44,6 +45,7 @@ Usage:
   crewdeck prepare <id>
   crewdeck merge <id> --confirm
   crewdeck abandon <id> --confirm [--reason <text>]
+  crewdeck reconcile-merged-pr <reviewed-pr-build-id> --confirm
   crewdeck reconcile-orphan <report-id> --confirm --reason <text>
   crewdeck cleanup <id> --confirm
 
@@ -162,6 +164,12 @@ try {
     case "abandon":
       if (!args[0] || !args.includes("--confirm")) throw new Error("abandon requires <id> --confirm");
       result = await abandonTask(configPath, args[0], { reason: option("--reason") });
+      break;
+    case "reconcile-merged-pr":
+      if (!args[0] || !args.includes("--confirm")) {
+        throw new Error("reconcile-merged-pr requires <reviewed-pr-build-id> --confirm");
+      }
+      result = await reconcileMergedPullRequest(configPath, args[0]);
       break;
     case "reconcile-orphan":
       if (!args[0] || !args.includes("--confirm") || !option("--reason")) {

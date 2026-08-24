@@ -2,6 +2,7 @@ export const TERMINAL_CREW_STATUSES = new Set([
   "report-collected",
   "orphan-reconciled",
   "integrated",
+  "pr-merged",
   "abandoned",
   "cleaned",
 ]);

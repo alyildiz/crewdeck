@@ -14,6 +14,7 @@ Crewdeck is a lightweight Pi/Herdr orchestrator for visible coding agents in iso
 - detached branchless worktrees for scouts/reviewers; branch worktrees for builds
 - deterministic/idempotent push and GitHub draft-PR create/update after exact-SHA approval
 - one bounded, immutable, append-only GitHub verdict comment per approved SHA, with durable dispatch intent and fail-closed ambiguity
+- explicit, confirmed reconciliation when that exact published PR was merged externally, producing terminal `pr-merged` history without local integration
 - no automatic merge, no PR-ready transition, no GitHub approval review, no stacked reviewers, and no no-mistakes integration
 - preserved scout, historical task, direct prepare/merge, abandonment, and orphan-report lifecycles
 
@@ -29,7 +30,7 @@ The Herdr 0.8 API was verified rather than assumed: `worktree create` without `-
 ~/.local/state/crewdeck/reports/<task>.candidates.json   reviewed-pr candidate journal
 ```
 
-State uses atomic writes under a lock. Candidate versions, collection acknowledgements, structured review findings, forwarding attempts, escalation, remote SHA, PR URL/number, exact-SHA verdict dispatch intents/comment identities, and timestamps survive orchestrator restart. The completion watcher rescans the durable inbox at session start, so missed filesystem events still generate a Pi follow-up.
+State uses atomic writes under a lock. Candidate versions, collection acknowledgements, structured review findings, forwarding attempts, escalation, remote SHA, PR URL/number, exact-SHA verdict dispatch intents/comment identities, external merge evidence/reconciliation attempts, and timestamps survive orchestrator restart. The completion watcher rescans the durable inbox at session start, so missed filesystem events still generate a Pi follow-up.
 
 ## Configuration
 
@@ -92,7 +93,7 @@ A review contract must be a shell-free, read-only report. Crewdeck requires exac
 
 ## Setup
 
-Requirements: Node.js, Git, Pi, Herdr 0.8+, and `gh` for draft-PR publication.
+Requirements: Node.js, Git, Pi, Herdr 0.8+, and `gh` for draft-PR publication/reconciliation.
 
 ```bash
 npm install
@@ -143,6 +144,7 @@ It atomically appends candidate `vN`. Repeating an identical HEAD/payload is ide
 ```text
 running → candidate v1 → exact-SHA review
                      approved ───────────────→ draft PR publication
+                                                  externally merged → confirmed reconciliation → pr-merged
                      changes-requested ──────→ durable inbox → steering → candidate v2
                      blocked/inconclusive ───→ escalation
                      final round not approved → escalation
@@ -216,6 +218,23 @@ This is deliberately bounded idempotence, not general exactly-once delivery. Cre
 
 PR retry remains deterministic: if push succeeded before interruption, the lease/remote SHA is reconciled; if PR creation succeeded but its response was lost, lookup by exact head/base adopts the unique matching draft. Publication never runs `gh pr review --approve`, `gh pr ready`, `gh pr merge`, or a local merge.
 
+## Externally merged PR reconciliation
+
+If a published reviewed PR is merged outside Crewdeck, the build deliberately remains `running` until an operator invokes the separately confirmed `crew_reconcile_merged_pr` (CLI: `reconcile-merged-pr ... --confirm`). Reconciliation is read-only toward GitHub and both base branches: it never pushes, merges, marks ready, updates a base ref, or claims local integration.
+
+Before cleanup it fails closed unless all of these agree:
+
+- the task is a `change` with `workflow=reviewed-pr`, status `running`, expected `crew/<id>` branch/worktree/repository paths, and no active adoption or reviewer;
+- one complete durable publication has an exact GitHub remote/repository/base/head/PR URL and number, no dispatched/ambiguous/duplicate verdict intent, and its SHA equals the latest collected candidate;
+- the exact collected approval, reviewer task/report, publication SHA, remote SHA, verdict comment identity, and candidate version match;
+- `gh pr view` reports that exact same-repository PR as `MERGED` with the exact number, URL, base, head, head OID, merge commit, and merge timestamp;
+- the approved SHA is a Git ancestor of the merge commit or the currently advertised remote base SHA (objects are fetched without updating refs or `FETCH_HEAD`);
+- the worker is specifically absent or settled (`idle`/`done`), never working, blocked, unknown, or merely unreachable; and the worktree is clean at the exact approved SHA with no newer branch/candidate.
+
+Crewdeck then reserves the attempt durably, rechecks state and remote base, closes the isolated agent/workspace, verifies worktree removal, and deletes `refs/heads/crew/<id>` only with an exact-old-SHA update after containment proof. Any proof or cleanup failure leaves the task nonterminal as `running` with `cleanup-failed` recovery evidence; dirty data, changed branches, and uncontained commits are preserved. A confirmed retry can finish a partially completed cleanup. Only after every cleanup check succeeds does state atomically become `pr-merged` with nested `merged-reconciled` evidence: PR URL/number/base/head, GitHub merge timestamp/commit, approved candidate SHA/version/reviewer, remote-base containment proof, cleanup timestamps, and reconciliation time. Candidate journals, reviews, reports, and publication history are never deleted. Repeating the operation after success is idempotent.
+
+`pr-merged` is hidden from `/crew` and retained in `/crew all` and `crew_status` history. It is deliberately distinct from `integrated`, `abandoned`, and generic `cleaned`.
+
 ## Pi extension API
 
 The project extension exposes:
@@ -225,6 +244,7 @@ The project extension exposes:
 - `crew_status`, `crew_collect_results`, `crew_diff`
 - `crew_steer`, `crew_forward_review`, `crew_resume_build`
 - `crew_publish_pr`
+- separately confirmed `crew_reconcile_merged_pr`
 - existing `crew_prepare_integration`, confirmed `crew_merge`, confirmed `crew_abandon`, confirmed `crew_reconcile_orphan_report`, and confirmed `crew_cleanup`
 
 When durable events arrive, the extension uses `pi.sendUserMessage(..., { deliverAs: "followUp" })`. The orchestrator must call status and collection; no background LLM polling occurs.
@@ -249,6 +269,8 @@ bin/crewdeck forward-review reviewed-fix-r1
 bin/crewdeck publish reviewed-fix \
   --remote origin --repo owner/repo --base main --head crew/reviewed-fix \
   --title "Reviewed fix" --body "Draft PR body"
+# only after that exact PR was merged externally on GitHub:
+bin/crewdeck reconcile-merged-pr reviewed-fix --confirm
 
 # Recovery/control
 bin/crewdeck resume reviewed-fix
