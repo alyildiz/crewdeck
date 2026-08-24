@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +18,19 @@ function runCli(item, ...args) {
   return spawnSync(process.execPath, [cli, ...args], { env: item.env, encoding: "utf8" });
 }
 
+function runCliAsync(item, ...args) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [cli, ...args], { env: item.env });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("close", (status) => resolve({ status, stdout, stderr }));
+  });
+}
+
 function pendingInbox(item) {
   const source = `import { getPendingResultIds } from ${JSON.stringify(path.join(projectRoot, "src/core.mjs"))}; console.log(JSON.stringify(await getPendingResultIds(process.env.CREWDECK_CONFIG)));`;
   const result = spawnSync(process.execPath, ["--input-type=module", "-e", source], {
@@ -28,7 +41,15 @@ function pendingInbox(item) {
   return JSON.parse(result.stdout);
 }
 
-async function fixture({ verdict = "approved", failCreateOnce = false, includeReview = true } = {}) {
+async function fixture({
+  verdict = "approved",
+  failCreateOnce = false,
+  includeReview = true,
+  commentFailure = "",
+  staleBeforeComment = false,
+  staleAfterComment = false,
+  commentPostDelayMs = 0,
+} = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "crewdeck-reviewed-pr-"));
   const repo = path.join(root, "repo");
   const worktree = path.join(root, "worktrees", "demo", "build-one");
@@ -155,21 +176,55 @@ esac
   const gh = path.join(bin, "gh");
   await writeFile(gh, `#!/usr/bin/env node
 const fs=require("fs");
+const cp=require("child_process");
 const args=process.argv.slice(2); const file=process.env.CREW_GH_STATE; const log=process.env.CREW_GH_LOG;
-fs.appendFileSync(log,args.join(" ")+"\\n");
+const logged=args.map((arg)=>arg.startsWith("body=")?"body=<redacted>":arg);
+fs.appendFileSync(log,logged.join(" ")+"\\n");
 let state={}; try{state=JSON.parse(fs.readFileSync(file,"utf8"))}catch{}
 const save=()=>fs.writeFileSync(file,JSON.stringify(state));
+const value=(name)=>args[args.indexOf(name)+1];
+const headOid=()=>cp.execFileSync(process.env.CREW_REAL_GIT,["--git-dir",process.env.CREW_FAKE_REMOTE,"rev-parse","refs/heads/crew/build-one"],{encoding:"utf8"}).trim();
+const currentPr=()=>state.pr?{...state.pr,headRefOid:headOid()}:undefined;
 if(args[0]==="auth"&&args[1]==="status") process.exit(0);
 if(args[0]==="repo"&&args[1]==="view"){console.log(JSON.stringify({nameWithOwner:"acme/demo"}));process.exit(0)}
-if(args[0]==="pr"&&args[1]==="list"){console.log(JSON.stringify(state.pr?[state.pr]:[]));process.exit(0)}
-if(args[0]==="pr"&&args[1]==="view"){if(!state.pr)process.exit(1);console.log(JSON.stringify(state.pr));process.exit(0)}
+if(args[0]==="pr"&&args[1]==="list"){const pr=currentPr();console.log(JSON.stringify(pr?[pr]:[]));process.exit(0)}
+if(args[0]==="pr"&&args[1]==="view"){const pr=currentPr();if(!pr)process.exit(1);console.log(JSON.stringify(pr));process.exit(0)}
 if(args[0]==="pr"&&args[1]==="create"){
-  const value=(name)=>args[args.indexOf(name)+1];
   state.pr={number:17,url:"https://github.com/acme/demo/pull/17",isDraft:true,headRefName:"crew/build-one",baseRefName:"main",state:"OPEN",title:value("--title"),body:value("--body")}; save();
   if(process.env.CREW_GH_FAIL_ONCE==="1"&&!state.failedOnce){state.failedOnce=true;save();console.error("simulated response loss");process.exit(1)}
   console.log(state.pr.url);process.exit(0)
 }
-if(args[0]==="pr"&&args[1]==="edit"){const value=(name)=>args[args.indexOf(name)+1];state.pr.title=value("--title");state.pr.body=value("--body");state.edits=(state.edits||0)+1;save();process.exit(0)}
+if(args[0]==="pr"&&args[1]==="edit"){state.pr.title=value("--title");state.pr.body=value("--body");state.edits=(state.edits||0)+1;save();process.exit(0)}
+if(args[0]==="api"){
+  const endpoint=args.find((arg)=>arg.startsWith("repos/"));
+  const comments=state.comments||[];
+  if(args.includes("POST")){
+    state.commentPosts=(state.commentPosts||0)+1;
+    const bodyArg=args.find((arg)=>arg.startsWith("body="));
+    const comment={id:500+state.commentPosts,html_url:
+      "https://github.com/acme/demo/pull/17#issuecomment-"+(500+state.commentPosts),body:bodyArg.slice(5)};
+    if(Number(process.env.CREW_GH_COMMENT_DELAY_MS||0)>0){Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,Number(process.env.CREW_GH_COMMENT_DELAY_MS))}
+    if(process.env.CREW_GH_COMMENT_FAILURE!=="lost-absent") state.comments=[...comments,comment];
+    save();
+    if(process.env.CREW_GH_STALE_AFTER_COMMENT==="1"){
+      fs.writeFileSync(process.env.CREW_FIXTURE_WORKTREE+"/stale-after.txt","stale after comment\\n");
+      cp.execFileSync(process.env.CREW_REAL_GIT,["-C",process.env.CREW_FIXTURE_WORKTREE,"add","stale-after.txt"]);
+      cp.execFileSync(process.env.CREW_REAL_GIT,["-C",process.env.CREW_FIXTURE_WORKTREE,"commit","-qm","stale after comment"]);
+    }
+    if(process.env.CREW_GH_COMMENT_FAILURE){console.error("simulated comment response loss");process.exit(1)}
+    console.log(JSON.stringify(comment));process.exit(0)
+  }
+  if(process.env.CREW_GH_STALE_BEFORE_COMMENT==="1"&&!state.staledBeforeComment){
+    state.staledBeforeComment=true;save();
+    fs.writeFileSync(process.env.CREW_FIXTURE_WORKTREE+"/stale.txt","stale before comment\\n");
+    cp.execFileSync(process.env.CREW_REAL_GIT,["-C",process.env.CREW_FIXTURE_WORKTREE,"add","stale.txt"]);
+    cp.execFileSync(process.env.CREW_REAL_GIT,["-C",process.env.CREW_FIXTURE_WORKTREE,"commit","-qm","stale before comment"]);
+  }
+  const pageMatch=endpoint&&endpoint.match(/\\/comments\\?per_page=100&page=([1-9][0-9]*)$/);
+  if(!pageMatch){console.error("unexpected api endpoint");process.exit(1)}
+  const page=Number(pageMatch[1]);
+  console.log(JSON.stringify(comments.slice((page-1)*100,page*100)));process.exit(0)
+}
 console.error("unexpected gh "+args.join(" "));process.exit(1)
 `);
   await chmod(gh, 0o755);
@@ -184,11 +239,16 @@ console.error("unexpected gh "+args.join(" "));process.exit(1)
     CREW_GH_LOG: ghLog,
     CREW_HERDR_LOG: herdrLog,
     CREW_FIXTURE_REPO: repo,
+    CREW_FIXTURE_WORKTREE: worktree,
     CREW_REAL_GIT: realGit,
     CREW_DETACHED_REMOVE_PATH: "",
     HERDR_ENV: "1",
     CREW_AGENT_PRESENT: "0",
     CREW_GH_FAIL_ONCE: failCreateOnce ? "1" : "0",
+    CREW_GH_COMMENT_FAILURE: commentFailure,
+    CREW_GH_STALE_BEFORE_COMMENT: staleBeforeComment ? "1" : "0",
+    CREW_GH_STALE_AFTER_COMMENT: staleAfterComment ? "1" : "0",
+    CREW_GH_COMMENT_DELAY_MS: String(commentPostDelayMs),
   };
   return { root, repo, worktree, remote, statePath, stateDir, ghState, ghLog, herdrLog, head, env };
 }
@@ -201,17 +261,18 @@ async function collectCandidateAndReview(item) {
   return collected;
 }
 
+const publishArgs = [
+  "publish", "build-one",
+  "--remote", "origin",
+  "--repo", "acme/demo",
+  "--base", "main",
+  "--head", "crew/build-one",
+  "--title", "Reviewed change",
+  "--body", "Draft body",
+];
+
 function publish(item) {
-  return runCli(
-    item,
-    "publish", "build-one",
-    "--remote", "origin",
-    "--repo", "acme/demo",
-    "--base", "main",
-    "--head", "crew/build-one",
-    "--title", "Reviewed change",
-    "--body", "Draft body",
-  );
+  return runCli(item, ...publishArgs);
 }
 
 test("reviewers and scouts use Herdr-opened detached worktrees while builds keep crew branches", async (t) => {
@@ -306,6 +367,24 @@ test("approved exact SHA publication retries deterministically and is idempotent
   assert.ok(output.publication.pushedAt);
   assert.ok(output.publication.prCreatedAt);
   assert.ok(output.publication.updatedAt);
+  assert.equal(output.verdictComment.headSha, item.head);
+  assert.equal(output.verdictComment.reviewerTaskId, "review-one");
+  assert.equal(output.verdictComment.candidateVersion, 1);
+  assert.equal(output.verdictComment.immutable, true);
+  let ghDurable = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(ghDurable.commentPosts, 1);
+  assert.equal(ghDurable.comments.length, 1);
+  const firstComment = ghDurable.comments[0].body;
+  assert.match(firstComment, new RegExp(`<!-- crewdeck-verdict:build-one:${item.head} -->`));
+  assert.match(firstComment, new RegExp(item.head));
+  assert.match(firstComment, /"verdict": "approved"/);
+  assert.match(firstComment, /"reviewerTaskId": "review-one"/);
+  assert.match(firstComment, /"candidateVersion": 1/);
+  assert.match(firstComment, /### Summary[\s\S]*review approved/);
+  assert.match(firstComment, /### Checks[\s\S]*inspected exact diff/);
+  assert.match(firstComment, /### Findings/);
+  assert.match(firstComment, /### Open questions/);
+  assert.match(firstComment, /not an official GitHub approval/);
 
   result = publish(item);
   assert.equal(result.status, 0, result.stderr);
@@ -314,6 +393,9 @@ test("approved exact SHA publication retries deterministically and is idempotent
   let log = await readFile(item.ghLog, "utf8");
   assert.equal((log.match(/pr create/g) || []).length, 1);
   assert.equal((log.match(/pr edit/g) || []).length, 0);
+  ghDurable = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(ghDurable.commentPosts, 1);
+  assert.equal(ghDurable.comments.length, 1);
 
   await writeFile(path.join(item.worktree, "change.txt"), "approved candidate two\n");
   git(item.worktree, "add", "change.txt");
@@ -353,7 +435,212 @@ test("approved exact SHA publication retries deterministically and is idempotent
   log = await readFile(item.ghLog, "utf8");
   assert.equal((log.match(/pr create/g) || []).length, 1);
   assert.equal((log.match(/pr edit/g) || []).length, 1);
+  assert.doesNotMatch(log, /api .*--method (?:PATCH|DELETE)|pr (?:review|ready|merge)/);
+  ghDurable = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(ghDurable.commentPosts, 2);
+  assert.equal(ghDurable.comments.length, 2);
+  assert.equal(ghDurable.comments[0].body, firstComment);
+  assert.match(ghDurable.comments[1].body, new RegExp(`<!-- crewdeck-verdict:build-one:${secondHead} -->`));
+  durable = JSON.parse(await readFile(item.statePath, "utf8"));
+  assert.deepEqual(
+    durable.tasks["build-one"].publication.verdictComments.map((entry) => entry.headSha),
+    [item.head, secondHead],
+  );
   assert.equal(git(item.repo, "rev-parse", "main"), git(item.remote, "rev-parse", "main"));
+});
+
+test("exact marker lookup adopts an immutable comment beyond the first bounded page", async (t) => {
+  const item = await fixture({ verdict: "approved" });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  await collectCandidateAndReview(item);
+  let result = publish(item);
+  assert.equal(result.status, 0, result.stderr);
+  const ghState = JSON.parse(await readFile(item.ghState, "utf8"));
+  const exact = ghState.comments[0];
+  ghState.comments = Array.from({ length: 100 }, (_, index) => ({
+    id: 10_000 + index,
+    html_url: `https://github.com/acme/demo/pull/17#issuecomment-${10_000 + index}`,
+    body: `unrelated comment ${index}`,
+  })).concat(exact);
+  await writeFile(item.ghState, JSON.stringify(ghState));
+
+  result = publish(item);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).verdictComment.adopted, true);
+  const after = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(after.commentPosts, 1);
+  assert.equal(after.comments.length, 101);
+  assert.match(await readFile(item.ghLog, "utf8"), /comments\?per_page=100&page=2/);
+});
+
+test("lost comment response with an applied comment is adopted on retry without another POST", async (t) => {
+  const item = await fixture({ verdict: "approved", commentFailure: "lost-applied" });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  await collectCandidateAndReview(item);
+
+  let result = publish(item);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /verdict_comment_post_ambiguous/);
+  let state = JSON.parse(await readFile(item.statePath, "utf8"));
+  assert.equal(state.tasks["build-one"].publication.verdictComments[0].status, "dispatched");
+  let ghState = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(ghState.commentPosts, 1);
+  assert.equal(ghState.comments.length, 1);
+
+  item.env.CREW_GH_COMMENT_FAILURE = "";
+  result = publish(item);
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.verdictComment.adopted, true);
+  assert.equal(output.verdictComment.id, ghState.comments[0].id);
+  state = JSON.parse(await readFile(item.statePath, "utf8"));
+  assert.equal(state.tasks["build-one"].publication.verdictComments[0].status, "published");
+  ghState = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(ghState.commentPosts, 1);
+});
+
+test("lost comment response without an applied comment becomes durably ambiguous and never reposts", async (t) => {
+  const item = await fixture({ verdict: "approved", commentFailure: "lost-absent" });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  await collectCandidateAndReview(item);
+
+  let result = publish(item);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /verdict_comment_post_ambiguous/);
+  item.env.CREW_GH_COMMENT_FAILURE = "";
+  result = publish(item);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /verdict_comment_ambiguous/);
+  let state = JSON.parse(await readFile(item.statePath, "utf8"));
+  assert.equal(state.tasks["build-one"].publication.verdictComments[0].status, "ambiguous");
+  let ghState = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(ghState.commentPosts, 1);
+  assert.deepEqual(ghState.comments || [], []);
+
+  result = publish(item);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /verdict_comment_ambiguous/);
+  state = JSON.parse(await readFile(item.statePath, "utf8"));
+  assert.equal(state.tasks["build-one"].publication.verdictComments[0].status, "ambiguous");
+  ghState = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(ghState.commentPosts, 1);
+});
+
+test("concurrent publication calls share one durable dispatch intent and issue at most one comment POST", async (t) => {
+  const item = await fixture({ verdict: "approved", commentPostDelayMs: 500 });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  await collectCandidateAndReview(item);
+
+  const results = await Promise.all([
+    runCliAsync(item, ...publishArgs),
+    runCliAsync(item, ...publishArgs),
+  ]);
+  assert.ok(results.some((result) => result.status === 0), JSON.stringify(results));
+  const ghState = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(ghState.commentPosts, 1);
+  assert.equal(ghState.comments.length, 1);
+  const state = JSON.parse(await readFile(item.statePath, "utf8"));
+  assert.equal(state.tasks["build-one"].publication.verdictComments.length, 1);
+  assert.equal(state.tasks["build-one"].publication.verdictComments[0].status, "published");
+});
+
+test("immutable marker collision or divergent content is refused without comment mutation", async (t) => {
+  const divergent = await fixture({ verdict: "approved" });
+  t.after(() => rm(divergent.root, { recursive: true, force: true }));
+  await collectCandidateAndReview(divergent);
+  let result = publish(divergent);
+  assert.equal(result.status, 0, result.stderr);
+  let ghState = JSON.parse(await readFile(divergent.ghState, "utf8"));
+  ghState.comments[0].body += "\ndivergent external content";
+  await writeFile(divergent.ghState, JSON.stringify(ghState));
+  result = publish(divergent);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /verdict_comment_divergent/);
+  ghState = JSON.parse(await readFile(divergent.ghState, "utf8"));
+  assert.equal(ghState.commentPosts, 1);
+  assert.match(ghState.comments[0].body, /divergent external content/);
+
+  const collision = await fixture({ verdict: "approved" });
+  t.after(() => rm(collision.root, { recursive: true, force: true }));
+  await collectCandidateAndReview(collision);
+  result = publish(collision);
+  assert.equal(result.status, 0, result.stderr);
+  ghState = JSON.parse(await readFile(collision.ghState, "utf8"));
+  ghState.comments.push({
+    ...ghState.comments[0],
+    id: 999,
+    html_url: "https://github.com/acme/demo/pull/17#issuecomment-999",
+  });
+  await writeFile(collision.ghState, JSON.stringify(ghState));
+  result = publish(collision);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /verdict_comment_collision/);
+  ghState = JSON.parse(await readFile(collision.ghState, "utf8"));
+  assert.equal(ghState.commentPosts, 1);
+  assert.equal(ghState.comments.length, 2);
+});
+
+test("a candidate becoming stale before comment dispatch produces zero comments", async (t) => {
+  const item = await fixture({ verdict: "approved", staleBeforeComment: true });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  await collectCandidateAndReview(item);
+  const result = publish(item);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /stale_candidate/);
+  const ghState = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(ghState.commentPosts || 0, 0);
+  assert.deepEqual(ghState.comments || [], []);
+  const state = JSON.parse(await readFile(item.statePath, "utf8"));
+  assert.deepEqual(state.tasks["build-one"].publication.verdictComments || [], []);
+  const log = await readFile(item.ghLog, "utf8");
+  assert.doesNotMatch(log, /--method POST|--method PATCH|--method DELETE|pr (?:review|ready|merge)/);
+});
+
+test("a comment remains immutable historical audit when the candidate becomes stale after POST", async (t) => {
+  const item = await fixture({ verdict: "approved", staleAfterComment: true });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  await collectCandidateAndReview(item);
+  const result = publish(item);
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.currentVerdictState.status, "stale");
+  assert.equal(output.currentVerdictState.approvedHead, item.head);
+  assert.notEqual(output.currentVerdictState.currentHead, item.head);
+  const ghState = JSON.parse(await readFile(item.ghState, "utf8"));
+  assert.equal(ghState.commentPosts, 1);
+  assert.equal(ghState.comments.length, 1);
+  const state = JSON.parse(await readFile(item.statePath, "utf8"));
+  assert.equal(state.tasks["build-one"].publication.verdictComments[0].comment.id, ghState.comments[0].id);
+  const log = await readFile(item.ghLog, "utf8");
+  assert.doesNotMatch(log, /--method PATCH|--method DELETE|pr (?:review|ready|merge)/);
+});
+
+test("reviewer-controlled verdict fields are safely rendered and byte-bounded", async (t) => {
+  const item = await fixture({ verdict: "approved" });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  const reportPath = path.join(item.stateDir, "reports", "review-one.json");
+  const report = JSON.parse(await readFile(reportPath, "utf8"));
+  report.payload.summary = `<script>@octocat</script>${"<&@".repeat(20_000)}`;
+  report.payload.checks = ["@crew please review <b>unsafe</b>"];
+  report.payload.findings = [{
+    severity: "nit",
+    title: "<img src=x>",
+    detail: "@octocat",
+    location: "<root>",
+    recommendation: "keep immutable",
+  }];
+  report.payload.openQuestions = ["@all?"];
+  await writeFile(reportPath, JSON.stringify(report));
+  await collectCandidateAndReview(item);
+
+  const result = publish(item);
+  assert.equal(result.status, 0, result.stderr);
+  const ghState = JSON.parse(await readFile(item.ghState, "utf8"));
+  const comment = ghState.comments[0].body;
+  assert.ok(Buffer.byteLength(comment, "utf8") <= 48 * 1024);
+  assert.doesNotMatch(comment, /<script>|<img|@octocat|@crew|@all/);
+  assert.match(comment, /&lt;script&gt;&#64;&#8203;octocat&lt;\/script&gt;/);
+  assert.match(comment, /truncated by Crewdeck/);
 });
 
 test("changes-requested findings travel through durable inbox then orchestrator steering", async (t) => {
