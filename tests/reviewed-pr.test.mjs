@@ -73,9 +73,11 @@ async function fixture({
   await writeFile(path.join(repo, "file.txt"), "base\n");
   git(repo, "add", "file.txt");
   git(repo, "commit", "-qm", "base");
+  const baseSha = git(repo, "rev-parse", "HEAD");
   execFileSync(realGit, ["init", "-q", "--bare", remote]);
   execFileSync(realGit, ["-C", repo, "push", "-q", remote, "main:main"]);
   git(repo, "remote", "add", "origin", "git@github.com:acme/demo.git");
+  git(repo, "remote", "add", "base-source", remote);
   await mkdir(path.dirname(worktree), { recursive: true });
   git(repo, "worktree", "add", "-q", "-b", "crew/build-one", worktree, "main");
   await writeFile(path.join(worktree, "change.txt"), "candidate one\n");
@@ -99,7 +101,7 @@ async function fixture({
     worktreeRoot: path.join(root, "worktrees"),
     kindsFile: kindsPath,
     profilesFile: profilesPath,
-    projects: { demo: { path: repo, base: "main", verify: [] } },
+    projects: { demo: { path: repo, base: "main", baseRemote: "base-source", githubChecks: "none", verify: [] } },
   }));
 
   const buildToken = "a".repeat(48);
@@ -108,7 +110,7 @@ async function fixture({
     id: "build-one", project: "demo", description: "Reviewed fixture build", kind: "build",
     lifecycle: "change", contract: "standard", workflow: "reviewed-pr", cleanup: "after-integration",
     profile: "worker", status: "running", branch: "crew/build-one", detached: false,
-    base: "main", repo, worktree, workspaceId: "build-workspace", paneId: "build-pane",
+    base: "main", baseSha, baseSource: { mode: "remote", remote: "base-source", ref: "refs/heads/main" }, repo, worktree, workspaceId: "build-workspace", paneId: "build-pane",
     agentName: "cd_build_one", sourceWorkspaceId: "source", sourceWorkspaceOwned: false,
     reportToken: buildToken, maxReviewRounds: 3, createdAt: new Date().toISOString(),
   };
@@ -156,7 +158,7 @@ cwd=""
 if [[ "\${1:-}" == "-C" ]]; then cwd="$2"; shift 2; fi
 case "\${1:-}" in
   ls-remote)
-    exec "$real" ls-remote --heads "$CREW_FAKE_REMOTE" "$4" ;;
+    ref="\${@: -1}"; exec "$real" ls-remote --heads "$CREW_FAKE_REMOTE" "$ref" ;;
   push)
     exec "$real" -C "$cwd" push "$2" "$CREW_FAKE_REMOTE" "$4" ;;
   *)
@@ -172,7 +174,7 @@ case "$1 $2" in
   "workspace list") printf '{"result":{"workspaces":[{"workspace_id":"source","label":"project:demo","worktree":{"is_linked_worktree":false,"checkout_path":"%s"}}]}}\n' "$CREW_FIXTURE_REPO" ;;
   "workspace get") printf '{"result":{"workspace":{"workspace_id":"build-workspace"}}}\n' ;;
   "worktree open") printf '{"result":{"workspace":{"workspace_id":"detached-workspace"},"root_pane":{"pane_id":"detached-pane"},"worktree":{"is_detached":true}}}\n' ;;
-  "worktree remove") "$CREW_REAL_GIT" -C "$CREW_FIXTURE_REPO" worktree remove "$CREW_DETACHED_REMOVE_PATH"; printf '{"result":{}}\n' ;;
+  "worktree remove") if [[ "\${CREW_FAIL_RETIRE_REMOVE:-0}" == 1 ]]; then echo interrupted_remove >&2; exit 1; fi; "$CREW_REAL_GIT" -C "$CREW_FIXTURE_REPO" worktree remove "$CREW_DETACHED_REMOVE_PATH"; printf '{"result":{}}\n' ;;
   "pane run"|"agent start") printf '{"result":{}}\n' ;;
   "agent get") if [[ "\${CREW_AGENT_PRESENT:-0}" == 1 ]]; then printf '{"result":{"agent":{"status":"working"}}}\n'; else echo agent_not_found >&2; exit 1; fi ;;
   "agent prompt") printf '{"result":{"accepted":true}}\n' ;;
@@ -277,7 +279,7 @@ console.error("unexpected gh "+args.join(" "));process.exit(1)
     CREW_GH_REST_FAILURE: restFailure,
     CREW_GH_REST_MISMATCH: restMismatch,
   };
-  return { root, repo, worktree, remote, statePath, stateDir, ghState, ghLog, herdrLog, head, env };
+  return { root, repo, worktree, remote, statePath, stateDir, ghState, ghLog, herdrLog, baseSha, head, env };
 }
 
 async function collectCandidateAndReview(item) {
@@ -376,9 +378,24 @@ test("reviewers and scouts use Herdr-opened detached worktrees while builds keep
     completedAt: new Date().toISOString(),
     payload: {
       parentTaskId: "build-one", reviewedHead: item.head, verdict: "approved", summary: "approved",
-      findings: [], checks: ["exact SHA"], openQuestions: [],
+      findings: [], checks: ["exact SHA"], openQuestions: [], evidenceSha256: reviewRecord.reviewEvidence.contentSha256,
     },
   }));
+  const evidencePath = reviewRecord.reviewEvidence.path;
+  const originalEvidence = await readFile(evidencePath, "utf8");
+  const evidence = JSON.parse(originalEvidence);
+  assert.equal(evidence.parentTaskId, "build-one");
+  assert.equal(evidence.baseSha, item.baseSha);
+  assert.equal(evidence.candidateSha, item.head);
+  assert.ok(evidence.commits.some((commit) => commit.sha === item.head));
+  await chmod(evidencePath, 0o600);
+  await writeFile(evidencePath, originalEvidence.replace("candidate one", "tampered subject"));
+  result = runCli(item, "collect", "review-new", "--keep-reports");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /review_evidence_invalid/);
+  await writeFile(evidencePath, originalEvidence);
+  await chmod(evidencePath, 0o400);
+
   item.env.CREW_DETACHED_REMOVE_PATH = reviewWorktree;
   result = runCli(item, "collect", "review-new");
   assert.equal(result.status, 0, result.stderr);
@@ -841,6 +858,105 @@ test("exact marker lookup adopts an immutable comment beyond the first bounded p
   assert.match(await readFile(item.ghLog, "utf8"), /comments\?per_page=100&page=2/);
 });
 
+test("a provably dead reviewer can be safely retired and replaced without discarding build work", async (t) => {
+  const item = await fixture({ includeReview: false });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  let result = runCli(item, "collect", "build-one@candidate-1", "--keep-reports");
+  assert.equal(result.status, 0, result.stderr);
+  result = runCli(item, "review", "build-one", "dead-review", item.head, "Review exact candidate before the simulated agent loss", "--profile", "worker");
+  assert.equal(result.status, 0, result.stderr);
+  const deadWorktree = path.join(item.root, "worktrees", "demo", "dead-review");
+  item.env.CREW_DETACHED_REMOVE_PATH = deadWorktree;
+  item.env.CREW_FAIL_RETIRE_REMOVE = "1";
+  result = runCli(item, "retire-agent", "dead-review", "--confirm", "--reason", "Herdr proves the reviewer agent absent");
+  assert.equal(result.status, 1);
+  assert.equal(JSON.parse(await readFile(item.statePath, "utf8")).tasks["dead-review"].agentRetirement.status, "retiring");
+  item.env.CREW_FAIL_RETIRE_REMOVE = "0";
+  result = runCli(item, "retire-agent", "dead-review", "--confirm", "--reason", "Herdr proves the reviewer agent absent");
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).task.status, "retired");
+  assert.equal(git(item.worktree, "rev-parse", "HEAD"), item.head);
+  result = runCli(item, "review", "build-one", "replacement-review", item.head, "Replacement exact candidate review after proven dead reviewer", "--profile", "worker");
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("separately confirmed verdict reconciliation adopts only exact existing evidence without reposting", async (t) => {
+  const item = await fixture({ verdict: "approved", commentFailure: "lost-applied" });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  await collectCandidateAndReview(item);
+  let result = publish(item);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /verdict_comment_post_ambiguous/);
+  item.env.CREW_GH_COMMENT_FAILURE = "";
+  await writeFile(item.ghLog, "");
+  result = runCli(item, "reconcile-verdict", "build-one", "--confirm", "--reason", "POST response was interrupted");
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.outcome.outcome, "adopted-exact");
+  assert.equal(output.intent.status, "published");
+  assert.doesNotMatch(await readFile(item.ghLog, "utf8"), /--method (?:POST|PATCH|DELETE)/);
+});
+
+test("PR observer persists exact open identity without treating it as merged", async (t) => {
+  const item = await fixture({ verdict: "approved" });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  await collectCandidateAndReview(item);
+  assert.equal(publish(item).status, 0);
+  const observed = runCli(item, "observe-prs", "build-one");
+  assert.equal(observed.status, 0, observed.stderr);
+  const [entry] = JSON.parse(observed.stdout);
+  assert.equal(entry.status, "open");
+  assert.equal(entry.headSha, item.head);
+  const status = JSON.parse(runCli(item, "status", "build-one").stdout)[0];
+  assert.equal(status.observerState, "open");
+  assert.equal(status.pr.state, "open");
+});
+
+test("review-round extension is monotonic, reason-durable, and concurrent-decision safe", async (t) => {
+  const item = await fixture({ includeReview: false });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  let result = runCli(item, "extend-review-rounds", "build-one", "--current-max", "3", "--new-max", "5", "--confirm", "--reason", "one additional correction cycle approved");
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(await readFile(item.statePath, "utf8"));
+  assert.equal(state.tasks["build-one"].effectiveMaxReviewRounds, 5);
+  assert.deepEqual(state.tasks["build-one"].reviewRoundDecisions.map(({ from, to }) => ({ from, to })), [{ from: 3, to: 5 }]);
+  result = runCli(item, "extend-review-rounds", "build-one", "--current-max", "3", "--new-max", "6", "--confirm", "--reason", "stale concurrent decision");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /round_extension_conflict/);
+});
+
+test("publication refuses a remote base that moved after the pinned review contract", async (t) => {
+  const item = await fixture({ verdict: "approved" });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  await collectCandidateAndReview(item);
+  execFileSync(realGit, ["-C", item.worktree, "push", "-q", item.remote, `${item.head}:refs/heads/main`]);
+  const refsBefore = git(item.repo, "show-ref");
+  const fetchHeadPath = path.join(item.repo, ".git", "FETCH_HEAD");
+  const fetchHeadBefore = await readFile(fetchHeadPath, "utf8").catch(() => undefined);
+  const result = publish(item);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /base_(?:advanced|drift)/);
+  assert.equal(git(item.remote, "rev-parse", "main"), item.head);
+  assert.equal(git(item.repo, "show-ref"), refsBefore);
+  assert.equal(await readFile(fetchHeadPath, "utf8").catch(() => undefined), fetchHeadBefore);
+  assert.notEqual(spawnSync(realGit, ["--git-dir", item.remote, "show-ref", "--verify", "refs/heads/crew/build-one"]).status, 0);
+});
+
+test("required GitHub checks fail closed when the exact-SHA check API is unavailable", async (t) => {
+  const item = await fixture({ verdict: "approved" });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  await collectCandidateAndReview(item);
+  const config = JSON.parse(await readFile(item.env.CREWDECK_CONFIG, "utf8"));
+  config.projects.demo.githubChecks = "required";
+  await writeFile(item.env.CREWDECK_CONFIG, JSON.stringify(config));
+  const result = publish(item);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /github_checks_not_passing/);
+  const state = JSON.parse(await readFile(item.statePath, "utf8"));
+  assert.equal(state.tasks["build-one"].publication.checks.status, "unavailable");
+  assert.equal((JSON.parse(await readFile(item.ghState, "utf8")).comments || []).length, 0);
+});
+
 test("lost comment response with an applied comment is adopted on retry without another POST", async (t) => {
   const item = await fixture({ verdict: "approved", commentFailure: "lost-applied" });
   t.after(() => rm(item.root, { recursive: true, force: true }));
@@ -892,6 +1008,14 @@ test("lost comment response without an applied comment becomes durably ambiguous
   assert.equal(state.tasks["build-one"].publication.verdictComments[0].status, "ambiguous");
   ghState = JSON.parse(await readFile(item.ghState, "utf8"));
   assert.equal(ghState.commentPosts, 1);
+
+  result = runCli(item, "reconcile-verdict", "build-one", "--confirm", "--reason", "operator checked after interrupted POST");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /verdict_comment_absent/);
+  state = JSON.parse(await readFile(item.statePath, "utf8"));
+  assert.equal(state.tasks["build-one"].verdictReconciliations.at(-1).outcome, "refused");
+  assert.equal(state.tasks["build-one"].verdictReconciliations.at(-1).refusal.code, "verdict_comment_absent");
+  assert.equal(JSON.parse(await readFile(item.ghState, "utf8")).commentPosts, 1);
 });
 
 test("concurrent publication calls share one durable dispatch intent and issue at most one comment POST", async (t) => {

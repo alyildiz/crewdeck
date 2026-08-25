@@ -54,6 +54,7 @@ function runReporter({ extension, cwd, reportDir, workflow, script }) {
         CREWDECK_TASK_WORKFLOW: workflow,
         CREWDECK_TASK_BRANCH: "crew/build-one",
         CREWDECK_TASK_BASE: "main",
+        CREWDECK_TASK_BASE_SHA: git(cwd, "rev-parse", "main"),
         CREWDECK_MAX_REVIEW_ROUNDS: "3",
         CREWDECK_REPORT_TOKEN: "a".repeat(48),
         CREWDECK_REPORT_DIR: reportDir,

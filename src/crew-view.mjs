@@ -1,6 +1,7 @@
 export const TERMINAL_CREW_STATUSES = new Set([
   "report-collected",
   "orphan-reconciled",
+  "retired",
   "integrated",
   "pr-merged",
   "abandoned",
@@ -20,7 +21,11 @@ export function taskLines(tasks) {
     const live = task.agent?.state || "unknown";
     const ahead = task.git?.available ? `${task.git.ahead} commit(s)` : "git unavailable";
     const status = task.observedStatus || task.status;
-    return `${task.id.padEnd(24)} ${status.padEnd(20)} agent=${live.padEnd(8)} ${ahead}`;
+    const round = task.workflow === "reviewed-pr" ? ` r${task.reviewRound || 0}/${task.currentMaxReviewRounds || task.maxReviewRounds || "?"}` : "";
+    const pr = task.pr?.number ? ` PR#${task.pr.number}:${task.pr.state}` : "";
+    const gate = task.workflow === "reviewed-pr" ? ` checks=${task.checkState || "?"} verdict=${task.verdictState || "?"}` : "";
+    const action = task.nextAction ? ` → ${task.nextAction}` : "";
+    return `${task.id.padEnd(24)} ${status.padEnd(20)} agent=${live.padEnd(8)} ${ahead}${round}${pr}${gate}${action}`;
   });
 }
 

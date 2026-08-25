@@ -28,9 +28,11 @@ The Herdr 0.8 API was verified rather than assumed: `worktree create` without `-
 ~/.local/state/crewdeck/state.json                       tasks, inbox, publication
 ~/.local/state/crewdeck/reports/<task>.json              final scout/review/direct result
 ~/.local/state/crewdeck/reports/<task>.candidates.json   reviewed-pr candidate journal
+~/.local/state/crewdeck/reports/<review>.review-evidence.json  exact-SHA bounded review evidence
+~/.local/state/crewdeck/reports/<task>.rounds.json       live per-task round authority
 ```
 
-State uses atomic writes under a lock. Candidate versions, collection acknowledgements, structured review findings, forwarding attempts, escalation, remote SHA, PR URL/number, exact-SHA verdict dispatch intents/comment identities, external merge evidence/reconciliation attempts, and timestamps survive orchestrator restart. The completion watcher rescans the durable inbox at session start, so missed filesystem events still generate a Pi follow-up.
+State uses atomic writes under a verifiable PID/boot/start-time/token lock with dead-owner recovery and confirmed diagnostics for unverifiable stale locks. Candidate versions, collection acknowledgements, structured review findings, forwarding attempts, escalation, remote SHA, PR URL/number, exact-SHA verdict dispatch intents/comment identities, external merge evidence/reconciliation attempts, and timestamps survive orchestrator restart. The completion watcher rescans the durable inbox at session start, so missed filesystem events still generate a Pi follow-up.
 
 ## Configuration
 
@@ -67,6 +69,7 @@ If the default `crewdeck.json` is missing, Crewdeck fails with a `missing_config
       "path": "/absolute/path/to/my-project",
       "base": "main",
       "baseRemote": "upstream",
+      "githubChecks": "required",
       "trustProjectResources": true,
       "verify": ["npm test"]
     }
@@ -74,7 +77,9 @@ If the default `crewdeck.json` is missing, Crewdeck fails with a `missing_config
 }
 ```
 
-`maxReviewRounds` is 1–10 and defaults to 3 for historical configs.
+`maxReviewRounds` is 1–10 and defaults to 3 for historical configs. `prObserverIntervalSeconds` defaults to 60 and is bounded to 30–900 seconds.
+
+`githubChecks` is fail-closed and defaults to `required`. Publication and merged reconciliation query both check runs and commit status contexts for the exact approved SHA. Pending, missing, failing, stale-SHA, malformed, ambiguous, or unavailable results refuse completion. Successful, neutral, and skipped completed check runs are accepted; status contexts must be successful. Checks are CI evidence only and never imply reviewer or GitHub approval. Projects intentionally configured without checks must explicitly set `githubChecks: "none"`; status records this disabled escape hatch.
 
 `baseRemote` is optional and is never inferred. When present, every batch containing a `change` task reads only the configured `base` branch from that named remote, fetches it with tags and `FETCH_HEAD` updates disabled, verifies that the advertised ref stayed stable during the fetch, proves the fetched object is the exact commit, and pins one SHA for the whole batch. Each `crew/<id>` change branch is then created from that SHA. The task state exposes `baseSource` (`mode`, `remote`, and full ref) plus `baseSha`.
 
@@ -189,6 +194,8 @@ Candidate events use keys such as `build-id@candidate-1` in the existing complet
 
 `crew_spawn_review` requires the parent reviewed-pr build, a collected current candidate, and its full SHA. It refuses a moving writer, stale SHA, duplicate reviewer, another open reviewer, or exhausted rounds. The review task is detached at that exact commit and exposes no shell/write/steering tool.
 
+Before launch Crewdeck precomputes an authoritative bounded evidence document from the pinned `baseSha...reviewedHead`: full commit identities, diffstat, and a patch capped at 40 KiB. The document includes parent/reviewer/base/candidate identity and a SHA-256 digest, is outside the build worktree, and is exposed read-only to the shell-free reviewer. The reviewer attests `evidenceSha256`; collection recomputes the digest and refuses stale or tampered evidence.
+
 Its terminating result contains:
 
 ```json
@@ -196,6 +203,7 @@ Its terminating result contains:
   "parentTaskId": "build-id",
   "reviewedHead": "0123456789abcdef0123456789abcdef01234567",
   "verdict": "approved | changes-requested | blocked | inconclusive",
+  "evidenceSha256": "<64 hex characters>",
   "summary": "...",
   "findings": [{
     "severity": "blocking | major | minor | nit",
@@ -251,6 +259,16 @@ This is deliberately bounded idempotence, not general exactly-once delivery. Cre
 
 PR retry remains deterministic: if push succeeded before interruption, the lease/remote SHA is reconciled; if PR creation succeeded but its response was lost, lookup by exact head/base adopts the unique matching draft. Publication never runs `gh pr review --approve`, `gh pr ready`, `gh pr merge`, or a local merge.
 
+## Recovery and observation controls
+
+State locks are directories with an atomic owner record containing host, PID, Linux boot ID, process start ticks, random token, and acquisition time. Active identity-matching locks are never stolen. After a bounded grace period, same-host dead/PID-reused locks are atomically quarantined and recovered; malformed or otherwise unverifiable locks require `lock-status` followed by separately confirmed `recover-lock --reason ...`. Recovery is audited in `last-lock-recovery.json` and cannot remove a successor lock.
+
+An ambiguous verdict dispatch can be handled only by separately confirmed `reconcile-verdict --reason ...`. It re-lists comments on the exact durable PR and adopts only the exact marker and byte-identical body. It never POSTs, PATCHes, or DELETEs. Exact absence, divergence, collision, and lookup failure produce durable refused reconciliation evidence and remain fail-closed.
+
+`retire-agent --reason ...` retires only an agent proven absent, unless `--terminate` is independently confirmed. Dirty work is always preserved. Change worktrees/branches remain intact for safe adoption; a clean exact detached reviewer may have its isolated workspace closed and becomes replaceable without bypassing Herdr/Git. `extend-review-rounds` requires the expected current maximum, a larger maximum, confirmation, and a durable reason; decisions are monotonic and append-only and never rewrite candidate/review history.
+
+Crewdeck polls exact published PR identities at startup and every configured interval. It records `open`, `closed-unmerged`, `lookup-failed`, `unknown`, or `merged-awaiting-confirmed-reconciliation`; only the last produces a completion notification, and still requires the separate confirmed reconciliation. Polling never merges or mutates GitHub.
+
 ## Externally merged PR reconciliation
 
 If a published reviewed PR is merged outside Crewdeck, the build deliberately remains `running` until an operator invokes the separately confirmed `crew_reconcile_merged_pr` (CLI: `reconcile-merged-pr ... --confirm`). Reconciliation is read-only toward GitHub and both base branches: it never pushes, merges, marks ready, updates a base ref, or claims local integration.
@@ -278,7 +296,8 @@ The project extension exposes:
 - `crew_spawn_review`
 - `crew_status`, `crew_collect_results`, `crew_diff`
 - `crew_steer`, `crew_forward_review`, `crew_resume_build`
-- `crew_publish_pr`
+- `crew_publish_pr`, read-only `crew_observe_prs`
+- separately confirmed `crew_reconcile_verdict`, `crew_extend_review_rounds`, `crew_retire_agent`, and state-lock recovery
 - separately confirmed `crew_reconcile_merged_pr`
 - existing `crew_prepare_integration`, confirmed `crew_merge`, confirmed `crew_abandon`, confirmed `crew_reconcile_orphan_report`, and confirmed `crew_cleanup`
 
@@ -305,9 +324,15 @@ bin/crewdeck publish reviewed-fix \
   --remote origin --repo owner/repo --base main --head crew/reviewed-fix \
   --title "Reviewed fix" --body "Draft PR body"
 # only after that exact PR was merged externally on GitHub:
+bin/crewdeck observe-prs reviewed-fix
 bin/crewdeck reconcile-merged-pr reviewed-fix --confirm
 
 # Recovery/control
+bin/crewdeck reconcile-verdict reviewed-fix --confirm --reason "lost POST response"
+bin/crewdeck extend-review-rounds reviewed-fix --current-max 3 --new-max 4 --confirm --reason "one correction cycle approved"
+bin/crewdeck retire-agent reviewed-fix-r1 --confirm --reason "agent is absent"
+bin/crewdeck lock-status
+bin/crewdeck recover-lock --confirm --reason "owner record interrupted before completion"
 bin/crewdeck resume reviewed-fix
 bin/crewdeck abandon obsolete-fix --confirm --reason "superseded"
 bin/crewdeck reconcile-orphan old-report --confirm --reason "manual removal during maintenance"

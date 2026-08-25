@@ -16,8 +16,11 @@ const taskContract = process.env.CREWDECK_TASK_CONTRACT || "standard";
 const taskWorkflow = process.env.CREWDECK_TASK_WORKFLOW || "direct";
 const taskBranch = process.env.CREWDECK_TASK_BRANCH || "";
 const taskBase = process.env.CREWDECK_TASK_BASE || "";
+const taskBaseSha = process.env.CREWDECK_TASK_BASE_SHA || "";
 const parentTaskId = process.env.CREWDECK_PARENT_TASK_ID || "";
 const reviewedHead = process.env.CREWDECK_REVIEWED_HEAD || "";
+const reviewEvidencePath = process.env.CREWDECK_REVIEW_EVIDENCE_PATH || "";
+const reviewEvidenceSha256 = process.env.CREWDECK_REVIEW_EVIDENCE_SHA256 || "";
 const reportToken = process.env.CREWDECK_REPORT_TOKEN || "";
 const reportDir = process.env.CREWDECK_REPORT_DIR || "";
 const maxReviewRounds = Number(process.env.CREWDECK_MAX_REVIEW_ROUNDS || "3");
@@ -83,6 +86,7 @@ const ReviewResult = Type.Object({
   ),
   checks: StringList,
   openQuestions: StringList,
+  evidenceSha256: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$" })),
 });
 
 async function git(args: string[]) {
@@ -119,7 +123,8 @@ export default function crewdeckWorkerReporter(pi: ExtensionAPI) {
     if (taskLifecycle !== "change") throw new Error("Only change tasks can use reviewed-pr");
     if (taskBranch !== `crew/${taskId}`) throw new Error("Invalid CREWDECK_TASK_BRANCH");
     if (!taskBase) throw new Error("Invalid CREWDECK_TASK_BASE");
-    if (!Number.isInteger(maxReviewRounds) || maxReviewRounds < 1 || maxReviewRounds > 10) {
+    if (!/^[0-9a-f]{40}$/.test(taskBaseSha)) throw new Error("Invalid CREWDECK_TASK_BASE_SHA");
+    if (!Number.isInteger(maxReviewRounds) || maxReviewRounds < 1 || maxReviewRounds > 50) {
       throw new Error("Invalid CREWDECK_MAX_REVIEW_ROUNDS");
     }
   }
@@ -138,7 +143,7 @@ export default function crewdeckWorkerReporter(pi: ExtensionAPI) {
           git(["rev-parse", "HEAD"]),
           git(["branch", "--show-current"]),
           git(["status", "--porcelain"]),
-          git(["rev-list", "--count", `${taskBase}..HEAD`]),
+          git(["rev-list", "--count", `${taskBaseSha}..HEAD`]),
         ]);
         if (branch !== taskBranch) throw new Error(`Build must remain on ${taskBranch}`);
         if (status !== "") throw new Error("Cannot submit a candidate from a dirty worktree");
@@ -181,8 +186,18 @@ export default function crewdeckWorkerReporter(pi: ExtensionAPI) {
               details: { taskId, version: existing.version, head, submittedAt: existing.submittedAt, idempotent: true },
             };
           }
-          if (journal.candidates.length >= maxReviewRounds) {
-            throw new Error(`Review round limit reached (${maxReviewRounds}); orchestrator escalation is required`);
+          let effectiveMax = maxReviewRounds;
+          try {
+            const authority = JSON.parse(await readFile(path.join(reportDir, `${taskId}.rounds.json`), "utf8"));
+            if (authority.taskId !== taskId || authority.token !== reportToken || !Number.isInteger(authority.maxReviewRounds)) {
+              throw new Error("invalid review-round authority");
+            }
+            effectiveMax = authority.maxReviewRounds;
+          } catch (error: any) {
+            if (error.code !== "ENOENT") throw error;
+          }
+          if (journal.candidates.length >= effectiveMax) {
+            throw new Error(`Review round limit reached (${effectiveMax}); orchestrator escalation is required`);
           }
           const candidate = {
             version: journal.candidates.length + 1,
@@ -217,6 +232,15 @@ export default function crewdeckWorkerReporter(pi: ExtensionAPI) {
       if (taskContract === "review") {
         if (params.parentTaskId !== parentTaskId || params.reviewedHead !== reviewedHead) {
           throw new Error("Review identity must match the bound parentTaskId and reviewedHead");
+        }
+        if (reviewEvidenceSha256) {
+          if (!path.isAbsolute(reviewEvidencePath) || params.evidenceSha256 !== reviewEvidenceSha256) {
+            throw new Error("Review must attest the authoritative precomputed evidence SHA-256");
+          }
+          const evidence = JSON.parse(await readFile(reviewEvidencePath, "utf8"));
+          if (evidence.contentSha256 !== reviewEvidenceSha256 || evidence.parentTaskId !== parentTaskId || evidence.candidateSha !== reviewedHead) {
+            throw new Error("Authoritative reviewer evidence identity is stale or tampered");
+          }
         }
         if (params.verdict === "approved" && params.findings.some((finding: any) => finding.severity === "blocking")) {
           throw new Error("An approved review cannot contain blocking findings");

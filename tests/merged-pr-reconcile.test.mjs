@@ -90,7 +90,7 @@ async function fixture({ agent = "idle", contained = true, legacyPublication = f
     worktreeRoot: path.join(root, "worktrees"),
     kindsFile: kindsPath,
     profilesFile: profilesPath,
-    projects: { demo: { path: repo, base: "main", verify: [] } },
+    projects: { demo: { path: repo, base: "main", githubChecks: "none", verify: [] } },
   }));
 
   const now = new Date().toISOString();
@@ -403,7 +403,8 @@ test("reconciles a historical v2 publication with no verdict field or GitHub com
   assert.equal(await readFile(item.reviewPath, "utf8"), reviewHistory);
   assert.equal(await readFile(item.priorReviewPath, "utf8"), priorReviewHistory);
   const after = await persisted(item);
-  assert.deepEqual(after.tasks["build-one"].publication, publicationHistory);
+  assert.deepEqual(after.tasks["build-one"].publication, { ...publicationHistory, checks: output.task.publication.checks });
+  assert.equal(after.tasks["build-one"].publication.checks.status, "disabled");
   assert.equal(after.tasks["build-one"].mergeReconciliation.evidence.verdict.status, "legacy-absent");
   assert.deepEqual(JSON.parse(await readFile(item.ghState, "utf8")).comments, []);
   assert.doesNotMatch(await readFile(item.ghLog, "utf8"), /api .*--method (?:POST|PATCH|DELETE)/);
@@ -455,7 +456,8 @@ test("reconciles the exact external merge, cleans only isolated resources, and p
   assert.equal(await readFile(item.candidatePath, "utf8"), candidateHistory);
   assert.equal(await readFile(item.reviewPath, "utf8"), reviewHistory);
   const after = await persisted(item);
-  assert.deepEqual(after.tasks["build-one"].publication, publicationHistory);
+  assert.deepEqual(after.tasks["build-one"].publication, { ...publicationHistory, checks: output.task.publication.checks });
+  assert.equal(after.tasks["build-one"].publication.checks.status, "disabled");
   assert.equal(after.tasks["review-one"].status, "cleaned");
   assert.deepEqual(JSON.parse(await readFile(item.ghState, "utf8")).comments, githubComments);
   assert.doesNotMatch(await readFile(item.ghLog, "utf8"), /api .*--method (?:POST|PATCH|DELETE)/);

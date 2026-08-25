@@ -13,16 +13,22 @@ import {
   getPendingResultIds,
   getStatus,
   forwardReviewFindings,
+  extendReviewRounds,
   getTaskDiff,
   loadConfig,
   mergeTask,
+  observePublishedPullRequests,
   prepareIntegration,
   promptTask,
   publishPullRequest,
   reconcileMergedPullRequest,
   reconcileOrphanReport,
+  reconcileVerdictComment,
+  recoverStateLock,
   reportDirectory,
+  retireTaskAgent,
   resumeBuild,
+  stateLockStatus,
   spawnBatch,
   spawnReview,
 } from "../../../src/core.mjs";
@@ -66,6 +72,7 @@ async function validateProfiles(params: any, ctx: any) {
 
 export default function crewdeckExtension(pi: ExtensionAPI) {
   let reportWatcher: FSWatcher | undefined;
+  let observerTimer: ReturnType<typeof setInterval> | undefined;
   let activeContext: any;
   const completionWake = createCompletionWakeController({
     listPending: () => getPendingResultIds(CONFIG),
@@ -234,6 +241,68 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "crew_reconcile_verdict",
+    label: "Reconcile Ambiguous Verdict",
+    description: "Separately confirmed read-only GitHub reconciliation. Re-lists only the exact immutable marker/body and adopts an exact match; never reposts, edits, or deletes. Durable reason and refusal outcome are recorded.",
+    parameters: Type.Object({ id: Type.String(), reason: Type.String({ minLength: 1, maxLength: 4000 }) }),
+    async execute(_id, params, _signal, _update, ctx) {
+      if (!ctx.hasUI) throw new Error("crew_reconcile_verdict requires interactive confirmation");
+      const confirmed = await ctx.ui.confirm("Reconcile immutable verdict evidence?", `Read only PR comments for '${params.id}' and adopt only an exact marker/body match? Reason: ${params.reason}`);
+      if (!confirmed) return text({ reconciled: false, reason: "user declined" });
+      return text(await reconcileVerdictComment(CONFIG, params.id, { reason: params.reason }));
+    },
+  });
+
+  pi.registerTool({
+    name: "crew_extend_review_rounds",
+    label: "Extend Review Rounds",
+    description: "Confirmed monotonic per-task review-round extension with durable reason and concurrent expected-current-max guard. Does not rewrite candidate or review history.",
+    parameters: Type.Object({ id: Type.String(), currentMax: Type.Integer({ minimum: 1, maximum: 50 }), newMax: Type.Integer({ minimum: 2, maximum: 50 }), reason: Type.String({ minLength: 1, maxLength: 4000 }) }),
+    async execute(_id, params, _signal, _update, ctx) {
+      if (!ctx.hasUI) throw new Error("crew_extend_review_rounds requires interactive confirmation");
+      const confirmed = await ctx.ui.confirm("Extend this task's review rounds?", `Extend '${params.id}' from ${params.currentMax} to ${params.newMax} without rewriting history? Reason: ${params.reason}`);
+      if (!confirmed) return text({ extended: false, reason: "user declined" });
+      return text(await extendReviewRounds(CONFIG, params.id, params));
+    },
+  });
+
+  pi.registerTool({
+    name: "crew_retire_agent",
+    label: "Retire Stalled Agent",
+    description: "Confirmed retirement of a provably absent agent or an explicitly terminated one. Preserves all dirty/unintegrated change work; a clean dead reviewer can release its isolated resources for replacement.",
+    parameters: Type.Object({ id: Type.String(), reason: Type.String({ minLength: 1, maxLength: 4000 }), terminate: Type.Optional(Type.Boolean({ default: false })) }),
+    async execute(_id, params, _signal, _update, ctx) {
+      if (!ctx.hasUI) throw new Error("crew_retire_agent requires interactive confirmation");
+      const confirmed = await ctx.ui.confirm("Retire task agent?", `Retire '${params.id}'${params.terminate ? " by explicitly terminating it" : " only if absent"}; preserve unintegrated change work? Reason: ${params.reason}`);
+      if (!confirmed) return text({ retired: false, reason: "user declined" });
+      return text(await retireTaskAgent(CONFIG, params.id, params));
+    },
+  });
+
+  pi.registerTool({
+    name: "crew_state_lock",
+    label: "Diagnose/Recover State Lock",
+    description: "Diagnose the verifiable local state-lock owner. Recovery is separately confirmed, never steals an active lock, and requires a durable reason.",
+    parameters: Type.Object({ recover: Type.Optional(Type.Boolean({ default: false })), reason: Type.Optional(Type.String({ minLength: 1, maxLength: 4000 })) }),
+    async execute(_id, params, _signal, _update, ctx) {
+      if (!params.recover) return text(await stateLockStatus());
+      if (!params.reason) throw new Error("crew_state_lock recovery requires a reason");
+      if (!ctx.hasUI) throw new Error("crew_state_lock recovery requires interactive confirmation");
+      const confirmed = await ctx.ui.confirm("Recover stale Crewdeck state lock?", `Never steal an active lock; quarantine only a dead or grace-aged unverifiable lock? Reason: ${params.reason}`);
+      if (!confirmed) return text({ recovered: false, reason: "user declined" });
+      return text(await recoverStateLock({ reason: params.reason }));
+    },
+  });
+
+  pi.registerTool({
+    name: "crew_observe_prs",
+    label: "Observe Published PRs",
+    description: "Read-only authenticated exact-identity rescan of Crewdeck PRs. Closed-unmerged, lookup failures, and unknown states are never treated as merged.",
+    parameters: Type.Object({ id: Type.Optional(Type.String()) }),
+    async execute(_id, params) { return text(await observePublishedPullRequests(CONFIG, params.id)); },
+  });
+
+  pi.registerTool({
     name: "crew_reconcile_merged_pr",
     label: "Reconcile Externally Merged PR",
     description:
@@ -347,10 +416,27 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     // Reconcile the durable report inbox at every start so an event that arrived
     // while Pi was stopped, or was missed by fs.watch, still wakes the orchestrator.
     completionWake.start();
+    const observe = async () => {
+      try {
+        const observations = await observePublishedPullRequests(CONFIG);
+        for (const item of observations) {
+          if (item.newlyObserved && item.status === "merged-awaiting-confirmed-reconciliation") {
+            pi.sendUserMessage(`CREWDECK PR MERGED: exact published PR ${item.url} for ${item.id} was observed merged. Ask the user before calling crew_reconcile_merged_pr; observation alone is not reconciliation.`, { deliverAs: "followUp" });
+          }
+        }
+      } catch (error: any) {
+        activeContext?.ui.notify(`Crewdeck PR observer: ${error.message}`, "warning");
+      }
+    };
+    await observe();
+    const config = await loadConfig(CONFIG);
+    observerTimer = setInterval(observe, config.prObserverIntervalSeconds * 1000);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
     completionWake.stop();
+    if (observerTimer) clearInterval(observerTimer);
+    observerTimer = undefined;
     activeContext = undefined;
     reportWatcher?.close();
     reportWatcher = undefined;
