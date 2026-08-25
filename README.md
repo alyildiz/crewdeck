@@ -66,6 +66,7 @@ If the default `crewdeck.json` is missing, Crewdeck fails with a `missing_config
     "my-project": {
       "path": "/absolute/path/to/my-project",
       "base": "main",
+      "baseRemote": "upstream",
       "trustProjectResources": true,
       "verify": ["npm test"]
     }
@@ -74,6 +75,10 @@ If the default `crewdeck.json` is missing, Crewdeck fails with a `missing_config
 ```
 
 `maxReviewRounds` is 1–10 and defaults to 3 for historical configs.
+
+`baseRemote` is optional and is never inferred. When present, every batch containing a `change` task reads only the configured `base` branch from that named remote, fetches it with tags and `FETCH_HEAD` updates disabled, verifies that the advertised ref stayed stable during the fetch, proves the fetched object is the exact commit, and pins one SHA for the whole batch. Each `crew/<id>` change branch is then created from that SHA. The task state exposes `baseSource` (`mode`, `remote`, and full ref) plus `baseSha`.
+
+If `baseRemote` is absent, existing projects retain local-base behavior; Crewdeck resolves and pins the configured local branch at spawn time. A remote lookup, fetch, ref, race, or object-verification failure aborts before any change worktree is created. Fetching may add Git objects, but Crewdeck does not update the primary checkout's branch, working tree, local base ref, remote-tracking refs, tags, or `FETCH_HEAD`.
 
 [`config/kinds.yml`](config/kinds.yml) separates permissions from model selection:
 
@@ -132,7 +137,7 @@ Existing installations that already have local `crewdeck.json` and `config/profi
 Register a project:
 
 ```bash
-bin/crewdeck project add my-project /absolute/path/to/project --base main --trust
+bin/crewdeck project add my-project /absolute/path/to/project --base main --base-remote upstream --trust
 ```
 
 Launch only through the restricted launcher:

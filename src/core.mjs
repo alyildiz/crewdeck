@@ -406,7 +406,91 @@ async function validateProject(project) {
   if (path.resolve(root) !== project.path) {
     throw new CrewdeckError(`${project.path} is not the project worktree root`, "invalid_project");
   }
-  await git(project.path, ["rev-parse", "--verify", project.base]);
+  if (typeof project.base !== "string" || !project.base.trim()) {
+    throw new CrewdeckError(`Project ${project.name}: base must name a branch`, "invalid_project");
+  }
+  try {
+    await git(project.path, ["check-ref-format", "--branch", project.base]);
+  } catch {
+    throw new CrewdeckError(`Project ${project.name}: base is not a valid branch name`, "invalid_project");
+  }
+  if (project.baseRemote !== undefined &&
+      (typeof project.baseRemote !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(project.baseRemote))) {
+    throw new CrewdeckError(`Project ${project.name}: baseRemote is not a valid explicit remote name`, "invalid_project");
+  }
+  if (project.baseRemote === undefined) await git(project.path, ["rev-parse", "--verify", `${project.base}^{commit}`]);
+}
+
+function parseRemoteBranch(output, ref) {
+  const lines = output.split("\n").filter(Boolean);
+  if (lines.length !== 1) return undefined;
+  const match = lines[0].match(/^([0-9a-f]{40})\t(.+)$/);
+  return match?.[2] === ref ? match[1] : undefined;
+}
+
+async function resolveChangeBase(project) {
+  const ref = `refs/heads/${project.base}`;
+  if (project.baseRemote === undefined) {
+    const sha = (await git(project.path, ["rev-parse", "--verify", `${project.base}^{commit}`])).stdout;
+    if (!/^[0-9a-f]{40}$/.test(sha)) {
+      throw new CrewdeckError(`Cannot prove local base ${project.base} as an exact commit`, "local_base_unproven");
+    }
+    return { sha, source: { mode: "local", ref } };
+  }
+
+  const remote = project.baseRemote;
+  try {
+    await git(project.path, ["remote", "get-url", remote]);
+  } catch (error) {
+    throw new CrewdeckError(`Configured base remote '${remote}' is unavailable`, "base_remote_unavailable", {
+      error: error.message,
+    });
+  }
+  const readAdvertisedSha = async () => {
+    let output;
+    try {
+      output = (await git(project.path, ["ls-remote", "--refs", "--heads", remote, ref], { timeout: 30_000 })).stdout;
+    } catch (error) {
+      throw new CrewdeckError(`Cannot read configured remote base ${remote}/${project.base}`, "remote_base_unavailable", {
+        error: error.message,
+      });
+    }
+    const sha = parseRemoteBranch(output, ref);
+    if (!sha) {
+      throw new CrewdeckError(`Configured remote base ${remote}/${project.base} is missing or ambiguous`, "remote_base_ref_unproven");
+    }
+    return sha;
+  };
+
+  const advertisedBefore = await readAdvertisedSha();
+  try {
+    await git(project.path, [
+      "fetch",
+      "--no-tags",
+      "--no-write-fetch-head",
+      "--refmap=",
+      remote,
+      ref,
+    ], { timeout: 120_000 });
+  } catch (error) {
+    throw new CrewdeckError(`Fetch failed for configured remote base ${remote}/${project.base}`, "remote_base_fetch_failed", {
+      error: error.message,
+    });
+  }
+  const advertisedAfter = await readAdvertisedSha();
+  if (advertisedAfter !== advertisedBefore) {
+    throw new CrewdeckError(`Configured remote base ${remote}/${project.base} changed during fetch`, "remote_base_changed");
+  }
+  try {
+    const commit = (await git(project.path, ["rev-parse", "--verify", `${advertisedAfter}^{commit}`])).stdout;
+    if (commit !== advertisedAfter) throw new Error("advertised object is not the exact commit");
+  } catch (error) {
+    throw new CrewdeckError(`Fetched SHA for ${remote}/${project.base} cannot be proven as a commit`, "remote_base_sha_unproven", {
+      sha: advertisedAfter,
+      error: error.message,
+    });
+  }
+  return { sha: advertisedAfter, source: { mode: "remote", remote, ref } };
 }
 
 function validateTaskInput(task, config) {
@@ -659,6 +743,7 @@ async function bindWorkerEnvironment(paneId, record) {
     CREWDECK_TASK_WORKFLOW: record.workflow || "direct",
     CREWDECK_TASK_BRANCH: record.branch || "",
     CREWDECK_TASK_BASE: record.base || "",
+    CREWDECK_TASK_BASE_SHA: record.baseSha || "",
     CREWDECK_PARENT_TASK_ID: record.parentTaskId || "",
     CREWDECK_REVIEWED_HEAD: record.reviewedHead || "",
     CREWDECK_MAX_REVIEW_ROUNDS: record.maxReviewRounds || 3,
@@ -754,7 +839,7 @@ async function ensureProjectWorkspace(project) {
   return { id, owned: true };
 }
 
-async function createOne(config, project, sourceWorkspace, task, profileName) {
+async function createOne(config, project, sourceWorkspace, task, profileName, changeBase) {
   validateTaskInput(task, config);
   const kind = config.kinds[task.kind];
   task.maxReviewRounds = config.maxReviewRounds;
@@ -813,6 +898,9 @@ async function createOne(config, project, sourceWorkspace, task, profileName) {
       throw error;
     }
   } else {
+    if (!changeBase || !/^[0-9a-f]{40}$/.test(changeBase.sha)) {
+      throw new CrewdeckError("Exact change base was not proven before worktree creation", "base_sha_unproven");
+    }
     created = await runJson("herdr", [
       "worktree",
       "create",
@@ -821,7 +909,7 @@ async function createOne(config, project, sourceWorkspace, task, profileName) {
       "--branch",
       branch,
       "--base",
-      project.base,
+      changeBase.sha,
       "--path",
       worktree,
       "--label",
@@ -862,6 +950,17 @@ async function createOne(config, project, sourceWorkspace, task, profileName) {
     );
   }
   const checkoutHead = (await git(worktree, ["rev-parse", "HEAD"])).stdout;
+  if (!detached) {
+    const checkoutBranch = (await git(worktree, ["branch", "--show-current"])).stdout;
+    if (checkoutBranch !== branch || checkoutHead !== changeBase.sha) {
+      throw new CrewdeckError("Created change worktree does not match its pinned base SHA and owned branch", "change_worktree_unproven", {
+        expectedBranch: branch,
+        actualBranch: checkoutBranch,
+        expectedHead: changeBase.sha,
+        actualHead: checkoutHead,
+      });
+    }
+  }
 
   const record = {
     id: task.id,
@@ -882,6 +981,7 @@ async function createOne(config, project, sourceWorkspace, task, profileName) {
     ...(task.candidateVersion ? { candidateVersion: task.candidateVersion } : {}),
     maxReviewRounds: config.maxReviewRounds,
     base: project.base,
+    ...(!detached ? { baseSource: changeBase.source, baseSha: changeBase.sha } : {}),
     repo: project.path,
     worktree,
     workspaceId,
@@ -970,11 +1070,14 @@ export async function spawnBatch(configPath, { project: projectName, tasks, prof
   });
   const project = resolveProject(config, projectName);
   await validateProject(project);
+  const changeBase = tasks.some((task) => config.kinds[task.kind].lifecycle === "change")
+    ? await resolveChangeBase(project)
+    : undefined;
   const sourceWorkspace = await ensureProjectWorkspace(project);
 
-  // Each task receives its own worktree workspace; independent Pi startups happen concurrently.
+  // Resolve one immutable change base per batch, then start independent Pi workers concurrently.
   const results = await Promise.allSettled(
-    tasks.map((task) => createOne(config, project, sourceWorkspace, task, profile)),
+    tasks.map((task) => createOne(config, project, sourceWorkspace, task, profile, changeBase)),
   );
   return results.map((result, index) =>
     result.status === "fulfilled"
@@ -1138,7 +1241,7 @@ async function gitSnapshot(record) {
   try {
     const status = (await git(record.worktree, ["status", "--porcelain"])).stdout;
     const head = (await git(record.worktree, ["rev-parse", "HEAD"])).stdout;
-    const baseHead = (await git(record.repo, ["rev-parse", record.base])).stdout;
+    const baseHead = record.baseSha || (await git(record.repo, ["rev-parse", record.base])).stdout;
     const aheadRaw = (await git(record.worktree, ["rev-list", "--count", `${baseHead}..${head}`])).stdout;
     return { available: true, clean: status === "", status, head, baseHead, ahead: Number(aheadRaw) };
   } catch (error) {
@@ -1295,9 +1398,10 @@ export async function getTaskDiff(configPath, id) {
   }
   const snapshot = await gitSnapshot(record);
   if (!snapshot.available) throw new CrewdeckError("Build worktree is unavailable", "missing_worktree");
-  const range = `${record.base}...HEAD`;
+  const baseRef = record.baseSha || record.base;
+  const range = `${baseRef}...HEAD`;
   const [commits, stat, patchResult] = await Promise.all([
-    git(record.worktree, ["log", "--oneline", "--decorate=no", `${record.base}..HEAD`]),
+    git(record.worktree, ["log", "--oneline", "--decorate=no", `${baseRef}..HEAD`]),
     git(record.worktree, ["diff", "--stat", range]),
     git(record.worktree, ["diff", "--no-ext-diff", "--unified=3", range], { maxBuffer: 4 * 1024 * 1024 }),
   ]);
@@ -3565,6 +3669,7 @@ export async function addProject(configPath, name, projectPath, options = {}) {
   config.projects[name] = {
     path: absolute,
     base,
+    ...(options.baseRemote ? { baseRemote: options.baseRemote } : {}),
     trustProjectResources: options.trustProjectResources === true,
     verify: options.verify || [],
   };

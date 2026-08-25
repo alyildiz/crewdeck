@@ -101,20 +101,23 @@ test("resolves only explicitly configured kind skills", async () => {
   assert.deepEqual(config.kinds.build.skills, []);
 });
 
-test("registers a Git project with explicit trust", async () => {
+test("registers a Git project with explicit trust and base remote", async () => {
   const { configPath, repo } = await fixture();
   const project = await addProject(configPath, "demo", repo, {
     base: "main",
+    baseRemote: "upstream",
     trustProjectResources: true,
   });
   assert.deepEqual(project, {
     path: repo,
     base: "main",
+    baseRemote: "upstream",
     trustProjectResources: true,
     verify: [],
   });
   const persisted = JSON.parse(await readFile(configPath, "utf8"));
   assert.equal(persisted.projects.demo.path, repo);
+  assert.equal(persisted.projects.demo.baseRemote, "upstream");
   assert.equal(typeof persisted.profilesFile, "string");
   assert.equal(persisted.profiles, undefined);
 });

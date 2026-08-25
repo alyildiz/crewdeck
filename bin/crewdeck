@@ -31,7 +31,7 @@ function usage() {
 
 Usage:
   crewdeck config
-  crewdeck project add <name> <path> [--base <branch>] [--trust]
+  crewdeck project add <name> <path> [--base <branch>] [--base-remote <remote>] [--trust]
   crewdeck project list
   crewdeck spawn <project> <kind> <id> <task> [--profile <name>] [--reviewed-pr]
   crewdeck review <parent-id> <review-id> <reviewed-head> <task> [--profile <name>]
@@ -75,6 +75,7 @@ try {
       } else if (args[0] === "add" && args[1] && args[2]) {
         result = await addProject(configPath, args[1], args[2], {
           base: option("--base"),
+          baseRemote: option("--base-remote"),
           trustProjectResources: args.includes("--trust"),
         });
       } else {
