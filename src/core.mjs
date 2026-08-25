@@ -204,11 +204,24 @@ async function withStateLock(fn) {
   }
 }
 
+export function defaultConfigPath() {
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "crewdeck.json");
+}
+
 async function loadRawConfig(configPath) {
   const absolute = path.resolve(configPath);
   try {
     return { absolute, config: JSON.parse(await readFile(absolute, "utf8")) };
   } catch (error) {
+    if (error.code === "ENOENT" && absolute === defaultConfigPath()) {
+      throw new CrewdeckError(
+        `Default Crewdeck config not found at ${absolute}. Bootstrap the local runtime config from the tracked templates:\n` +
+          `  cp crewdeck.json.example crewdeck.json\n` +
+          `  cp config/profiles.yml.example config/profiles.yml\n` +
+          `Then edit crewdeck.json (register this machine's projects) and config/profiles.yml (providers/models available here).`,
+        "missing_config",
+      );
+    }
     throw new CrewdeckError(`Cannot read ${absolute}: ${error.message}`, "invalid_config");
   }
 }

@@ -25,7 +25,7 @@ A build has one of two workflows:
 
 ## Intake and dispatch
 
-1. Resolve a registered project from `crewdeck.json`; ask one short question only if ambiguous/unregistered.
+1. Resolve a registered project from the local `crewdeck.json` (git-ignored runtime copy bootstrapped from the tracked `crewdeck.json.example`; profiles likewise from `config/profiles.yml.example`); ask one short question only if ambiguous/unregistered.
 2. Split by independently testable outcome. Serialize semantic dependencies and external-state mutations.
 3. Give every task a stable lowercase id, configured kind, concrete outcome, acceptance criteria, constraints, and exclusions.
 4. Use only a profile whose `allowedKinds` includes the kind. Never silently substitute a model.

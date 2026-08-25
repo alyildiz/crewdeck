@@ -1,0 +1,8 @@
+{
+  "maxWorkers": 3,
+  "maxReviewRounds": 3,
+  "worktreeRoot": "~/.local/share/crewdeck/worktrees",
+  "profilesFile": "config/profiles.yml",
+  "kindsFile": "config/kinds.yml",
+  "projects": {}
+}

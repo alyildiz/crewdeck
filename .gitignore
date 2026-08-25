@@ -1,3 +1,6 @@
 node_modules/
 *.log
 .DS_Store
+# Local runtime configuration (machine-specific); bootstrap from the tracked *.example templates
+crewdeck.json
+config/profiles.yml

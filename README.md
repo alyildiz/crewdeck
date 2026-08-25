@@ -34,7 +34,26 @@ State uses atomic writes under a lock. Candidate versions, collection acknowledg
 
 ## Configuration
 
-[`crewdeck.json`](crewdeck.json) owns projects and review limits:
+Configuration is split between **tracked templates** and **machine-local runtime files**:
+
+| Tracked in Git | Local runtime file (git-ignored) | Owns |
+| --- | --- | --- |
+| `crewdeck.json.example` | `crewdeck.json` | projects, worker/review limits, file pointers |
+| `config/profiles.yml.example` | `config/profiles.yml` | provider/model/thinking profiles |
+| `config/kinds.yml` | — (shared, tracked) | lifecycles, contracts, permissions, tools |
+
+`crewdeck.json` and `config/profiles.yml` are machine-specific (local project paths, locally available providers/models) and are never committed. Bootstrap a fresh checkout:
+
+```bash
+cp crewdeck.json.example crewdeck.json
+cp config/profiles.yml.example config/profiles.yml
+```
+
+then edit `crewdeck.json` to register this machine's projects and `config/profiles.yml` to name providers/models that actually exist in this machine's Pi model registry with usable authentication. The templates contain no local paths or projects; the profiles template uses placeholders and makes no claim that any provider or model is universally available.
+
+If the default `crewdeck.json` is missing, Crewdeck fails with a `missing_config` error that prints exactly those copy commands. An explicitly configured `CREWDECK_CONFIG` pointing at a missing file keeps the plain `Cannot read` error without bootstrap guidance.
+
+`crewdeck.json` owns projects and review limits:
 
 ```json
 {
@@ -89,7 +108,7 @@ kinds:
 
 A review contract must be a shell-free, read-only report. Crewdeck requires exactly one configured review kind when spawning a reviewer. Every worker starts with discovered skills disabled; only explicit kind skills are loaded.
 
-[`config/profiles.yml`](config/profiles.yml) maps profile names to provider/model/thinking and `allowedKinds`. Profiles never grant permissions. Pi's effective model registry and provider authentication remain runtime authority.
+`config/profiles.yml` (local copy of the tracked `config/profiles.yml.example`) maps profile names to provider/model/thinking and `allowedKinds`. Profiles never grant permissions. Pi's effective model registry and provider authentication remain runtime authority.
 
 ## Setup
 
@@ -100,6 +119,15 @@ npm install
 npm test
 npm run check
 ```
+
+Bootstrap the local runtime config from the tracked templates (see [Configuration](#configuration)):
+
+```bash
+cp crewdeck.json.example crewdeck.json
+cp config/profiles.yml.example config/profiles.yml
+```
+
+Existing installations that already have local `crewdeck.json` and `config/profiles.yml` keep them unchanged; the files are now git-ignored instead of tracked.
 
 Register a project:
 

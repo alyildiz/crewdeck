@@ -1,0 +1,27 @@
+# Crewdeck profile template (tracked in Git; never edit this file in place).
+#
+# Bootstrap the machine-local runtime config:
+#   cp config/profiles.yml.example config/profiles.yml
+#
+# config/profiles.yml is machine-local and git-ignored. The provider/model
+# values below are placeholders: providers and models are NOT universally
+# available. Replace them with entries that actually exist in this machine's
+# Pi model registry and for which provider authentication is configured
+# (for example a local vLLM endpoint, or a cloud provider you are
+# authenticated for). Crewdeck validates names and thinking levels at load
+# time; Pi's model registry and provider auth remain runtime authority.
+#
+# Profiles never grant tools, skills, or filesystem permissions; those come
+# from config/kinds.yml. Every allowedKinds entry must name a kind
+# configured there.
+version: 1
+
+# Profile used when a task does not name one explicitly.
+defaultProfile: default
+
+profiles:
+  default:
+    provider: replace-with-your-provider
+    model: replace-with-your-model
+    thinking: medium
+    allowedKinds: [scout, review, build]
