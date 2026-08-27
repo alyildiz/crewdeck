@@ -13,6 +13,7 @@ import {
   getPendingResultIds,
   getStatus,
   forwardReviewFindings,
+  forwardBaseAdvance,
   extendReviewRounds,
   getTaskDiff,
   loadConfig,
@@ -303,6 +304,16 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "crew_forward_base_advance",
+    label: "Forward Base Advance",
+    description: "Controlled delivery of one durable, locally classified base advance to the affected sole writer. Unknown evidence fails closed; compatible published PRs are preserved without rewriting.",
+    parameters: Type.Object({ id: Type.String(), sequence: Type.Optional(Type.Integer({ minimum: 1 })), wait: Type.Optional(Type.Boolean({ default: false })) }),
+    async execute(_id, params) {
+      return text(await forwardBaseAdvance(CONFIG, params.id, params.sequence, { wait: params.wait }));
+    },
+  });
+
+  pi.registerTool({
     name: "crew_reconcile_merged_pr",
     label: "Reconcile Externally Merged PR",
     description:
@@ -420,8 +431,11 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
       try {
         const observations = await observePublishedPullRequests(CONFIG);
         for (const item of observations) {
-          if (item.newlyObserved && item.status === "merged-awaiting-confirmed-reconciliation") {
-            pi.sendUserMessage(`CREWDECK PR MERGED: exact published PR ${item.url} for ${item.id} was observed merged. Ask the user before calling crew_reconcile_merged_pr; observation alone is not reconciliation.`, { deliverAs: "followUp" });
+          if ((item.newlyObserved || item.baseAdvances?.length) && item.status === "merged-awaiting-confirmed-reconciliation") {
+            const affected = item.baseAdvances?.length
+              ? ` Durable base advances: ${item.baseAdvances.map((entry: any) => `${entry.taskId}#${entry.sequence}:${entry.classification}`).join(", ")}. Inspect status and use crew_forward_base_advance; unknown classifications fail closed.`
+              : " No eligible same-project change task was affected.";
+            pi.sendUserMessage(`CREWDECK PR MERGED: exact published PR ${item.url} for ${item.id} was observed merged. Ask the user before calling crew_reconcile_merged_pr; observation alone is not reconciliation.${affected}`, { deliverAs: "followUp" });
           }
         }
       } catch (error: any) {

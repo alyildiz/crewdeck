@@ -10,6 +10,7 @@ import {
   getTaskDiff,
   loadConfig,
   forwardReviewFindings,
+  forwardBaseAdvance,
   extendReviewRounds,
   mergeTask,
   observePublishedPullRequests,
@@ -50,6 +51,7 @@ Usage:
   crewdeck publish <build-id> --remote <name> --repo <owner/name> --base <branch> --head <branch> --title <text> --body <text>
   crewdeck reconcile-verdict <build-id> --confirm --reason <text>
   crewdeck observe-prs [build-id]
+  crewdeck forward-base-advance <build-id> [--sequence <n>] [--wait]
   crewdeck extend-review-rounds <build-id> --current-max <n> --new-max <n> --confirm --reason <text>
   crewdeck retire-agent <id> --confirm --reason <text> [--terminate]
   crewdeck lock-status
@@ -172,6 +174,10 @@ try {
       break;
     case "observe-prs":
       result = await observePublishedPullRequests(configPath, args[0]);
+      break;
+    case "forward-base-advance":
+      if (!args[0]) throw new Error("forward-base-advance requires <build-id> [--sequence <n>] [--wait]");
+      result = await forwardBaseAdvance(configPath, args[0], option("--sequence") ? Number(option("--sequence")) : undefined, { wait: args.includes("--wait") });
       break;
     case "extend-review-rounds":
       if (!args[0] || !args.includes("--confirm") || !option("--reason") || !option("--current-max") || !option("--new-max")) {

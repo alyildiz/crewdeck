@@ -24,8 +24,9 @@ export function taskLines(tasks) {
     const round = task.workflow === "reviewed-pr" ? ` r${task.reviewRound || 0}/${task.currentMaxReviewRounds || task.maxReviewRounds || "?"}` : "";
     const pr = task.pr?.number ? ` PR#${task.pr.number}:${task.pr.state}` : "";
     const gate = task.workflow === "reviewed-pr" ? ` checks=${task.checkState || "?"} verdict=${task.verdictState || "?"}` : "";
+    const baseAdvance = task.baseAdvanceState ? ` base#${task.baseAdvanceState.sequence}:${task.baseAdvanceState.classification}/${task.baseAdvanceState.status}` : "";
     const action = task.nextAction ? ` → ${task.nextAction}` : "";
-    return `${task.id.padEnd(24)} ${status.padEnd(20)} agent=${live.padEnd(8)} ${ahead}${round}${pr}${gate}${action}`;
+    return `${task.id.padEnd(24)} ${status.padEnd(20)} agent=${live.padEnd(8)} ${ahead}${round}${pr}${gate}${baseAdvance}${action}`;
   });
 }
 

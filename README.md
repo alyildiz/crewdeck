@@ -269,6 +269,16 @@ An ambiguous verdict dispatch can be handled only by separately confirmed `recon
 
 Crewdeck polls exact published PR identities at startup and every configured interval. It records `open`, `closed-unmerged`, `lookup-failed`, `unknown`, or `merged-awaiting-confirmed-reconciliation`; only the last produces a completion notification, and still requires the separate confirmed reconciliation. Polling never merges or mutates GitHub.
 
+### Cross-task base advances
+
+When the authenticated observer **newly** verifies an exact published PR as merged, it fans out only to nonterminal `change` tasks in the same registered project and on the same configured base. The merged source task, reports/reviewers, terminal tasks, and other projects are excluded. Each affected task receives one durable event keyed by source task, prior pinned base SHA, and merge commit SHA; repeated scans and restarts cannot create another event, while a later merge commit creates a new monotonic sequence.
+
+Classification uses only local Git objects and does not touch a worktree: Crewdeck proves the pinned base is an ancestor of the merge commit, then uses `git merge-tree` against the affected exact HEAD. Results are `compatible`, `conflicting`, or fail-closed `unknown`. Status and `/crew` show the latest sequence/classification/delivery state and next action.
+
+`crew_forward_base_advance` (CLI: `forward-base-advance`) is the only delivery path. It never addresses review agents. Unknown evidence is refused. A compatible task with an already published exact-SHA PR is settled as `compatible-preserved` without rebasing, pushing, rewriting the PR, or invalidating its approval. Otherwise Crewdeck durably reserves delivery, advances the task's pinned/required base, marks prior collected reviews and approvals stale, and prompts only the recorded sole writer to preserve work, rebase/adapt, rerun verification, commit, and submit a new exact-HEAD candidate when its SHA changes. An absent writer produces `awaiting-writer` and must be safely resumed first; an uncertain agent state fails closed. Interrupted prompt delivery is explicitly at-least-once on retry, while completed or preserved events are idempotent.
+
+A refreshed reviewed-PR candidate cannot be reviewed or published until its HEAD contains the required advanced base. Existing candidate, review, verdict-comment, and publication history remains immutable; a changed SHA requires a new candidate and exact-SHA review. The observer itself never rebases, mutates worktrees, pushes, stacks reviewers, or reuses stale approval.
+
 ## Externally merged PR reconciliation
 
 If a published reviewed PR is merged outside Crewdeck, the build deliberately remains `running` until an operator invokes the separately confirmed `crew_reconcile_merged_pr` (CLI: `reconcile-merged-pr ... --confirm`). Reconciliation is read-only toward GitHub and both base branches: it never pushes, merges, marks ready, updates a base ref, or claims local integration.
@@ -296,7 +306,7 @@ The project extension exposes:
 - `crew_spawn_review`
 - `crew_status`, `crew_collect_results`, `crew_diff`
 - `crew_steer`, `crew_forward_review`, `crew_resume_build`
-- `crew_publish_pr`, read-only `crew_observe_prs`
+- `crew_publish_pr`, read-only `crew_observe_prs`, controlled `crew_forward_base_advance`
 - separately confirmed `crew_reconcile_verdict`, `crew_extend_review_rounds`, `crew_retire_agent`, and state-lock recovery
 - separately confirmed `crew_reconcile_merged_pr`
 - existing `crew_prepare_integration`, confirmed `crew_merge`, confirmed `crew_abandon`, confirmed `crew_reconcile_orphan_report`, and confirmed `crew_cleanup`
@@ -325,6 +335,8 @@ bin/crewdeck publish reviewed-fix \
   --title "Reviewed fix" --body "Draft PR body"
 # only after that exact PR was merged externally on GitHub:
 bin/crewdeck observe-prs reviewed-fix
+# for each affected task reported by the observer/status:
+bin/crewdeck forward-base-advance another-build --sequence 1
 bin/crewdeck reconcile-merged-pr reviewed-fix --confirm
 
 # Recovery/control

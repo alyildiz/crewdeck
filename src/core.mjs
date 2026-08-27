@@ -1342,6 +1342,12 @@ export async function spawnReview(
   if (snapshot.head !== reviewedHead) {
     throw new CrewdeckError("Build HEAD changed after candidate submission", "stale_candidate");
   }
+  if (parent.requiredBaseSha) {
+    const requiredBase = await gitAncestorProof(parent.repo, parent.requiredBaseSha, reviewedHead);
+    if (!requiredBase.available || !requiredBase.ancestor) {
+      throw new CrewdeckError("Candidate does not contain the required advanced base", "base_refresh_required", requiredBase);
+    }
+  }
   if (snapshot.ahead < 1) throw new CrewdeckError("Candidate has no commits ahead of base", "no_commits");
   const agent = await liveAgent(parent);
   if (agent.available && !["idle", "done"].includes(agent.state)) {
@@ -1462,8 +1468,17 @@ function operatorStatus(record, candidates, observedStatus, config) {
   const review = candidate && (record.reviewInbox || []).filter((item) => item.reviewedHead === candidate.head).at(-1);
   const intent = candidate && Array.isArray(record.publication?.verdictComments)
     ? record.publication.verdictComments.find((item) => item.headSha === candidate.head) : undefined;
+  const baseAdvance = (record.baseAdvances || []).at(-1);
   let nextAction = "inspect task";
-  if (record.agentRetirement?.status === "retiring") nextAction = "retry confirmed agent retirement with the same reason";
+  if (baseAdvance?.status === "pending") {
+    nextAction = baseAdvance.classification === "unknown"
+      ? "resolve unknown base compatibility; do not mutate or forward"
+      : baseAdvance.classification === "compatible" && (record.publication?.number || baseAdvance.requiresRefresh === false)
+        ? "settle compatible base advance without rewriting the candidate"
+        : `forward base advance ${baseAdvance.sequence} to the sole writer`;
+  } else if (baseAdvance?.status === "awaiting-writer") nextAction = "resume the sole writer, then forward the pending base advance";
+  else if (baseAdvance?.status === "forwarding") nextAction = "retry base-advance forwarding; delivery may be at-least-once";
+  else if (record.agentRetirement?.status === "retiring") nextAction = "retry confirmed agent retirement with the same reason";
   else if (record.prObservation?.status === "merged-awaiting-confirmed-reconciliation") nextAction = "confirm merged PR reconciliation";
   else if (["ambiguous", "dispatched"].includes(intent?.status)) nextAction = "confirm verdict reconciliation";
   else if (record.reviewEscalation && !record.reviewEscalation.resolvedAt) nextAction = "confirm review-round extension or decide escalation";
@@ -1477,6 +1492,10 @@ function operatorStatus(record, candidates, observedStatus, config) {
     pr: record.publication?.number ? { number: record.publication.number, url: record.publication.url, state: record.prObservation?.status || "unobserved" } : undefined,
     verdictState: intent?.status || (review?.verdict ? `review-${review.verdict}` : "none"),
     checkState: record.publication?.checks?.status || "not-checked",
+    baseAdvanceState: baseAdvance ? {
+      sequence: baseAdvance.sequence, status: baseAdvance.status, classification: baseAdvance.classification,
+      priorBaseSha: baseAdvance.priorBaseSha, newBaseSha: baseAdvance.newBaseSha, sourceTaskId: baseAdvance.sourceTaskId,
+    } : undefined,
     observerState: record.prObservation?.status || "not-observed" };
 }
 
@@ -1560,6 +1579,14 @@ export async function getStatus(configPath, id) {
           else if (review?.validAtCollection) observedStatus = `review-${review.verdict}`;
           else observedStatus = "candidate";
         }
+      }
+      const pendingBaseRefresh = (record.baseAdvances || []).some((item) =>
+        ["forwarding", "forwarded"].includes(item.status) && item.requiresRefresh !== false &&
+        item.newBaseSha === record.requiredBaseSha
+      );
+      if (pendingBaseRefresh && snapshot.available) {
+        const refreshed = await gitAncestorProof(record.repo, record.requiredBaseSha, snapshot.head);
+        if (!refreshed.available || !refreshed.ancestor) observedStatus = "base-refresh-required";
       }
       if (["cleanup-pending", "cleanup-failed"].includes(record.mergeReconciliation?.status)) {
         observedStatus = `merge-${record.mergeReconciliation.status}`;
@@ -2601,6 +2628,12 @@ export async function publishPullRequest(
   if (!snapshot.available || !snapshot.clean) {
     throw new CrewdeckError("Publication refuses a dirty or unavailable build worktree", "dirty_worktree", snapshot);
   }
+  if (record.requiredBaseSha) {
+    const requiredBase = await gitAncestorProof(record.repo, record.requiredBaseSha, snapshot.head);
+    if (!requiredBase.available || !requiredBase.ancestor) {
+      throw new CrewdeckError("Current candidate does not contain the required advanced base", "base_refresh_required", requiredBase);
+    }
+  }
   if (snapshot.ahead < 1) throw new CrewdeckError("Current candidate has no commits ahead of base", "no_commits");
   const candidate = journal.available ? journal.journal.candidates.at(-1) : undefined;
   if (!candidate) throw new CrewdeckError("No reviewed-pr candidate is available", "missing_candidate");
@@ -3278,6 +3311,93 @@ async function listedWorktrees(repoPath) {
   );
 }
 
+const BASE_ADVANCE_TERMINAL = new Set(["cleaned", "integrated", "abandoned", "pr-merged", "orphan-reconciled", "retired"]);
+
+async function classifyBaseAdvance(record, newBaseSha) {
+  if (!/^[0-9a-f]{40}$/.test(record.baseSha || "") || !/^[0-9a-f]{40}$/.test(newBaseSha || "")) {
+    return { classification: "unknown", reason: "missing exact pinned or advanced base commit" };
+  }
+  const behind = await gitAncestorProof(record.repo, record.baseSha, newBaseSha);
+  if (!behind.available || !behind.ancestor) {
+    return { classification: "unknown", reason: behind.error || "pinned base is not proven ancestral to the merged base" };
+  }
+  const snapshot = await gitSnapshot(record);
+  if (!snapshot.available) return { classification: "unknown", reason: snapshot.error || "build HEAD is unavailable" };
+  const contains = await gitAncestorProof(record.repo, newBaseSha, snapshot.head);
+  if (contains.available && contains.ancestor) {
+    return { classification: "compatible", requiresRefresh: false, headSha: snapshot.head, evidence: "advanced base already contained by build HEAD" };
+  }
+  try {
+    await git(record.repo, ["merge-tree", "--write-tree", "--merge-base", record.baseSha, newBaseSha, snapshot.head]);
+    return { classification: "compatible", requiresRefresh: true, headSha: snapshot.head, evidence: "git merge-tree completed without conflicts" };
+  } catch (error) {
+    if (error.code === "command_failed" && Number(error.details?.exitCode) === 1) {
+      return { classification: "conflicting", requiresRefresh: true, headSha: snapshot.head, evidence: "git merge-tree reported conflicts" };
+    }
+    return { classification: "unknown", headSha: snapshot.head, reason: error.message };
+  }
+}
+
+async function recordBaseAdvanceFanout(source, outcome) {
+  if (outcome.status !== "merged-awaiting-confirmed-reconciliation" || !/^[0-9a-f]{40}$/.test(outcome.mergeCommit || "")) return [];
+  const snapshot = await loadState();
+  const eligible = Object.values(snapshot.tasks).filter((record) => {
+    const lifecycle = record.lifecycle || (record.kind === "scout" ? "report" : "change");
+    return record.id !== source.id && record.project === source.project && lifecycle === "change" &&
+      record.base === source.base && !record.cleanedAt && !BASE_ADVANCE_TERMINAL.has(record.status) &&
+      record.baseSha !== outcome.mergeCommit;
+  });
+  const classified = [];
+  for (const record of eligible) classified.push({ record, result: await classifyBaseAdvance(record, outcome.mergeCommit) });
+  const created = [];
+  await withStateLock(async () => {
+    const next = await loadState();
+    for (const { record, result } of classified) {
+      const stored = next.tasks[record.id];
+      if (!stored || stored.id === source.id || stored.project !== source.project || stored.lifecycle === "report" ||
+          stored.cleanedAt || BASE_ADVANCE_TERMINAL.has(stored.status)) continue;
+      stored.baseAdvances ||= [];
+      const identity = `${source.id}:${stored.baseSha || "unknown"}:${outcome.mergeCommit}`;
+      const existing = stored.baseAdvances.find((item) => item.identity === identity);
+      if (existing) {
+        if (["pending", "awaiting-writer"].includes(existing.status) && result.headSha && existing.headSha !== result.headSha) {
+          Object.assign(existing, {
+            classification: result.classification,
+            ...(result.requiresRefresh !== undefined ? { requiresRefresh: result.requiresRefresh } : {}),
+            headSha: result.headSha,
+            ...(result.evidence ? { evidence: result.evidence, reason: undefined } : {}),
+            ...(result.reason ? { reason: result.reason, evidence: undefined } : {}),
+            reclassifiedAt: new Date().toISOString(),
+          });
+          created.push({ taskId: stored.id, ...existing, updated: true });
+        }
+        continue;
+      }
+      const notification = {
+        sequence: stored.baseAdvances.length + 1,
+        identity,
+        status: "pending",
+        sourceTaskId: source.id,
+        sourcePrNumber: outcome.number,
+        sourcePrUrl: outcome.url,
+        priorBaseSha: stored.baseSha,
+        newBaseSha: outcome.mergeCommit,
+        mergedAt: outcome.mergedAt,
+        observedAt: outcome.observedAt,
+        classification: result.classification,
+        ...(result.requiresRefresh !== undefined ? { requiresRefresh: result.requiresRefresh } : {}),
+        ...(result.headSha ? { headSha: result.headSha } : {}),
+        ...(result.evidence ? { evidence: result.evidence } : {}),
+        ...(result.reason ? { reason: result.reason } : {}),
+      };
+      stored.baseAdvances.push(notification);
+      created.push({ taskId: stored.id, ...notification });
+    }
+    if (created.length) await saveState(next);
+  });
+  return created;
+}
+
 export async function observePublishedPullRequests(configPath, id) {
   const config = await loadConfig(configPath);
   const state = await loadState();
@@ -3297,6 +3417,10 @@ export async function observePublishedPullRequests(configPath, id) {
         pr?.baseRefName === publication.base && pr?.headRefOid === publication.headSha && pr?.isCrossRepository === false &&
         exactHeadRepository(pr?.headRepository, pr?.headRepositoryOwner, publication.repo);
       if (!identityExact) throw new CrewdeckError("Observed PR identity diverges from durable publication", "observer_identity_mismatch", pr);
+      if (pr.state === "MERGED" && (!/^[0-9a-f]{40}$/.test(pr.mergeCommit?.oid || "") ||
+          typeof pr.mergedAt !== "string" || Number.isNaN(Date.parse(pr.mergedAt)))) {
+        throw new CrewdeckError("Merged observation lacks exact merge identity", "observer_identity_mismatch", pr);
+      }
       const stateName = pr.state === "MERGED" ? "merged-awaiting-confirmed-reconciliation"
         : pr.state === "OPEN" ? "open" : pr.state === "CLOSED" ? "closed-unmerged" : "unknown";
       outcome = { status: stateName, observedAt: new Date().toISOString(), repo: publication.repo,
@@ -3318,9 +3442,111 @@ export async function observePublishedPullRequests(configPath, id) {
         await saveState(next);
       }
     });
-    observations.push({ id: record.id, ...outcome, newlyObserved });
+    // Run fanout on every exact merged observation. Durable identities deduplicate it;
+    // this closes the crash window between persisting the PR observation and fanout.
+    const baseAdvances = outcome.status === "merged-awaiting-confirmed-reconciliation"
+      ? await recordBaseAdvanceFanout(record, outcome) : [];
+    observations.push({ id: record.id, ...outcome, newlyObserved, baseAdvances });
   }
   return observations;
+}
+
+export async function forwardBaseAdvance(configPath, id, sequence, { wait = false } = {}) {
+  const config = await loadConfig(configPath);
+  const state = await loadState();
+  const record = state.tasks[id];
+  if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
+  record.lifecycle ||= config.kinds[record.kind]?.lifecycle || "change";
+  if (record.lifecycle !== "change" || record.cleanedAt || BASE_ADVANCE_TERMINAL.has(record.status)) {
+    throw new CrewdeckError("Only a nonterminal change task can receive a base advance", "invalid_base_advance_task");
+  }
+  const notification = sequence === undefined
+    ? (record.baseAdvances || []).filter((item) => item.status === "pending" || item.status === "awaiting-writer").at(-1)
+    : (record.baseAdvances || []).find((item) => item.sequence === sequence);
+  if (!notification) throw new CrewdeckError("Pending base-advance notification is missing", "base_advance_missing");
+  if (notification.status === "forwarded" || notification.status === "compatible-preserved") {
+    return { forwarded: notification.status === "forwarded", preserved: notification.status === "compatible-preserved", idempotent: true, notification };
+  }
+  if (notification.classification === "unknown") {
+    throw new CrewdeckError("Base compatibility is unknown; resolve Git evidence before notifying a writer", "base_compatibility_unknown", notification);
+  }
+  const currentSnapshot = await gitSnapshot(record);
+  if (!currentSnapshot.available || (notification.headSha && currentSnapshot.head !== notification.headSha)) {
+    throw new CrewdeckError("Build HEAD changed after base compatibility classification; wait for observer reclassification", "base_advance_stale", {
+      classifiedHead: notification.headSha, currentHead: currentSnapshot.head, error: currentSnapshot.error,
+    });
+  }
+  if (notification.classification === "compatible" && (record.publication?.number || notification.requiresRefresh === false)) {
+    await withStateLock(async () => {
+      const next = await loadState();
+      const item = (next.tasks[id]?.baseAdvances || []).find((entry) => entry.identity === notification.identity);
+      if (!item) throw new CrewdeckError("Base advance changed", "state_changed");
+      item.status = "compatible-preserved";
+      item.settledAt ||= new Date().toISOString();
+      await saveState(next);
+    });
+    return {
+      forwarded: false, preserved: true, idempotent: false,
+      reason: record.publication?.number
+        ? "published exact-SHA PR is locally compatible and is not rewritten"
+        : "build HEAD already contains the advanced base; candidate and approval identity do not require refresh",
+    };
+  }
+  const agent = await liveAgent(record);
+  if (!agent.available) {
+    if (!provenMissingAgent(agent)) throw new CrewdeckError("Cannot prove sole writer state", "agent_state_unknown", agent);
+    await withStateLock(async () => {
+      const next = await loadState();
+      const item = (next.tasks[id]?.baseAdvances || []).find((entry) => entry.identity === notification.identity);
+      if (!item) throw new CrewdeckError("Base advance changed", "state_changed");
+      item.status = "awaiting-writer";
+      item.writerAbsentAt ||= new Date().toISOString();
+      await saveState(next);
+    });
+    return { forwarded: false, writerAbsent: true, nextAction: "resume the sole writer, then forward this base advance" };
+  }
+  const attemptedAt = new Date().toISOString();
+  await withStateLock(async () => {
+    const next = await loadState();
+    const stored = next.tasks[id];
+    const item = (stored?.baseAdvances || []).find((entry) => entry.identity === notification.identity);
+    if (!item) throw new CrewdeckError("Base advance changed", "state_changed");
+    item.status = "forwarding";
+    item.forwardAttempts = (item.forwardAttempts || 0) + 1;
+    item.forwardAttemptedAt = attemptedAt;
+    stored.baseShaHistory ||= [];
+    if (stored.baseSha !== notification.newBaseSha) {
+      stored.baseShaHistory.push({ sha: stored.baseSha, supersededBy: notification.newBaseSha, at: attemptedAt, sourceTaskId: notification.sourceTaskId });
+      stored.baseSha = notification.newBaseSha;
+    }
+    stored.requiredBaseSha = notification.newBaseSha;
+    for (const review of stored.reviewInbox || []) {
+      if (review.validAtCollection) {
+        review.validAtCollection = false;
+        review.staleAt ||= attemptedAt;
+        review.staleReason = "pinned base advanced";
+      }
+    }
+    await saveState(next);
+  });
+  const message = [
+    `CREWDECK BASE ADVANCE ${notification.sequence}: ${notification.sourceTaskId} merged and the pinned base advanced from ${notification.priorBaseSha} to ${notification.newBaseSha}.`,
+    `Local deterministic classification: ${notification.classification}.`,
+    "Adapt/rebase the existing sole-writer branch without discarding work, rerun verification, commit any resulting changes, and submit a new exact-HEAD candidate when the SHA changes. Prior candidate review/approval is stale. Do not reuse it.",
+  ].join("\n");
+  const args = ["agent", "prompt", record.agentName, message];
+  if (wait) args.push("--wait", "--timeout", "600000");
+  await runJson("herdr", args, { timeout: wait ? 610_000 : 15_000 });
+  const forwardedAt = new Date().toISOString();
+  await withStateLock(async () => {
+    const next = await loadState();
+    const item = (next.tasks[id]?.baseAdvances || []).find((entry) => entry.identity === notification.identity);
+    if (!item) throw new CrewdeckError("Base advance changed after delivery", "state_changed");
+    item.status = "forwarded";
+    item.forwardedAt ||= forwardedAt;
+    await saveState(next);
+  });
+  return { forwarded: true, idempotent: false, taskId: id, sequence: notification.sequence, forwardedAt };
 }
 
 function mergedReconciliationResult(record, idempotent) {
