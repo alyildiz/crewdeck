@@ -5,7 +5,9 @@ export function createCompletionWakeController({
   onError = () => {},
   debounceMs = 250,
   retryMs = 2000,
+  maxBatch = 20,
 }) {
+  if (!Number.isSafeInteger(maxBatch) || maxBatch < 1) throw new Error("maxBatch must be a positive safe integer");
   let active = false;
   let delivering = false;
   let rescanRequested = false;
@@ -31,12 +33,14 @@ export function createCompletionWakeController({
     try {
       const pending = await listPending();
       if (!active) return;
-      const ready = pending.filter((id) => !announced.has(id));
+      const unannounced = pending.filter((id) => !announced.has(id));
+      const ready = unannounced.slice(0, maxBatch);
       if (ready.length === 0) return;
-      await sendFollowUp(ready);
+      await sendFollowUp(ready, { remaining: Math.max(0, unannounced.length - ready.length), totalPending: pending.length });
       if (!active) return;
       ready.forEach((id) => announced.add(id));
       onReady(ready, pending);
+      if (unannounced.length > ready.length) schedule(0);
     } catch (error) {
       if (active) {
         onError(error);

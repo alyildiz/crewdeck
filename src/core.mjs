@@ -138,15 +138,15 @@ function publicTaskRecord(record) {
 }
 
 function publicTaskReport(result) {
-  if (!result.available) return result;
+  if (!result.available) return { available: false, state: result.state || "error", error: safeDiagnosticText(result.error, 512) };
   const { token: _token, ...report } = result.report;
-  return { available: true, path: result.path, report };
+  return { available: true, ref: `result:${report.taskId}`, report };
 }
 
 function publicCandidateJournal(result) {
-  if (!result.available) return result;
+  if (!result.available) return { available: false, state: result.state || "error", error: safeDiagnosticText(result.error, 512) };
   const { token: _token, ...journal } = result.journal;
-  return { available: true, path: result.path, journal };
+  return { available: true, ref: `candidates:${journal.taskId}`, journal };
 }
 
 async function run(command, args, options = {}) {
@@ -1489,7 +1489,7 @@ function operatorStatus(record, candidates, observedStatus, config) {
   else if (record.publication?.number) nextAction = "observe external PR; reconciliation remains confirmed";
   return { nextAction, reviewRound: candidate?.version || 0, currentMaxReviewRounds: reviewRoundMax(record, config),
     escalation: record.reviewEscalation,
-    pr: record.publication?.number ? { number: record.publication.number, url: record.publication.url, state: record.prObservation?.status || "unobserved" } : undefined,
+    pr: record.publication?.number ? { number: record.publication.number, url: record.publication.url, headSha: record.publication.headSha, state: record.prObservation?.status || "unobserved" } : undefined,
     verdictState: intent?.status || (review?.verdict ? `review-${review.verdict}` : "none"),
     checkState: record.publication?.checks?.status || "not-checked",
     baseAdvanceState: baseAdvance ? {
@@ -1501,8 +1501,10 @@ function operatorStatus(record, candidates, observedStatus, config) {
 
 const TERMINAL_STATUSES = new Set(["cleaned", "orphan-reconciled", "retired", "pr-merged"]);
 const STATUS_SCOPES = new Set(["active", "history", "all"]);
-const DEFAULT_STATUS_LIMIT = 20;
-const MAX_STATUS_LIMIT = 50;
+export const COLLECTION_LIMIT = 20;
+export const DEFAULT_STATUS_LIMIT = 20;
+export const MAX_STATUS_LIMIT = 50;
+export const STATUS_OUTPUT_BUDGET_BYTES = 128 * 1024;
 
 function normalizeStatusRecord(config, storedRecord) {
   const record = {
@@ -1527,6 +1529,14 @@ function boundedStatusText(value, maxLength = 256) {
   return `${value.slice(0, maxLength - 3)}...`;
 }
 
+function safeDiagnosticText(value, maxLength = 512) {
+  if (typeof value !== "string") return undefined;
+  const redacted = value
+    .replace(/\b[0-9a-f]{40,}\b/gi, "[redacted-digest]")
+    .replace(/\b[A-Za-z0-9_-]{48,}\b/g, "[redacted-token]");
+  return boundedStatusText(redacted, maxLength);
+}
+
 function statusInteger(value) {
   return Number.isSafeInteger(value) ? value : undefined;
 }
@@ -1539,10 +1549,12 @@ function latestRelevantReview(reviewInbox, head) {
   return undefined;
 }
 
-function projectFileAvailability(result, durablePath) {
-  return result.available
-    ? { available: true, path: boundedStatusText(result.path, 1024), state: "available" }
-    : { available: false, path: boundedStatusText(durablePath, 1024), state: result.state === "missing" ? "missing" : "error" };
+function projectResultAvailability(result, ref) {
+  const projected = result.available
+    ? { available: true, ref, state: "available" }
+    : { available: false, ref, state: result.state === "missing" ? "missing" : "error" };
+  if (!result.available && result.error) projected.error = safeDiagnosticText(result.error, 512);
+  return projected;
 }
 
 function projectLatestPrObservation(observation) {
@@ -1563,14 +1575,22 @@ function projectLatestPrObservation(observation) {
 function terminalStatusSummary(record) {
   const summary = {
     id: boundedStatusText(record.id, 24),
-    project: boundedStatusText(record.project, 128),
+    project: boundedStatusText(record.project, 64),
     kind: boundedStatusText(record.kind, 32),
     status: boundedStatusText(record.status, 64),
     observedStatus: boundedStatusText(record.status, 64),
   };
-  const terminalAt =
-    record.cleanedAt || record.orphanReconciledAt || record.prMergedAt || record.agentRetiredAt || record.abandonedAt;
+  const terminalAt = record.status === "pr-merged"
+    ? record.mergedReconciledAt
+    : record.cleanedAt || record.orphanReconciledAt || record.agentRetiredAt || record.abandonedAt;
   if (terminalAt) summary.terminalAt = boundedStatusText(terminalAt, 64);
+  if (record.status === "pr-merged" && record.prMergedAt) summary.remotePrMergedAt = boundedStatusText(record.prMergedAt, 64);
+  if (record.lifecycle === "report" || record.resultCollectedAt) summary.result = { ref: `result:${record.id}` };
+  if (record.workflow === "reviewed-pr") summary.candidates = { ref: `candidates:${record.id}` };
+  if (record.publication?.number) summary.publication = {
+    number: statusInteger(record.publication.number),
+    url: boundedStatusText(record.publication.url, 256),
+  };
   return summary;
 }
 
@@ -1745,7 +1765,7 @@ async function computeStatusSummaryRecord(config, state, storedRecord) {
   const operator = operatorStatus(record, candidates, observedStatus, config);
   const summary = {
     id: boundedStatusText(record.id, 24),
-    project: boundedStatusText(record.project, 128),
+    project: boundedStatusText(record.project, 64),
     kind: boundedStatusText(record.kind, 32),
     workflow: boundedStatusText(record.workflow, 32),
     status: boundedStatusText(record.status, 64),
@@ -1759,10 +1779,11 @@ async function computeStatusSummaryRecord(config, state, storedRecord) {
     agent: {
       available: Boolean(agent.available),
       state: boundedStatusText(agent.state, 80),
+      ...(!agent.available && agent.error ? { error: safeDiagnosticText(agent.error, 256) } : {}),
     },
     git: snapshot.available
       ? { available: true, clean: Boolean(snapshot.clean), ahead: statusInteger(snapshot.ahead), head: boundedStatusText(snapshot.head, 64) }
-      : { available: false },
+      : { available: false, ...(snapshot.error ? { error: safeDiagnosticText(snapshot.error, 256) } : {}) },
   };
   if (operator.escalation) {
     summary.escalation = {
@@ -1776,14 +1797,15 @@ async function computeStatusSummaryRecord(config, state, storedRecord) {
   if (operator.pr) {
     summary.pr = {
       number: statusInteger(operator.pr.number),
-      url: boundedStatusText(operator.pr.url, 512),
+      url: boundedStatusText(operator.pr.url, 256),
+      headSha: boundedStatusText(operator.pr.headSha, 64),
       state: boundedStatusText(operator.pr.state, 80),
     };
   }
-  if (result) summary.result = projectFileAvailability(result, taskReportPath(record.id));
+  if (result) summary.result = projectResultAvailability(result, `result:${record.id}`);
   if (candidates) {
     summary.candidates = {
-      ...projectFileAvailability(candidates, taskCandidatesPath(record.id)),
+      ...projectResultAvailability(candidates, `candidates:${record.id}`),
       count: candidates.available ? candidates.journal.candidates.length : 0,
     };
     if (latestCandidate) {
@@ -1813,13 +1835,6 @@ async function computeStatusSummaryRecord(config, state, storedRecord) {
       };
     }
   }
-  if (record.publication?.number) {
-    summary.publication = {
-      number: statusInteger(record.publication.number),
-      url: boundedStatusText(record.publication.url, 512),
-      headSha: boundedStatusText(record.publication.headSha, 64),
-    };
-  }
   if (operator.baseAdvanceState) {
     summary.baseAdvanceState = {
       sequence: statusInteger(operator.baseAdvanceState.sequence),
@@ -1832,15 +1847,24 @@ async function computeStatusSummaryRecord(config, state, storedRecord) {
   }
   if (record.mergeReconciliation) {
     summary.mergeReconciliation = { status: boundedStatusText(record.mergeReconciliation.status, 80) };
-    if (statusInteger(record.mergeReconciliation.prNumber) !== undefined) {
-      summary.mergeReconciliation.prNumber = record.mergeReconciliation.prNumber;
-    }
-    if (record.mergeReconciliation.mergeCommit !== undefined) {
-      summary.mergeReconciliation.mergeCommit = boundedStatusText(record.mergeReconciliation.mergeCommit, 64);
-    }
+    if (statusInteger(record.mergeReconciliation.prNumber) !== undefined) summary.mergeReconciliation.prNumber = record.mergeReconciliation.prNumber;
+    if (record.mergeReconciliation.mergeCommit !== undefined) summary.mergeReconciliation.mergeCommit = boundedStatusText(record.mergeReconciliation.mergeCommit, 64);
+    if (record.mergeReconciliation.lastError) summary.mergeReconciliation.error = safeDiagnosticText(record.mergeReconciliation.lastError);
+    if (record.mergeReconciliation.reason) summary.mergeReconciliation.reason = safeDiagnosticText(record.mergeReconciliation.reason);
+    if (record.mergeReconciliation.code) summary.mergeReconciliation.errorCode = boundedStatusText(record.mergeReconciliation.code, 80);
   }
+  if (record.error) summary.error = safeDiagnosticText(record.error);
+  if (record.errorCode) summary.errorCode = boundedStatusText(record.errorCode, 80);
+  if (record.abandonmentReason) summary.reason = safeDiagnosticText(record.abandonmentReason);
   const observation = projectLatestPrObservation(record.prObservation);
-  if (observation) summary.prObservation = observation;
+  if (observation) {
+    if (operator.pr) {
+      delete observation.url;
+      delete observation.number;
+      delete observation.headSha;
+    }
+    summary.prObservation = observation;
+  }
   return summary;
 }
 
@@ -1852,6 +1876,50 @@ export async function getStatus(configPath, id) {
   return Promise.all(records.map((storedRecord) => computeStatusRecord(config, state, storedRecord)));
 }
 
+export async function getTaskStatus(configPath, id) {
+  if (!TASK_ID_RE.test(id || "")) throw new CrewdeckError("A valid task id is required", "invalid_task_id");
+  const config = await loadConfig(configPath);
+  const state = await loadState();
+  const record = state.tasks[id];
+  if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
+  return computeStatusSummaryRecord(config, state, record);
+}
+
+function statusGeneration(records, scope) {
+  return createHash("sha256").update(`${scope}\n${records.map((record) => `${record.id}:${record.status}:${record.cleanedAt || ""}`).join("\n")}`).digest("hex").slice(0, 16);
+}
+
+function encodeStatusCursor(scope, generation, after) {
+  return Buffer.from(JSON.stringify({ v: 1, scope, generation, after }), "utf8").toString("base64url");
+}
+
+function decodeStatusCursor(cursor, scope, generation, records) {
+  if (cursor === undefined || cursor === null || cursor === "" || cursor === 0) return 0;
+  if (Number.isSafeInteger(cursor) && cursor >= 0) return cursor;
+  if (typeof cursor !== "string") throw new CrewdeckError("Status cursor must be an opaque cursor string", "invalid_status_cursor");
+  try {
+    const decoded = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (decoded.v !== 1 || decoded.scope !== scope || decoded.generation !== generation || typeof decoded.after !== "string") {
+      throw new Error("cursor scope or generation changed");
+    }
+    const index = records.findIndex((record) => record.id === decoded.after);
+    if (index < 0) throw new Error("cursor task no longer exists in this scope");
+    return index + 1;
+  } catch (error) {
+    throw new CrewdeckError(`Status cursor is stale or invalid; restart pagination: ${error.message}`, "invalid_status_cursor");
+  }
+}
+
+export async function getStatusView(configPath, { id, mode = "bounded", scope, limit, cursor } = {}) {
+  if (!["bounded", "diagnostic"].includes(mode)) throw new CrewdeckError("Status mode must be bounded or diagnostic", "invalid_status_mode");
+  if (id && (scope !== undefined || limit !== undefined || cursor !== undefined)) {
+    throw new CrewdeckError("Status id is incompatible with summary pagination arguments", "invalid_status_arguments");
+  }
+  if (mode === "diagnostic" && !id) throw new CrewdeckError("Diagnostic status requires exactly one task id", "invalid_status_arguments");
+  if (id) return mode === "diagnostic" ? getStatus(configPath, id) : getTaskStatus(configPath, id);
+  return getStatusSummary(configPath, { scope, limit, cursor });
+}
+
 export async function getStatusSummary(
   configPath,
   { scope = "active", limit = DEFAULT_STATUS_LIMIT, cursor = 0 } = {},
@@ -1859,11 +1927,8 @@ export async function getStatusSummary(
   if (!STATUS_SCOPES.has(scope)) {
     throw new CrewdeckError("Status scope must be active, history, or all", "invalid_status_scope");
   }
-  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_STATUS_LIMIT) {
-    throw new CrewdeckError(`Status limit must be an integer from 1 to ${MAX_STATUS_LIMIT}`, "invalid_status_limit");
-  }
-  if (!Number.isInteger(cursor) || cursor < 0) {
-    throw new CrewdeckError("Status cursor must be a non-negative integer offset", "invalid_status_cursor");
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_STATUS_LIMIT) {
+    throw new CrewdeckError(`Status limit must be a safe integer from 1 to ${MAX_STATUS_LIMIT}`, "invalid_status_limit");
   }
   const config = await loadConfig(configPath);
   const state = await loadState();
@@ -1877,20 +1942,37 @@ export async function getStatusSummary(
       const rightId = String(right.id || "");
       return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
     });
-  const selected = records.slice(cursor, cursor + limit);
+  const generation = statusGeneration(records, scope);
+  const offset = decodeStatusCursor(cursor, scope, generation, records);
+  const selected = records.slice(offset, offset + limit);
   const tasks = await Promise.all(selected.map((record) => computeStatusSummaryRecord(config, state, record)));
-  const nextCursor = cursor + tasks.length < records.length ? cursor + tasks.length : null;
-  return {
+  const nextCursor = offset + tasks.length < records.length
+    ? encodeStatusCursor(scope, generation, selected.at(-1).id)
+    : null;
+  const page = {
     scope,
-    pagination: {
-      cursor,
-      limit,
-      returned: tasks.length,
-      total: records.length,
-      nextCursor,
-    },
+    pagination: { cursor: cursor || null, generation, limit, returned: tasks.length, total: records.length, nextCursor },
     tasks,
   };
+  const bytes = Buffer.byteLength(JSON.stringify(page, null, 2), "utf8");
+  if (bytes > STATUS_OUTPUT_BUDGET_BYTES) {
+    throw new CrewdeckError(`Serialized status page exceeds the ${STATUS_OUTPUT_BUDGET_BYTES}-byte budget`, "status_output_budget", { bytes });
+  }
+  return page;
+}
+
+export async function getPendingBaseAdvanceKeys(configPath) {
+  await loadConfig(configPath);
+  const state = await loadState();
+  const pending = [];
+  for (const record of Object.values(state.tasks)) {
+    for (const item of record.baseAdvances || []) {
+      if (["pending", "awaiting-writer", "forwarding"].includes(item.status)) {
+        pending.push({ taskId: record.id, sequence: item.sequence, classification: boundedStatusText(item.classification, 80), status: boundedStatusText(item.status, 80) });
+      }
+    }
+  }
+  return pending.sort((left, right) => left.taskId.localeCompare(right.taskId) || left.sequence - right.sequence);
 }
 
 export async function getPendingResultIds(configPath) {
@@ -1918,7 +2000,14 @@ export async function getPendingResultIds(configPath) {
       if (result.available) pending.push(record.id);
     }
   }
-  return pending.sort();
+  return pending.sort((left, right) => {
+    const [leftId, leftVersion] = left.split("@candidate-");
+    const [rightId, rightVersion] = right.split("@candidate-");
+    if (leftId !== rightId) return leftId < rightId ? -1 : 1;
+    if (leftVersion === undefined) return -1;
+    if (rightVersion === undefined) return 1;
+    return Number(leftVersion) - Number(rightVersion);
+  });
 }
 
 export async function getTaskDiff(configPath, id) {
@@ -1973,10 +2062,51 @@ export async function promptTask(configPath, id, message, { wait = false } = {})
   return runJson("herdr", args, { timeout: wait ? 610_000 : 15_000 });
 }
 
+function collectionTaskProjection(record, observedStatus = record.status) {
+  return {
+    id: boundedStatusText(record.id, 24),
+    project: boundedStatusText(record.project, 128),
+    kind: boundedStatusText(record.kind, 32),
+    lifecycle: boundedStatusText(record.lifecycle, 16),
+    workflow: boundedStatusText(record.workflow, 32),
+    status: boundedStatusText(record.status, 64),
+    observedStatus: boundedStatusText(observedStatus, 80),
+    cleanup: boundedStatusText(record.cleanup, 32),
+  };
+}
+
+export async function readResultDetail(configPath, key) {
+  const config = await loadConfig(configPath);
+  const match = String(key || "").match(/^([a-z][a-z0-9-]{0,23})(?:@candidate-([1-9][0-9]*))?$/);
+  if (!match) throw new CrewdeckError("A result id or exact candidate inbox key is required", "invalid_inbox_key");
+  const [, id, versionText] = match;
+  const version = versionText ? Number(versionText) : undefined;
+  if (version !== undefined && !Number.isSafeInteger(version)) throw new CrewdeckError("Candidate version must be a safe integer", "invalid_inbox_key");
+  const state = await loadState();
+  const record = state.tasks[id];
+  if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
+  const normalized = normalizeStatusRecord(config, record);
+  if (version !== undefined) {
+    const journal = await readCandidateJournal(normalized);
+    if (!journal.available) throw new CrewdeckError(journal.error || "Candidate journal is missing", "missing_candidate");
+    const candidate = journal.journal.candidates.find((item) => item.version === version);
+    if (!candidate) throw new CrewdeckError(`Candidate v${version} does not exist`, "missing_candidate");
+    return { inboxKey: key, task: collectionTaskProjection(normalized), candidate: { ...candidate } };
+  }
+  const result = await readTaskReport(normalized);
+  if (!result.available) throw new CrewdeckError(result.error || "Task result is missing", "missing_result");
+  const { token: _token, ...report } = result.report;
+  return { inboxKey: id, task: collectionTaskProjection(normalized), result: { available: true, ref: `result:${id}`, report } };
+}
+
 export async function collectResults(configPath, ids, { cleanupReports, cleanupScouts } = {}) {
+  if (ids !== undefined && !Array.isArray(ids)) throw new CrewdeckError("ids must be an array", "invalid_inbox_keys");
+  if (ids?.length > COLLECTION_LIMIT) throw new CrewdeckError(`At most ${COLLECTION_LIMIT} inbox keys may be collected`, "too_many_inbox_keys");
+  if (ids && new Set(ids).size !== ids.length) throw new CrewdeckError("Duplicate inbox keys are not allowed", "duplicate_inbox_key");
+  const pending = ids?.length ? null : await getPendingResultIds(configPath);
+  const selectedKeys = ids?.length ? ids : pending.slice(0, COLLECTION_LIMIT);
   const config = await loadConfig(configPath);
   const state = await loadState();
-  const selectedKeys = ids?.length ? ids : await getPendingResultIds(configPath);
   const collected = [];
   const candidateAcks = new Map();
   const resultAcks = new Map();
@@ -1989,6 +2119,9 @@ export async function collectResults(configPath, ids, { cleanupReports, cleanupS
     if (!match) throw new CrewdeckError(`Invalid inbox key '${key}'`, "invalid_inbox_key");
     const [, id, requestedVersionText] = match;
     const requestedVersion = requestedVersionText ? Number(requestedVersionText) : undefined;
+    if (requestedVersion !== undefined && !Number.isSafeInteger(requestedVersion)) {
+      throw new CrewdeckError("Candidate version must be a safe integer", "invalid_inbox_key");
+    }
     const record = state.tasks[id];
     if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
     record.kind ||= record.profile === "scout" ? "scout" : "build";
@@ -2000,25 +2133,22 @@ export async function collectResults(configPath, ids, { cleanupReports, cleanupS
 
     if (record.workflow === "reviewed-pr") {
       const journal = await readCandidateJournal(record);
-      if (journal.available) {
-        const upper = requestedVersion ?? journal.journal.candidates.length;
-        if (upper > journal.journal.candidates.length) {
-          throw new CrewdeckError(`Candidate v${upper} does not exist`, "missing_candidate");
-        }
-        for (const candidate of journal.journal.candidates) {
-          if (candidate.version <= (record.candidateCollectedVersion || 0) || candidate.version > upper) continue;
-          const candidateKey = `${id}@candidate-${candidate.version}`;
-          if (seenCandidates.has(candidateKey)) continue;
+      if (requestedVersion === undefined && journal.available && journal.journal.candidates.length > (record.candidateCollectedVersion || 0)) {
+        throw new CrewdeckError(`Build '${id}' has pending candidate events; use an exact key such as ${id}@candidate-${(record.candidateCollectedVersion || 0) + 1}`, "exact_candidate_key_required");
+      }
+      if (requestedVersion !== undefined) {
+        if (!journal.available) throw new CrewdeckError(journal.error || "Candidate journal is missing", "missing_candidate");
+        const candidate = journal.journal.candidates.find((item) => item.version === requestedVersion);
+        if (!candidate) throw new CrewdeckError(`Candidate v${requestedVersion} does not exist`, "missing_candidate");
+        const expectedVersion = Math.max(record.candidateCollectedVersion || 0, candidateAcks.get(id) || 0) + 1;
+        if (candidate.version < expectedVersion) throw new CrewdeckError(`Inbox event '${key}' was already collected`, "inbox_event_collected");
+        if (candidate.version > expectedVersion) throw new CrewdeckError(`Collect ${id}@candidate-${expectedVersion} first; candidate acknowledgements are sequential`, "candidate_sequence_required");
+        const candidateKey = `${id}@candidate-${candidate.version}`;
+        if (!seenCandidates.has(candidateKey)) {
           seenCandidates.add(candidateKey);
-          collected.push({
-            inboxKey: candidateKey,
-            task: publicTaskRecord(record),
-            candidate: { ...candidate },
-          });
+          collected.push({ inboxKey: candidateKey, task: collectionTaskProjection(record, "candidate-submitted"), candidate: { ...candidate } });
           candidateAcks.set(id, Math.max(candidateAcks.get(id) || 0, candidate.version));
         }
-      } else if (requestedVersion !== undefined) {
-        throw new CrewdeckError(journal.error || "Candidate journal is missing", "missing_candidate");
       }
     } else if (requestedVersion !== undefined) {
       throw new CrewdeckError("Only reviewed-pr builds have candidate inbox events", "invalid_inbox_key");
@@ -2027,11 +2157,15 @@ export async function collectResults(configPath, ids, { cleanupReports, cleanupS
     if (requestedVersion !== undefined || seenResults.has(id)) continue;
     seenResults.add(id);
     const result = await readTaskReport(record);
-    if (!result.available) continue;
+    if (!result.available) {
+      if (ids?.length) throw new CrewdeckError(result.error || `Inbox event '${id}' is not available`, "missing_result");
+      continue;
+    }
+    if (record.resultCollectedAt && ids?.length) throw new CrewdeckError(`Inbox event '${id}' was already collected`, "inbox_event_collected");
     const collectedAt = record.resultCollectedAt || new Date().toISOString();
     record.resultCollectedAt = collectedAt;
     resultAcks.set(id, collectedAt);
-    const item = { task: publicTaskRecord(record), result: publicTaskReport(result) };
+    const item = { inboxKey: id, task: collectionTaskProjection(record, record.lifecycle === "report" ? "report-ready" : "candidate"), result: publicTaskReport(result) };
     collected.push(item);
 
     if (record.contract === "review") {
@@ -2102,13 +2236,24 @@ export async function collectResults(configPath, ids, { cleanupReports, cleanupS
         item.task.status === "cleaned"
       ) continue;
       try {
-        item.cleanup = await cleanupTask(configPath, item.task.id);
+        const cleaned = await cleanupTask(configPath, item.task.id);
+        item.cleanup = { ok: true, status: boundedStatusText(cleaned.status, 64), cleanedAt: boundedStatusText(cleaned.cleanedAt, 64) };
       } catch (error) {
         item.cleanup = { ok: false, error: error.message, code: error.code };
       }
     }
   }
-  return collected;
+  if (ids?.length) return collected;
+  return {
+    items: collected,
+    pagination: {
+      limit: COLLECTION_LIMIT,
+      returned: collected.length,
+      pendingBefore: pending.length,
+      remaining: Math.max(0, pending.length - selectedKeys.length),
+      hasMore: pending.length > selectedKeys.length,
+    },
+  };
 }
 
 export async function forwardReviewFindings(configPath, reviewId, { wait = false } = {}) {
@@ -3726,6 +3871,7 @@ export async function observePublishedPullRequests(configPath, id) {
 }
 
 export async function forwardBaseAdvance(configPath, id, sequence, { wait = false } = {}) {
+  if (sequence !== undefined && (!Number.isSafeInteger(sequence) || sequence < 1)) throw new CrewdeckError("Base-advance sequence must be a positive safe integer", "invalid_base_advance_sequence");
   const config = await loadConfig(configPath);
   const state = await loadState();
   const record = state.tasks[id];

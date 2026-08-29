@@ -38,11 +38,11 @@ After dispatch, report task names, kinds, workflows, profiles, and purposes. Do 
 
 `crew_submit_candidate` stores `build-id@candidate-N` without terminating the build. `crew_complete` still terminates direct builds, scouts, and reviewers and remains immutable for historical tasks.
 
-The completion watcher reconciles durable inbox events on writes and restart, then necessarily wakes this orchestrator with `CREWDECK COMPLETION`. On that follow-up:
+The completion watcher reconciles durable inbox events on writes and restart, then necessarily wakes this orchestrator with `CREWDECK COMPLETION`. Follow-ups contain at most 20 keys; additional chunks follow. Restart intentionally reannounces every still-pending durable key.
 
-1. Call `crew_status` with the named task ids (strip `@candidate-N` from inbox keys); an id returns that task's full durable record.
-2. Call `crew_collect_results` with the exact inbox keys from the follow-up.
-3. Treat collection as acknowledgement. Never infer completion from Herdr `idle`/`done` alone.
+1. Call bounded `crew_status` once for each named task id (strip `@candidate-N`). Never request `mode: diagnostic` in the normal completion path.
+2. Call `crew_collect_results` with exactly the inbox keys in that follow-up. The explicit-key result array contains each exact payload once; omitted-id pages use `{ items, pagination }` with `hasMore`.
+3. Treat collection as acknowledgement. Never infer completion from Herdr `idle`/`done` alone. Reviewed builds require sequential exact `build-id@candidate-N` keys; a bare build id does not collect candidate history.
 
 Report kinds configured `after-collection` close only after their durable result is collected and their immutable worktree is clean.
 
@@ -87,9 +87,9 @@ Use `crew_abandon` for a clean settled obsolete unintegrated change. It has inde
 
 Use `crew_steer` for ordinary missing requirements or conflict instructions. Use `crew_forward_review` instead for collected review findings.
 
-Status is two-level. `crew_status` without an id returns a deterministic bounded page of active/actionable tasks by default (20, maximum 50). Request `scope: history` or `scope: all` explicitly and follow the returned cursor metadata for durable history; abandonment awaiting cleanup is active. Summary records contain only bounded orchestration fields, latest candidate/relevant review plus counts, an explicit latest PR observation projection, and durable result/candidate paths. `crew_status` with an id returns the full durable diagnostic record for that task. Report and review payloads are not inlined in summaries: read the durable files at `result.path` or `candidates.path` when needed.
+`crew_status` is bounded by default. Without an id it returns active/actionable tasks (20, maximum 50); with an id it returns one targeted projection. Explicit `history`/`all` pages use opaque generation-bound cursors and fail visibly if task creation or scope movement makes a cursor stale. Safe `result:<id>` and `candidates:<id>` references replace model-facing filesystem paths. Use `crew_read_result` only for selective token-redacted reinspection of one report or exact candidate. Use `mode: diagnostic` only for explicit single-task troubleshooting, never normal completion or `/crew`. The CLI equivalent is `status --diagnostic <id>`; legacy `--summary` remains bounded. The indented serialized status boundary is hard-capped at 128 KiB.
 
-Use `crew_status` after restart; next action, current/max round, escalation, PR URL/state, verdict, checks, observer state, candidate journals, review inboxes, and reconciliation attempts are durable. The authenticated observer rescans at startup and on a bounded cadence; merged observation only notifies and never replaces confirmed reconciliation. Missing/closed-unmerged/unknown/lookup failure are never merged.
+Use bounded `crew_status` after restart; next action, current/max round, escalation, PR URL/state, verdict, checks, observer state, candidate/review counts, safe references, and reconciliation states are durable. The authenticated observer rescans at startup and on a bounded cadence; merged observation only notifies and never replaces confirmed reconciliation. Missing/closed-unmerged/unknown/lookup failure are never merged.
 
 Use separately confirmed `crew_retire_agent` with a reason only for an agent proven absent, or with explicit termination confirmation. It never discards dirty/unintegrated change work; it may close a clean dead reviewer's exact detached resources so a replacement review can run. Diagnose locks with `crew_state_lock`; confirmed recovery never steals an active PID/boot/start-time identity and records the reason. A `cleanup-failed` merged-PR attempt must be retried through the same confirmed tool, never bypassed with raw cleanup. Missing agents alone are never deletion authority.
 

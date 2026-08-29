@@ -304,16 +304,20 @@ The project extension exposes:
 
 - `crew_spawn_batch` (`workflow` may be `direct` or `reviewed-pr`)
 - `crew_spawn_review`
-- `crew_status` (bounded active summary by default; explicit paginated `history`/`all`; full single-task record with `id`), `crew_collect_results`, `crew_diff`
+- `crew_status` (bounded active or targeted summary by default; explicit paginated `history`/`all`; full single-task troubleshooting only with `mode=diagnostic`), `crew_collect_results`, explicit selective `crew_read_result`, `crew_diff`
 - `crew_steer`, `crew_forward_review`, `crew_resume_build`
 - `crew_publish_pr`, read-only `crew_observe_prs`, controlled `crew_forward_base_advance`
 - separately confirmed `crew_reconcile_verdict`, `crew_extend_review_rounds`, `crew_retire_agent`, and state-lock recovery
 - separately confirmed `crew_reconcile_merged_pr`
 - existing `crew_prepare_integration`, confirmed `crew_merge`, confirmed `crew_abandon`, confirmed `crew_reconcile_orphan_report`, and confirmed `crew_cleanup`
 
-When durable events arrive, the extension uses `pi.sendUserMessage(..., { deliverAs: "followUp" })`. The orchestrator must call status and collection; no background LLM polling occurs.
+When durable events arrive, the extension uses `pi.sendUserMessage(..., { deliverAs: "followUp" })`. Completion keys are announced in chunks of 20. Announcement memory is session-local by design: every restart reconciles and reannounces still-pending durable keys, so a delivered message can never hide an uncollected event after restart. The orchestrator calls bounded targeted status and then collection; no background LLM polling occurs. Merged-PR base-advance notices use the same 20-item chunk ceiling.
 
-Status is two-level. `crew_status` without an id returns only active/actionable tasks by default, in a deterministic page of 20. Set `scope` to `history` for terminal tasks or `all` for both, and page with `limit` (1 to 50) plus the zero-based `cursor`; pagination metadata reports returned/total/next cursor. Terminal means `cleaned`, `orphan-reconciled`, `retired`, `pr-merged`, or `abandoned` with `cleanedAt`; abandonment awaiting cleanup remains active. Every summary record is bounded to orchestration fields, latest candidate/relevant review plus counts, an explicit latest PR observation projection, and durable report/candidate paths. Payloads and historical arrays are never inlined. `crew_status` with an id remains the full durable diagnostic for that single task. Read `result.path` or `candidates.path` when details are needed. The CLI keeps full `crewdeck status [id]` output by default and exposes the same view through `crewdeck status --summary [--scope active|history|all] [--limit 1..50] [--cursor N]`.
+`crew_status` is bounded by default. With an `id` it returns one targeted token-safe projection and does not inline result payloads, candidate journals, task descriptions, or raw paths. Without an id it returns an active/actionable page of 20; `scope=history|all` and `limit` up to 50 are explicit. Returned opaque cursors bind scope and a task-membership generation, and fail visibly with `invalid_status_cursor` after creation or scope transitions instead of silently skipping work. Legacy non-negative safe-integer offsets remain accepted as best-effort input, but every new continuation is opaque. The actual indented UTF-8 Pi/CLI boundary has a 128 KiB hard budget, including Unicode and JSON escaping. Terminal summaries expose safe `result:<id>` and `candidates:<id>` references where relevant; `pr-merged.terminalAt` is local `mergedReconciledAt`, while `remotePrMergedAt` is GitHub's merge time.
+
+Full historical behavior remains available only as explicit troubleshooting: Pi uses `crew_status { id, mode: "diagnostic" }`; CLI uses `crewdeck status --diagnostic <id>`. The old CLI `--summary` flag remains a bounded no-op for compatibility, but `status [id]` now defaults safe. Raw report/candidate paths are never model-facing. Use `crew_read_result { key }` or `crewdeck read-result <key>` to selectively read one token-redacted report or one exact candidate version.
+
+`crew_collect_results` accepts at most 20 exact keys. For explicit keys, the backward-compatible result array contains each report/candidate payload exactly once plus a minimal task projection. Omitted ids return one bounded `{ items, pagination }` page with `remaining/hasMore` metadata. A reviewed build id never means all candidate versions: use sequential exact `build-id@candidate-N` keys. Duplicate, out-of-order, oversized, missing, and already-collected requests fail clearly.
 
 ## Manual CLI
 
@@ -322,7 +326,9 @@ Status is two-level. `crew_status` without an id returns only active/actionable 
 bin/crewdeck spawn my-project scout inspect "Inspect without changing code" --profile local-fast
 bin/crewdeck spawn my-project build direct-fix "Implement the accepted fix" --profile cloud-medium
 bin/crewdeck collect inspect
-bin/crewdeck status --summary --scope active --limit 20
+bin/crewdeck status --scope active --limit 20
+# explicit troubleshooting only:
+bin/crewdeck status --diagnostic direct-fix
 bin/crewdeck prepare direct-fix
 bin/crewdeck merge direct-fix --confirm
 
@@ -353,4 +359,4 @@ bin/crewdeck abandon obsolete-fix --confirm --reason "superseded"
 bin/crewdeck reconcile-orphan old-report --confirm --reason "manual removal during maintenance"
 ```
 
-Use `/crew` for active/actionable tasks, `/crew all` for durable history, and `/crew clear` to hide the widget. Do not bypass refusals by editing state or issuing raw Git, Herdr, or GitHub commands.
+Use `/crew` for a bounded active/actionable page, `/crew all [cursor]` for one bounded all-task page with visible continuation metadata, and `/crew clear` to hide the widget. Active cleanup work includes `integrated`, `report-collected`, and other records that have not reached durable cleanup terminalization. Do not bypass refusals by editing state or issuing raw Git, Herdr, or GitHub commands.

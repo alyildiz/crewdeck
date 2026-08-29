@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { getStatus, getStatusSummary } from "../src/core.mjs";
+import { getStatus, getStatusSummary, getStatusView } from "../src/core.mjs";
 
 const TOKEN = "c".repeat(48);
 const LARGE_SECRET = `SECRET-LARGE-${"x".repeat(256 * 1024)}`;
@@ -248,6 +248,7 @@ async function fixture() {
     workflow: "reviewed-pr",
     status: "pr-merged",
     prMergedAt: "2025-01-06T00:00:00.000Z",
+    mergedReconciledAt: "2025-01-06T01:00:00.000Z",
     reportToken: TOKEN,
   };
 
@@ -302,7 +303,12 @@ test("default summary is a bounded active/actionable page", async () => {
   await withStateDir(stateDir, async () => {
     const page = await getStatusSummary(configPath);
     assert.equal(page.scope, "active");
-    assert.deepEqual(page.pagination, { cursor: 0, limit: 20, returned: 2, total: 2, nextCursor: null });
+    assert.equal(page.pagination.cursor, null);
+    assert.equal(page.pagination.limit, 20);
+    assert.equal(page.pagination.returned, 2);
+    assert.equal(page.pagination.total, 2);
+    assert.equal(page.pagination.nextCursor, null);
+    assert.match(page.pagination.generation, /^[0-9a-f]{16}$/);
     assert.deepEqual(page.tasks.map((item) => item.id), ["abandoned-pending", "reviewed-build"]);
     assert.equal(page.tasks[0].observedStatus, "abandon-cleanup-pending");
     assert.ok(!page.tasks.some((item) => item.id.startsWith("history-") || item.id === "old-scout"));
@@ -316,18 +322,51 @@ test("history and all scopes paginate deterministically with bounded metadata", 
     const second = await getStatusSummary(configPath, { scope: "history", limit: 7, cursor: first.pagination.nextCursor });
     assert.deepEqual(first.tasks.map((item) => item.id), historyIds.slice(0, 7));
     assert.deepEqual(second.tasks.map((item) => item.id), historyIds.slice(7, 14));
-    assert.deepEqual(first.pagination, { cursor: 0, limit: 7, returned: 7, total: historyIds.length, nextCursor: 7 });
-    assert.deepEqual(second.pagination, { cursor: 7, limit: 7, returned: 7, total: historyIds.length, nextCursor: 14 });
+    assert.equal(first.pagination.returned, 7);
+    assert.equal(first.pagination.total, historyIds.length);
+    assert.equal(first.pagination.cursor, null);
+    assert.equal(typeof first.pagination.nextCursor, "string");
+    assert.equal(second.pagination.cursor, first.pagination.nextCursor);
+    assert.equal(second.pagination.returned, 7);
+    assert.equal(second.pagination.total, historyIds.length);
+    assert.equal(typeof second.pagination.nextCursor, "string");
 
     const maxPage = await getStatusSummary(configPath, { scope: "all", limit: 50, cursor: 0 });
     assert.equal(maxPage.pagination.returned, 50);
     assert.equal(maxPage.pagination.total, historyIds.length + 2);
-    assert.equal(maxPage.pagination.nextCursor, 50);
+    assert.equal(typeof maxPage.pagination.nextCursor, "string");
     const tail = await getStatusSummary(configPath, { scope: "all", limit: 50, cursor: 50 });
     assert.equal(tail.pagination.returned, historyIds.length + 2 - 50);
     assert.equal(tail.pagination.nextCursor, null);
     const beyond = await getStatusSummary(configPath, { scope: "history", limit: 10, cursor: 10_000 });
-    assert.deepEqual(beyond.pagination, { cursor: 10_000, limit: 10, returned: 0, total: historyIds.length, nextCursor: null });
+    assert.equal(beyond.pagination.cursor, 10_000);
+    assert.equal(beyond.pagination.returned, 0);
+    assert.equal(beyond.pagination.total, historyIds.length);
+    assert.equal(beyond.pagination.nextCursor, null);
+  });
+});
+
+test("generation cursor fails visibly after task creation or scope transition", async () => {
+  const { stateDir, statePath, state, configPath } = await fixture();
+  await withStateDir(stateDir, async () => {
+    const first = await getStatusSummary(configPath, { scope: "all", limit: 5 });
+    state.tasks["created-between-pages"] = {
+      id: "created-between-pages", project: "demo", kind: "scout", lifecycle: "report", status: "cleaned", cleanedAt: "2025-02-01T00:00:00.000Z",
+    };
+    await writeFile(statePath, JSON.stringify(state));
+    await assert.rejects(
+      () => getStatusSummary(configPath, { scope: "all", limit: 5, cursor: first.pagination.nextCursor }),
+      { code: "invalid_status_cursor" },
+    );
+
+    const active = await getStatusSummary(configPath, { scope: "active", limit: 1 });
+    state.tasks[active.tasks[0].id].status = "cleaned";
+    state.tasks[active.tasks[0].id].cleanedAt = "2025-02-02T00:00:00.000Z";
+    await writeFile(statePath, JSON.stringify(state));
+    await assert.rejects(
+      () => getStatusSummary(configPath, { scope: "active", limit: 1, cursor: active.pagination.nextCursor }),
+      { code: "invalid_status_cursor" },
+    );
   });
 });
 
@@ -339,6 +378,8 @@ test("summary validates scope, maximum limit, and cursor", async () => {
     await assert.rejects(() => getStatusSummary(configPath, { limit: 51 }), { code: "invalid_status_limit" });
     await assert.rejects(() => getStatusSummary(configPath, { cursor: -1 }), { code: "invalid_status_cursor" });
     await assert.rejects(() => getStatusSummary(configPath, { cursor: 1.5 }), { code: "invalid_status_cursor" });
+    await assert.rejects(() => getStatusView(configPath, { id: "reviewed-build", limit: 1 }), { code: "invalid_status_arguments" });
+    await assert.rejects(() => getStatusView(configPath, { mode: "diagnostic", scope: "active" }), { code: "invalid_status_arguments" });
   });
 });
 
@@ -356,7 +397,7 @@ test("active records expose latest-only candidate/review counts and explicit PR 
     assert.equal(build.observerState, "open");
     assert.deepEqual(build.candidates, {
       available: true,
-      path: candidatesPath,
+      ref: "candidates:reviewed-build",
       state: "available",
       count: 250,
       latest: { version: 250, head: sha(250) },
@@ -377,14 +418,11 @@ test("active records expose latest-only candidate/review counts and explicit PR 
       status: "open",
       observedAt: "2025-01-03T00:00:00.000Z",
       repo: "demo/repo",
-      number: 42,
-      url: "https://github.com/demo/repo/pull/42",
-      headSha: sha(250),
     });
-    assert.deepEqual(build.publication, { number: 42, url: "https://github.com/demo/repo/pull/42", headSha: sha(250) });
+    assert.deepEqual(build.pr, { number: 42, url: "https://github.com/demo/repo/pull/42", headSha: sha(250), state: "open" });
     assert.equal(build.baseAdvanceState.sequence, 400);
     assert.equal(build.baseAdvanceState.status, "settled");
-    assert.deepEqual(build.mergeReconciliation, { status: "cleanup-pending" });
+    assert.deepEqual(build.mergeReconciliation, { status: "cleanup-pending", error: "[redacted-token]" });
     assert.ok(!Object.values(build).some(Array.isArray), "a summary record must not contain an unbounded array");
   });
 });
@@ -450,6 +488,39 @@ test("adversarial payloads never leak and serialized output stays bounded as jou
   });
 });
 
+test("indented JSON for 20 and 50 maximally populated Unicode active summaries stays under 128 KiB", async () => {
+  const { stateDir, statePath, state, configPath, reportsDir } = await fixture();
+  const tasks = {};
+  for (let index = 0; index < 50; index += 1) {
+    const id = `max-active-${String(index).padStart(2, "0")}`;
+    tasks[id] = {
+      id, project: `é🙂\\\"${"界".repeat(120)}`, kind: "build", lifecycle: "change", workflow: "direct",
+      cleanup: "after-integration", status: "abandoned", abandonedAt: "2025-01-01T00:00:00.000Z",
+      abandonmentReason: LARGE_SECRET, reportToken: TOKEN, agentName: `${id}-agent`,
+      worktree: `/missing/${id}`, repo: `/missing/repo/${id}`, baseSha: sha(index + 1),
+      publication: { number: index + 1, url: `https://example.invalid/${"é🙂%22".repeat(60)}`, headSha: sha(index + 1), checks: { status: "failed" } },
+      prObservation: { status: "lookup-failed", observedAt: "2025-01-02T00:00:00.000Z", repo: "demo/repo", number: index + 1, url: `https://example.invalid/${"界".repeat(120)}`, headSha: sha(index + 1) },
+      mergeReconciliation: { status: "cleanup-failed", lastError: LARGE_SECRET, code: "cleanup_failed" },
+      baseAdvances: [{ sequence: 1, status: "pending", classification: "unknown", priorBaseSha: sha(index + 1), newBaseSha: sha(index + 2), sourceTaskId: "source-task" }],
+    };
+    await writeFile(path.join(reportsDir, `${id}.json`), JSON.stringify({ schemaVersion: 1, taskId: id, kind: "build", lifecycle: "change", token: TOKEN, payload: { commit: sha(index + 1), summary: LARGE_SECRET } }));
+  }
+  state.tasks = tasks;
+  await writeFile(statePath, JSON.stringify(state));
+  await withStateDir(stateDir, async () => {
+    for (const limit of [20, 50]) {
+      const page = await getStatusSummary(configPath, { scope: "active", limit });
+      const text = JSON.stringify(page, null, 2);
+      const bytes = Buffer.byteLength(text, "utf8");
+      assert.equal(page.tasks.length, limit);
+      assert.ok(text.includes("é🙂"));
+      assert.ok(text.includes("\\\\\\\""), "escaped backslash/quote must be measured at the serialized boundary");
+      assert.ok(bytes <= 128 * 1024, `${limit}-item page is ${bytes} bytes`);
+      console.log(`status budget: items=${limit} indentedUtf8Bytes=${bytes}`);
+    }
+  });
+});
+
 test("terminal summaries stay compact without reading payload journals or live resources", async () => {
   const { stateDir, configPath, reportsDir } = await fixture();
   const candidatePath = path.join(reportsDir, "merged-malformed.candidates.json");
@@ -476,6 +547,7 @@ test("terminal summaries stay compact without reading payload journals or live r
     status: "cleaned",
     observedStatus: "cleaned",
     terminalAt: "2025-01-05T00:00:00.000Z",
+    result: { ref: "result:old-scout" },
   });
   assert.deepEqual(merged, {
     id: "merged-malformed",
@@ -483,7 +555,9 @@ test("terminal summaries stay compact without reading payload journals or live r
     kind: "build",
     status: "pr-merged",
     observedStatus: "pr-merged",
-    terminalAt: "2025-01-06T00:00:00.000Z",
+    terminalAt: "2025-01-06T01:00:00.000Z",
+    remotePrMergedAt: "2025-01-06T00:00:00.000Z",
+    candidates: { ref: "candidates:merged-malformed" },
   });
   const serialized = JSON.stringify(page);
   assert.ok(!serialized.includes("TERMINAL-PAYLOAD-SECRET"));
@@ -504,7 +578,8 @@ test("full status with an id remains the durable diagnostic record", async () =>
     assert.equal(record.reviewRoundDecisions.length, 500);
     assert.ok(record.mergeReconciliation.evidence.marker.startsWith("SECRET-LARGE-"));
     assert.ok(record.result.report.payload.summary.startsWith("SECRET-LARGE-"));
-    assert.equal(record.result.path, path.join(reportsDir, "reviewed-build.json"));
+    assert.equal(record.result.ref, "result:reviewed-build");
+    assert.equal(record.result.path, undefined);
     assert.equal(record.candidates.journal.candidates.length, 250);
     assert.ok(record.candidates.journal.candidates.at(-1).payload.diffstat.startsWith("SECRET-LARGE-"));
     assert.equal(record.reportToken, undefined);
@@ -512,7 +587,7 @@ test("full status with an id remains the durable diagnostic record", async () =>
   });
 });
 
-test("CLI keeps full status default and validates bounded summary flags", async () => {
+test("CLI defaults to bounded status and keeps full diagnostics explicit", async () => {
   const { stateDir, configPath, historyIds } = await fixture();
   const env = { ...process.env, CREWDECK_STATE_DIR: stateDir, CREWDECK_CONFIG: configPath };
   const pageResult = spawnSync(process.execPath, [CLI, "status", "--summary", "--scope", "history", "--limit", "3", "--cursor", "2"], {
@@ -522,16 +597,23 @@ test("CLI keeps full status default and validates bounded summary flags", async 
   assert.equal(pageResult.status, 0, pageResult.stderr);
   const page = JSON.parse(pageResult.stdout);
   assert.deepEqual(page.tasks.map((item) => item.id), historyIds.slice(2, 5));
-  assert.deepEqual(page.pagination, { cursor: 2, limit: 3, returned: 3, total: historyIds.length, nextCursor: 5 });
+  assert.equal(page.pagination.cursor, 2);
+  assert.equal(page.pagination.limit, 3);
+  assert.equal(page.pagination.returned, 3);
+  assert.equal(page.pagination.total, historyIds.length);
+  assert.equal(typeof page.pagination.nextCursor, "string");
 
   const invalid = spawnSync(process.execPath, [CLI, "status", "--summary", "--limit", "51"], { env, encoding: "utf8" });
   assert.equal(invalid.status, 1);
   assert.equal(JSON.parse(invalid.stderr).code, "invalid_status_limit");
 
-  const full = spawnSync(process.execPath, [CLI, "status", "old-scout"], { env, encoding: "utf8" });
+  const bounded = spawnSync(process.execPath, [CLI, "status", "old-scout"], { env, encoding: "utf8" });
+  assert.equal(bounded.status, 0, bounded.stderr);
+  assert.equal(JSON.parse(bounded.stdout).id, "old-scout");
+  assert.ok(!bounded.stdout.includes("SECRET-LARGE-"));
+
+  const full = spawnSync(process.execPath, [CLI, "status", "--diagnostic", "old-scout"], { env, encoding: "utf8" });
   assert.equal(full.status, 0, full.stderr);
   const record = JSON.parse(full.stdout)[0];
-  assert.equal(record.id, "old-scout");
   assert.equal(record.description.startsWith("SECRET-LARGE-"), true);
-  assert.equal(record.pagination, undefined);
 });

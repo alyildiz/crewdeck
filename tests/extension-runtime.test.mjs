@@ -32,16 +32,17 @@ test("Pi extension runtime registers hardened lifecycle tools and executes lock 
     assert.ok(tools.some((tool) => tool.name === name), `missing runtime tool ${name}`);
   }
   const statusTool = tools.find((tool) => tool.name === "crew_status");
-  assert.match(statusTool.description, /active\/actionable tasks only/);
-  assert.match(statusTool.description, /scope=history or all/);
-  assert.match(statusTool.description, /full durable diagnostic record/);
+  assert.match(statusTool.description, /targeted token-safe projection/);
+  assert.match(statusTool.description, /scope=history\/all/);
+  assert.match(statusTool.description, /mode=diagnostic/);
   const statusSchema = JSON.stringify(statusTool.parameters);
-  for (const field of ["id", "scope", "limit", "cursor", "active", "history", "all"]) {
+  for (const field of ["id", "mode", "diagnostic", "scope", "limit", "cursor", "active", "history", "all"]) {
     assert.ok(statusSchema.includes(`\"${field}\"`), `crew_status schema must expose ${field}`);
   }
   assert.match(statusSchema, /\"minimum\":1/);
   assert.match(statusSchema, /\"maximum\":50/);
   assert.match(statusSchema, /\"minimum\":0/);
+  assert.ok(tools.some((tool) => tool.name === "crew_read_result"));
   const lockTool = tools.find((tool) => tool.name === "crew_state_lock");
   const result = await lockTool.execute("call", {}, undefined, undefined, { hasUI: false });
   assert.equal(result.details.status, "unlocked");

@@ -907,7 +907,7 @@ test("PR observer persists exact open identity without treating it as merged", a
   const [entry] = JSON.parse(observed.stdout);
   assert.equal(entry.status, "open");
   assert.equal(entry.headSha, item.head);
-  const status = JSON.parse(runCli(item, "status", "build-one").stdout)[0];
+  const status = JSON.parse(runCli(item, "status", "build-one").stdout);
   assert.equal(status.observerState, "open");
   assert.equal(status.pr.state, "open");
 });
@@ -1203,7 +1203,7 @@ test("publication refuses stale SHA, dirty worktree, missing review, and any bas
   git(stale.worktree, "commit", "-qm", "later head");
   let result = runCli(stale, "status", "review-one");
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(JSON.parse(result.stdout)[0].observedStatus, "review-stale");
+  assert.equal(JSON.parse(result.stdout).observedStatus, "review-stale");
   result = publish(stale);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /stale_candidate/);

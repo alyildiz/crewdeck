@@ -117,7 +117,7 @@ test("merged observation durably fans out, classifies, excludes, deduplicates, a
 
   const status = run(fx, "status", "conflict");
   assert.equal(status.status, 0, status.stderr);
-  assert.equal(JSON.parse(status.stdout)[0].baseAdvanceState.status, "forwarded");
+  assert.equal(JSON.parse(status.stdout).baseAdvanceState.status, "forwarded");
 
   // A distinct later merged/base identity appends exactly one monotonic event.
   await writeFile(path.join(fx.repo, "later.txt"), "later\n");

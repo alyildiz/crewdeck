@@ -11,8 +11,10 @@ import {
   cleanupTask,
   collectResults,
   getPendingResultIds,
-  getStatus,
+  getPendingBaseAdvanceKeys,
   getStatusSummary,
+  getStatusView,
+  readResultDetail,
   forwardReviewFindings,
   forwardBaseAdvance,
   extendReviewRounds,
@@ -78,17 +80,19 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
   let activeContext: any;
   const completionWake = createCompletionWakeController({
     listPending: () => getPendingResultIds(CONFIG),
-    sendFollowUp: (ready: string[]) => {
+    maxBatch: 20,
+    sendFollowUp: (ready: string[], metadata: { remaining: number }) => {
       const taskIds = [...new Set(ready.map((key) => key.split("@")[0]))];
       pi.sendUserMessage(
-        `CREWDECK COMPLETION: durable inbox events are ready: ${ready.join(", ")}. ` +
-          `Call crew_status for task ids ${taskIds.join(", ")}, then crew_collect_results with the exact inbox keys. ` +
-          "For a collected changes-requested review, use crew_forward_review so durable structured findings reach the parent build through steering; never message it from the reviewer.",
+        `CREWDECK COMPLETION: ${ready.length} durable inbox event(s) are ready: ${ready.join(", ")}. ` +
+          `Call bounded crew_status once for each task id (${taskIds.join(", ")}), then crew_collect_results with exactly these inbox keys. ` +
+          (metadata.remaining ? `${metadata.remaining} more event(s) remain and will be announced in another bounded follow-up. ` : "") +
+          "The collection response contains each payload exactly once. Use crew_read_result only for explicit later reinspection. For a collected changes-requested review, use crew_forward_review.",
         { deliverAs: "followUp" },
       );
     },
     onReady: (ready: string[], pending: string[]) => {
-      activeContext?.ui.notify(`Crewdeck result ready: ${ready.join(", ")}`, "info");
+      activeContext?.ui.notify(`Crewdeck result ready: ${ready.length} event(s)`, "info");
       activeContext?.ui.setStatus("crewdeck", `crewdeck: ${pending.length} result(s) ready`);
     },
     onError: (error: Error) => {
@@ -149,20 +153,16 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     name: "crew_status",
     label: "Crew Status",
     description:
-      "Without id, return a bounded paginated summary (default: active/actionable tasks only, 20 items; maximum 50). Use scope=history or all plus cursor for explicit durable-history pages. With id, return that task's full durable diagnostic record. Summary records contain orchestration fields and durable result/candidate file paths, never payloads or unbounded journals; read those paths when details are needed.",
+      "Bounded status only. With id, return one targeted token-safe projection used by completion. Without id, return a paginated active page (20 by default, 50 maximum). scope=history/all is explicit. Opaque nextCursor values are generation-bound. Full unbounded troubleshooting is available only with mode=diagnostic and one id. Result references are safe identifiers, not filesystem paths.",
     parameters: Type.Object({
-      id: Type.Optional(Type.String({ description: "Task id for one full durable record; omit for a bounded summary page" })),
-      scope: Type.Optional(Type.Union(
-        [Type.Literal("active"), Type.Literal("history"), Type.Literal("all")],
-        { default: "active", description: "Summary scope when id is omitted; history contains terminal tasks" },
-      )),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50, default: 20 })),
-      cursor: Type.Optional(Type.Integer({ minimum: 0, default: 0, description: "Zero-based deterministic page offset" })),
+      id: Type.Optional(Type.String({ description: "Task id for one bounded projection" })),
+      mode: Type.Optional(Type.Union([Type.Literal("bounded"), Type.Literal("diagnostic")], { default: "bounded" })),
+      scope: Type.Optional(Type.Union([Type.Literal("active"), Type.Literal("history"), Type.Literal("all")])),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+      cursor: Type.Optional(Type.Union([Type.String(), Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })])),
     }),
     async execute(_id, params) {
-      return text(params.id
-        ? await getStatus(CONFIG, params.id)
-        : await getStatusSummary(CONFIG, { scope: params.scope, limit: params.limit, cursor: params.cursor }));
+      return text(await getStatusView(CONFIG, params));
     },
   });
 
@@ -170,7 +170,7 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     name: "crew_collect_results",
     label: "Collect Crew Results",
     description:
-      "Collect durable structured results submitted by Crewdeck workers. Report kinds configured for after-collection are safely closed; change kinds remain available through integration.",
+      "Acknowledge up to 20 exact durable inbox keys and return each exact token-redacted report/candidate payload once with a minimal task projection. Omitted ids collect only the first bounded page and report remaining metadata. Reviewed builds require exact @candidate-N keys; bare build ids never collect several versions implicitly.",
     parameters: Type.Object({
       ids: Type.Optional(Type.Array(Type.String(), { maxItems: 20 })),
       keepReports: Type.Optional(Type.Boolean({ default: false })),
@@ -182,6 +182,14 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
       ctx.ui.setStatus("crewdeck", "crewdeck");
       return text(results);
     },
+  });
+
+  pi.registerTool({
+    name: "crew_read_result",
+    label: "Explicitly Reinspect Result",
+    description: "Explicit selective, token-redacted access to one report id or one exact build-id@candidate-N version. This is not part of normal completion and never exposes raw journal paths or integrity tokens.",
+    parameters: Type.Object({ key: Type.String() }),
+    async execute(_id, params) { return text(await readResultDetail(CONFIG, params.key)); },
   });
 
   pi.registerTool({
@@ -319,7 +327,7 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     name: "crew_forward_base_advance",
     label: "Forward Base Advance",
     description: "Controlled delivery of one durable, locally classified base advance to the affected sole writer. Unknown evidence fails closed; compatible published PRs are preserved without rewriting.",
-    parameters: Type.Object({ id: Type.String(), sequence: Type.Optional(Type.Integer({ minimum: 1 })), wait: Type.Optional(Type.Boolean({ default: false })) }),
+    parameters: Type.Object({ id: Type.String(), sequence: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })), wait: Type.Optional(Type.Boolean({ default: false })) }),
     async execute(_id, params) {
       return text(await forwardBaseAdvance(CONFIG, params.id, params.sequence, { wait: params.wait }));
     },
@@ -427,7 +435,7 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("crew", createCrewCommand(() => getStatus(CONFIG)));
+  pi.registerCommand("crew", createCrewCommand((options: any) => getStatusSummary(CONFIG, options)));
 
   pi.on("session_start", async (_event, ctx) => {
     activeContext = ctx;
@@ -439,22 +447,29 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     // Reconcile the durable report inbox at every start so an event that arrived
     // while Pi was stopped, or was missed by fs.watch, still wakes the orchestrator.
     completionWake.start();
-    const observe = async () => {
+    const announceBaseAdvances = (advances: any[]) => {
+      for (let offset = 0; offset < advances.length; offset += 20) {
+        const chunk = advances.slice(offset, offset + 20);
+        pi.sendUserMessage(`CREWDECK BASE ADVANCES ${offset + 1}-${offset + chunk.length}/${advances.length}: ${chunk.map((entry: any) => `${entry.taskId}#${entry.sequence}:${entry.classification}/${entry.status || "pending"}`).join(", ")}. Use bounded crew_status by id, then crew_forward_base_advance. Unknown classifications fail closed. Remaining work stays visible in /crew.`, { deliverAs: "followUp" });
+      }
+    };
+    const observe = async (reconcilePending = false) => {
       try {
         const observations = await observePublishedPullRequests(CONFIG);
+        const created = [];
         for (const item of observations) {
           if ((item.newlyObserved || item.baseAdvances?.length) && item.status === "merged-awaiting-confirmed-reconciliation") {
-            const affected = item.baseAdvances?.length
-              ? ` Durable base advances: ${item.baseAdvances.map((entry: any) => `${entry.taskId}#${entry.sequence}:${entry.classification}`).join(", ")}. Inspect status and use crew_forward_base_advance; unknown classifications fail closed.`
-              : " No eligible same-project change task was affected.";
-            pi.sendUserMessage(`CREWDECK PR MERGED: exact published PR ${item.url} for ${item.id} was observed merged. Ask the user before calling crew_reconcile_merged_pr; observation alone is not reconciliation.${affected}`, { deliverAs: "followUp" });
+            const advances = item.baseAdvances || [];
+            created.push(...advances);
+            pi.sendUserMessage(`CREWDECK PR MERGED: exact published PR ${item.url} for ${item.id} was observed merged. Ask the user before calling crew_reconcile_merged_pr; observation alone is not reconciliation.${advances.length ? ` ${advances.length} base advance(s) were recorded.` : " No eligible same-project change task was affected."}`, { deliverAs: "followUp" });
           }
         }
+        announceBaseAdvances(reconcilePending ? await getPendingBaseAdvanceKeys(CONFIG) : created);
       } catch (error: any) {
         activeContext?.ui.notify(`Crewdeck PR observer: ${error.message}`, "warning");
       }
     };
-    await observe();
+    await observe(true);
     const config = await loadConfig(CONFIG);
     observerTimer = setInterval(observe, config.prObserverIntervalSeconds * 1000);
   });

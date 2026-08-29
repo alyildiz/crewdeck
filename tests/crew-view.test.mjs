@@ -20,9 +20,10 @@ const tasks = [
 function commandFixture() {
   const widgets = [];
   let statusReads = 0;
-  const command = createCrewCommand(async () => {
+  const command = createCrewCommand(async ({ scope, limit, cursor }) => {
     statusReads += 1;
-    return tasks;
+    const selected = scope === "all" ? tasks : currentCrewTasks(tasks);
+    return { tasks: selected.slice(0, limit), pagination: { nextCursor: cursor ? null : undefined } };
   });
   const ctx = {
     ui: {
@@ -36,7 +37,7 @@ function commandFixture() {
 test("default crew view keeps active and actionable tasks, including a missing active agent", () => {
   assert.deepEqual(
     currentCrewTasks(tasks).map((task) => task.id),
-    ["running", "blocked", "report-ready", "candidate", "missing-active", "abandon-pending"],
+    ["running", "blocked", "report-ready", "candidate", "missing-active", "missing-collected", "integrated", "abandon-pending"],
   );
 });
 
@@ -47,11 +48,13 @@ test("/crew hides terminal durable tasks by default", async () => {
   const lines = fixture.widgets[0][1].join("\n");
   assert.match(lines, /missing-active/);
   assert.match(lines, /abandon-pending/);
-  assert.doesNotMatch(lines, /missing-collected|integrated|pr-merged|abandoned|orphan-reconciled|cleaned/);
+  assert.match(lines, /missing-collected/);
+  assert.match(lines, /integrated/);
+  assert.doesNotMatch(lines, /pr-merged|abandoned|orphan-reconciled|cleaned/);
   assert.deepEqual(fixture.widgets[0][2], { placement: "belowEditor" });
 });
 
-test("/crew all displays the complete durable task history", async () => {
+test("/crew all displays one bounded durable task page", async () => {
   const fixture = commandFixture();
   await fixture.command.handler(" all ", fixture.ctx);
 

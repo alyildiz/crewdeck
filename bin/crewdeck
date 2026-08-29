@@ -6,8 +6,8 @@ import {
   addProject,
   cleanupTask,
   collectResults,
-  getStatus,
-  getStatusSummary,
+  getStatusView,
+  readResultDetail,
   getTaskDiff,
   loadConfig,
   forwardReviewFindings,
@@ -43,9 +43,10 @@ Usage:
   crewdeck project list
   crewdeck spawn <project> <kind> <id> <task> [--profile <name>] [--reviewed-pr]
   crewdeck review <parent-id> <review-id> <reviewed-head> <task> [--profile <name>]
-  crewdeck status [id]   # full record(s), backward compatible
-  crewdeck status --summary [--scope active|history|all] [--limit 1..50] [--cursor <offset>]
+  crewdeck status [id] [--scope active|history|all] [--limit 1..50] [--cursor <opaque>]
+  crewdeck status --diagnostic <id>   # explicit legacy full record
   crewdeck collect [id|inbox-key ...] [--keep-reports]
+  crewdeck read-result <id|exact-candidate-key>
   crewdeck diff <build-id>
   crewdeck prompt <id> <message> [--wait]
   crewdeck forward-review <review-id> [--wait]
@@ -131,14 +132,15 @@ try {
     }
     case "status": {
       let id;
-      let summary = false;
+      let diagnostic = false;
       let scope;
       let limit;
       let cursor;
       for (let index = 0; index < args.length; index += 1) {
         const argument = args[index];
-        if (argument === "--summary") {
-          summary = true;
+        if (argument === "--summary") continue; // backward-compatible no-op: bounded is now the default.
+        if (argument === "--diagnostic") {
+          diagnostic = true;
           continue;
         }
         if (["--scope", "--limit", "--cursor"].includes(argument)) {
@@ -146,10 +148,13 @@ try {
           if (value === undefined || value.startsWith("--")) throw new Error(`${argument} requires a value`);
           index += 1;
           if (argument === "--scope") scope = value;
-          else {
-            if (!/^[0-9]+$/.test(value)) throw new Error(`${argument} must be a non-negative integer`);
-            if (argument === "--limit") limit = Number(value);
-            else cursor = Number(value);
+          else if (argument === "--limit") {
+            if (!/^[0-9]+$/.test(value)) throw new Error("--limit must be a positive safe integer");
+            limit = Number(value);
+            if (!Number.isSafeInteger(limit)) throw new Error("--limit must be a positive safe integer");
+          } else {
+            cursor = /^[0-9]+$/.test(value) ? Number(value) : value;
+            if (typeof cursor === "number" && !Number.isSafeInteger(cursor)) throw new Error("--cursor integer must be safe");
           }
           continue;
         }
@@ -157,13 +162,7 @@ try {
         if (id !== undefined) throw new Error("status accepts at most one task id");
         id = argument;
       }
-      if (summary && id) throw new Error("status --summary does not accept a task id; omit --summary for the full record");
-      if (!summary && (scope !== undefined || limit !== undefined || cursor !== undefined)) {
-        throw new Error("--scope, --limit, and --cursor require --summary");
-      }
-      result = summary
-        ? await getStatusSummary(configPath, { scope, limit, cursor })
-        : await getStatus(configPath, id);
+      result = await getStatusView(configPath, { id, mode: diagnostic ? "diagnostic" : "bounded", scope, limit, cursor });
       break;
     }
     case "collect":
@@ -172,6 +171,10 @@ try {
         args.filter((arg) => !arg.startsWith("--")),
         { cleanupReports: !args.includes("--keep-reports") && !args.includes("--keep-scouts") },
       );
+      break;
+    case "read-result":
+      if (!args[0] || args.length !== 1) throw new Error("read-result requires exactly one result id or exact candidate key");
+      result = await readResultDetail(configPath, args[0]);
       break;
     case "diff":
       if (!args[0]) throw new Error("diff requires <build-id>");
@@ -211,10 +214,14 @@ try {
     case "observe-prs":
       result = await observePublishedPullRequests(configPath, args[0]);
       break;
-    case "forward-base-advance":
+    case "forward-base-advance": {
       if (!args[0]) throw new Error("forward-base-advance requires <build-id> [--sequence <n>] [--wait]");
-      result = await forwardBaseAdvance(configPath, args[0], option("--sequence") ? Number(option("--sequence")) : undefined, { wait: args.includes("--wait") });
+      const sequenceText = option("--sequence");
+      const sequence = sequenceText === undefined ? undefined : Number(sequenceText);
+      if (sequence !== undefined && (!/^[1-9][0-9]*$/.test(sequenceText) || !Number.isSafeInteger(sequence))) throw new Error("--sequence must be a positive safe integer");
+      result = await forwardBaseAdvance(configPath, args[0], sequence, { wait: args.includes("--wait") });
       break;
+    }
     case "extend-review-rounds":
       if (!args[0] || !args.includes("--confirm") || !option("--reason") || !option("--current-max") || !option("--new-max")) {
         throw new Error("extend-review-rounds requires <id> --current-max <n> --new-max <n> --confirm --reason <text>");

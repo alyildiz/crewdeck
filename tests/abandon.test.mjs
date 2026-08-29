@@ -118,7 +118,7 @@ test("explicitly abandons and cleans a clean non-integrated conflict without tou
   await assert.rejects(() => readFile(path.join(fixture.worktree, "change.txt")), /ENOENT/);
   assert.equal(JSON.parse(await readFile(fixture.reportPath, "utf8")).payload.commit, fixture.head);
 
-  const status = runCli(fixture, "status", "obsolete");
+  const status = runCli(fixture, "status", "--diagnostic", "obsolete");
   assert.equal(status.status, 0, status.stderr);
   const [history] = JSON.parse(status.stdout);
   assert.equal(history.observedStatus, "abandoned");

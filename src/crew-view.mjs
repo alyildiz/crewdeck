@@ -1,8 +1,6 @@
 export const TERMINAL_CREW_STATUSES = new Set([
-  "report-collected",
   "orphan-reconciled",
   "retired",
-  "integrated",
   "pr-merged",
   "abandoned",
   "cleaned",
@@ -30,19 +28,24 @@ export function taskLines(tasks) {
   });
 }
 
-export function createCrewCommand(getTasks) {
+export function createCrewCommand(getPage) {
   return {
-    description: "Show active Crewdeck workers; use '/crew all' for history or '/crew clear' to hide",
+    description: "Show a bounded active Crewdeck page; use '/crew all [cursor]' for one bounded history page or '/crew clear'",
     handler: async (args, ctx) => {
-      const mode = args.trim();
+      const [mode = "", cursor, ...extra] = args.trim().split(/\s+/).filter(Boolean);
       if (mode === "clear") {
         ctx.ui.setWidget("crewdeck", undefined);
         return;
       }
       try {
-        const tasks = await getTasks();
-        const visibleTasks = mode === "all" ? tasks : currentCrewTasks(tasks);
-        ctx.ui.setWidget("crewdeck", taskLines(visibleTasks), { placement: "belowEditor" });
+        if (extra.length || (mode && mode !== "all")) throw new Error("Usage: /crew, /crew all [cursor], or /crew clear");
+        const response = await getPage({ scope: mode === "all" ? "all" : "active", limit: mode === "all" ? 50 : 20, cursor });
+        const page = Array.isArray(response)
+          ? { tasks: mode === "all" ? response.slice(0, 50) : currentCrewTasks(response).slice(0, 20), pagination: {} }
+          : response;
+        const lines = taskLines(page.tasks);
+        if (page.pagination.nextCursor) lines.push(`Crewdeck: page truncated; continue with /crew all ${page.pagination.nextCursor}`);
+        ctx.ui.setWidget("crewdeck", lines, { placement: "belowEditor" });
       } catch (error) {
         ctx.ui.notify(error.message, "error");
       }

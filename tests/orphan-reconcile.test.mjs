@@ -111,7 +111,7 @@ test("reconciles a running orphan report and removes stale Git metadata without 
   assert.notEqual(spawnSync("git", ["-C", item.repo, "show-ref", "--verify", "refs/heads/crew/old-report"]).status, 0);
   assert.doesNotMatch(git(item.repo, "worktree", "list", "--porcelain"), /old-report/);
 
-  const status = runCli(item, "status", "old-report");
+  const status = runCli(item, "status", "--diagnostic", "old-report");
   assert.equal(status.status, 0, status.stderr);
   const [history] = JSON.parse(status.stdout);
   assert.equal(history.observedStatus, "orphan-reconciled");
@@ -134,7 +134,7 @@ test("finalizes a collected orphan report while preserving its durable report an
   const record = (await persisted(item)).tasks["old-report"];
   assert.ok(record.resultCollectedAt);
   assert.equal(record.status, "orphan-reconciled");
-  const status = JSON.parse(runCli(item, "status", "old-report").stdout)[0];
+  const status = JSON.parse(runCli(item, "status", "--diagnostic", "old-report").stdout)[0];
   assert.equal(status.result.available, true);
   assert.equal(status.result.report.payload.summary, "preserved report");
 });

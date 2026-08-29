@@ -346,8 +346,8 @@ console.error("unexpected gh "+args.join(" "));process.exit(1)
 
 async function crewWidget(item, mode = "") {
   const widgets = [];
-  const command = createCrewCommand(async () => {
-    const result = runCli(item, "status");
+  const command = createCrewCommand(async ({ scope }) => {
+    const result = runCli(item, "status", "--scope", scope);
     assert.equal(result.status, 0, result.stderr);
     return JSON.parse(result.stdout);
   });
@@ -409,7 +409,7 @@ test("reconciles a historical v2 publication with no verdict field or GitHub com
   assert.deepEqual(JSON.parse(await readFile(item.ghState, "utf8")).comments, []);
   assert.doesNotMatch(await readFile(item.ghLog, "utf8"), /api .*--method (?:POST|PATCH|DELETE)/);
 
-  const status = runCli(item, "status", "build-one");
+  const status = runCli(item, "status", "--diagnostic", "build-one");
   assert.equal(status.status, 0, status.stderr);
   const [history] = JSON.parse(status.stdout);
   assert.equal(history.observedStatus, "pr-merged");
@@ -464,7 +464,7 @@ test("reconciles the exact external merge, cleans only isolated resources, and p
   assert.doesNotMatch(await crewWidget(item), /build-one/);
   assert.match(await crewWidget(item, "all"), /build-one\s+pr-merged/);
 
-  const status = runCli(item, "status", "build-one");
+  const status = runCli(item, "status", "--diagnostic", "build-one");
   assert.equal(status.status, 0, status.stderr);
   const [history] = JSON.parse(status.stdout);
   assert.equal(history.observedStatus, "pr-merged");
@@ -674,7 +674,7 @@ test("does not mark terminal on cleanup failure and safely resumes cleanup", asy
   assert.equal(state.tasks["build-one"].mergeReconciliation.status, "cleanup-failed");
   const failedStatus = runCli(item, "status", "build-one");
   assert.equal(failedStatus.status, 0, failedStatus.stderr);
-  assert.equal(JSON.parse(failedStatus.stdout)[0].observedStatus, "merge-cleanup-failed");
+  assert.equal(JSON.parse(failedStatus.stdout).observedStatus, "merge-cleanup-failed");
   assert.equal(git(item.repo, "rev-parse", "crew/build-one"), item.head);
   assert.equal(await readFile(path.join(item.worktree, "change.txt"), "utf8"), "approved candidate\n");
 
