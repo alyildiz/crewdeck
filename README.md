@@ -304,7 +304,7 @@ The project extension exposes:
 
 - `crew_spawn_batch` (`workflow` may be `direct` or `reviewed-pr`)
 - `crew_spawn_review`
-- `crew_status` (bounded all-task summary without `id`; full single-task record with `id`), `crew_collect_results`, `crew_diff`
+- `crew_status` (bounded active summary by default; explicit paginated `history`/`all`; full single-task record with `id`), `crew_collect_results`, `crew_diff`
 - `crew_steer`, `crew_forward_review`, `crew_resume_build`
 - `crew_publish_pr`, read-only `crew_observe_prs`, controlled `crew_forward_base_advance`
 - separately confirmed `crew_reconcile_verdict`, `crew_extend_review_rounds`, `crew_retire_agent`, and state-lock recovery
@@ -313,7 +313,7 @@ The project extension exposes:
 
 When durable events arrive, the extension uses `pi.sendUserMessage(..., { deliverAs: "followUp" })`. The orchestrator must call status and collection; no background LLM polling occurs.
 
-Status is two-level. `crew_status` without an id returns a bounded per-task summary for every task: only the orchestration loop fields (next action, review round/max, escalation, verdict/checks/observer state, PR, agent, git, result/candidate paths, compact review inbox, latest PR observation). Terminal tasks collapse to one compact line. `crew_status` with an id returns the full durable record for that single task. Report and review content is never inlined in the summary: read the durable files at `result.path` (report) and `candidates.path` (candidate journal). The CLI `crewdeck status --summary` uses the same bounded view; `crewdeck status [id]` keeps the full output.
+Status is two-level. `crew_status` without an id returns only active/actionable tasks by default, in a deterministic page of 20. Set `scope` to `history` for terminal tasks or `all` for both, and page with `limit` (1 to 50) plus the zero-based `cursor`; pagination metadata reports returned/total/next cursor. Terminal means `cleaned`, `orphan-reconciled`, `retired`, `pr-merged`, or `abandoned` with `cleanedAt`; abandonment awaiting cleanup remains active. Every summary record is bounded to orchestration fields, latest candidate/relevant review plus counts, an explicit latest PR observation projection, and durable report/candidate paths. Payloads and historical arrays are never inlined. `crew_status` with an id remains the full durable diagnostic for that single task. Read `result.path` or `candidates.path` when details are needed. The CLI keeps full `crewdeck status [id]` output by default and exposes the same view through `crewdeck status --summary [--scope active|history|all] [--limit 1..50] [--cursor N]`.
 
 ## Manual CLI
 
@@ -322,7 +322,7 @@ Status is two-level. `crew_status` without an id returns a bounded per-task summ
 bin/crewdeck spawn my-project scout inspect "Inspect without changing code" --profile local-fast
 bin/crewdeck spawn my-project build direct-fix "Implement the accepted fix" --profile cloud-medium
 bin/crewdeck collect inspect
-bin/crewdeck status --summary
+bin/crewdeck status --summary --scope active --limit 20
 bin/crewdeck prepare direct-fix
 bin/crewdeck merge direct-fix --confirm
 

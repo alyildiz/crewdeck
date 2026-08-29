@@ -149,12 +149,20 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     name: "crew_status",
     label: "Crew Status",
     description:
-      "Bounded per-task status summary for all Crewdeck tasks without waking workers: orchestration loop fields only (next action, review round/max, escalation, verdict/checks/observer state, PR, agent, git, result/candidate paths, compact review inbox, latest PR observation). Pass id for one task's full durable record. Read the durable files at result.path or candidates.path for report or review content.",
+      "Without id, return a bounded paginated summary (default: active/actionable tasks only, 20 items; maximum 50). Use scope=history or all plus cursor for explicit durable-history pages. With id, return that task's full durable diagnostic record. Summary records contain orchestration fields and durable result/candidate file paths, never payloads or unbounded journals; read those paths when details are needed.",
     parameters: Type.Object({
-      id: Type.Optional(Type.String({ description: "Task id; omit for the bounded all-task summary, set for the full single-task record" })),
+      id: Type.Optional(Type.String({ description: "Task id for one full durable record; omit for a bounded summary page" })),
+      scope: Type.Optional(Type.Union(
+        [Type.Literal("active"), Type.Literal("history"), Type.Literal("all")],
+        { default: "active", description: "Summary scope when id is omitted; history contains terminal tasks" },
+      )),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50, default: 20 })),
+      cursor: Type.Optional(Type.Integer({ minimum: 0, default: 0, description: "Zero-based deterministic page offset" })),
     }),
     async execute(_id, params) {
-      return text(params.id ? await getStatus(CONFIG, params.id) : await getStatusSummary(CONFIG));
+      return text(params.id
+        ? await getStatus(CONFIG, params.id)
+        : await getStatusSummary(CONFIG, { scope: params.scope, limit: params.limit, cursor: params.cursor }));
     },
   });
 

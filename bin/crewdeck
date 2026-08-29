@@ -43,7 +43,8 @@ Usage:
   crewdeck project list
   crewdeck spawn <project> <kind> <id> <task> [--profile <name>] [--reviewed-pr]
   crewdeck review <parent-id> <review-id> <reviewed-head> <task> [--profile <name>]
-  crewdeck status [id] [--summary]   # no id: full records; --summary: bounded all-task summary
+  crewdeck status [id]   # full record(s), backward compatible
+  crewdeck status --summary [--scope active|history|all] [--limit 1..50] [--cursor <offset>]
   crewdeck collect [id|inbox-key ...] [--keep-reports]
   crewdeck diff <build-id>
   crewdeck prompt <id> <message> [--wait]
@@ -128,11 +129,43 @@ try {
       });
       break;
     }
-    case "status":
-      result = args.includes("--summary")
-        ? await getStatusSummary(configPath)
-        : await getStatus(configPath, args.find((arg) => !arg.startsWith("--")));
+    case "status": {
+      let id;
+      let summary = false;
+      let scope;
+      let limit;
+      let cursor;
+      for (let index = 0; index < args.length; index += 1) {
+        const argument = args[index];
+        if (argument === "--summary") {
+          summary = true;
+          continue;
+        }
+        if (["--scope", "--limit", "--cursor"].includes(argument)) {
+          const value = args[index + 1];
+          if (value === undefined || value.startsWith("--")) throw new Error(`${argument} requires a value`);
+          index += 1;
+          if (argument === "--scope") scope = value;
+          else {
+            if (!/^[0-9]+$/.test(value)) throw new Error(`${argument} must be a non-negative integer`);
+            if (argument === "--limit") limit = Number(value);
+            else cursor = Number(value);
+          }
+          continue;
+        }
+        if (argument.startsWith("--")) throw new Error(`Unknown status option '${argument}'`);
+        if (id !== undefined) throw new Error("status accepts at most one task id");
+        id = argument;
+      }
+      if (summary && id) throw new Error("status --summary does not accept a task id; omit --summary for the full record");
+      if (!summary && (scope !== undefined || limit !== undefined || cursor !== undefined)) {
+        throw new Error("--scope, --limit, and --cursor require --summary");
+      }
+      result = summary
+        ? await getStatusSummary(configPath, { scope, limit, cursor })
+        : await getStatus(configPath, id);
       break;
+    }
     case "collect":
       result = await collectResults(
         configPath,
