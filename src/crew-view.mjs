@@ -1,3 +1,5 @@
+import { statusCursorScope } from "./core.mjs";
+
 export const TERMINAL_CREW_STATUSES = new Set([
   "orphan-reconciled",
   "retired",
@@ -30,21 +32,26 @@ export function taskLines(tasks) {
 
 export function createCrewCommand(getPage) {
   return {
-    description: "Show a bounded active Crewdeck page; use '/crew all [cursor]' for one bounded history page or '/crew clear'",
+    description:
+      "Show a bounded active Crewdeck page; use '/crew all [cursor]' for one bounded history page, '/crew <cursor>' to continue the page a cursor names, or '/crew clear' to hide",
     handler: async (args, ctx) => {
-      const [mode = "", cursor, ...extra] = args.trim().split(/\s+/).filter(Boolean);
-      if (mode === "clear") {
+      const [first = "", ...rest] = args.trim().split(/\s+/).filter(Boolean);
+      if (first === "clear") {
         ctx.ui.setWidget("crewdeck", undefined);
         return;
       }
       try {
-        if (extra.length || (mode && mode !== "all")) throw new Error("Usage: /crew, /crew all [cursor], or /crew clear");
-        const response = await getPage({ scope: mode === "all" ? "all" : "active", limit: mode === "all" ? 50 : 20, cursor });
-        const page = Array.isArray(response)
-          ? { tasks: mode === "all" ? response.slice(0, 50) : currentCrewTasks(response).slice(0, 20), pagination: {} }
-          : response;
-        const lines = taskLines(page.tasks);
-        if (page.pagination.nextCursor) lines.push(`Crewdeck: page truncated; continue with /crew all ${page.pagination.nextCursor}`);
+        if (first === "all" ? rest.length > 1 : rest.length > 0) {
+          throw new Error("Usage: /crew, /crew all [cursor], /crew <cursor>, or /crew clear");
+        }
+        const cursor = first === "all" ? rest[0] : first;
+        const scope = first === "all" ? "all" : first ? statusCursorScope(first) : "active";
+        const response = await getPage({ scope, limit: scope === "all" ? 50 : 20, cursor: cursor || undefined });
+        const lines = taskLines(response.tasks);
+        if (response.pagination.nextCursor) {
+          const continuation = response.scope === "all" ? `/crew all ${response.pagination.nextCursor}` : `/crew ${response.pagination.nextCursor}`;
+          lines.push(`Crewdeck: page truncated; continue with ${continuation}`);
+        }
         ctx.ui.setWidget("crewdeck", lines, { placement: "belowEditor" });
       } catch (error) {
         ctx.ui.notify(error.message, "error");

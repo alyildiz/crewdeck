@@ -69,3 +69,75 @@ test("/crew clear hides the widget without reading task status", async () => {
   assert.equal(fixture.statusReads, 0);
   assert.deepEqual(fixture.widgets, [["crewdeck", undefined]]);
 });
+
+function opaqueCursor(scope) {
+  return Buffer.from(JSON.stringify({ v: 1, scope, generation: "gen", after: "running" }), "utf8").toString("base64url");
+}
+
+test("/crew <cursor> replays an active-scope page cursor in its own scope", async () => {
+  const calls = [];
+  const command = createCrewCommand(async (options) => {
+    calls.push(options);
+    return {
+      scope: "active",
+      tasks: currentCrewTasks(tasks).slice(0, options.limit),
+      pagination: { nextCursor: `${opaqueCursor("active")}2` },
+    };
+  });
+  const widgets = [];
+  const ctx = {
+    ui: {
+      setWidget: (...args) => widgets.push(args),
+      notify: () => assert.fail("unexpected notification"),
+    },
+  };
+  const cursor = opaqueCursor("active");
+  await command.handler(cursor, ctx);
+
+  assert.deepEqual(calls, [{ scope: "active", limit: 20, cursor }]);
+  const lines = widgets[0][1];
+  assert.match(lines.at(-1), /^Crewdeck: page truncated; continue with \/crew [A-Za-z0-9_-]+$/);
+  assert.doesNotMatch(lines.at(-1), /\/crew all /);
+});
+
+test("/crew all <cursor> still replays an all-scope page cursor", async () => {
+  const calls = [];
+  const command = createCrewCommand(async (options) => {
+    calls.push(options);
+    return {
+      scope: "all",
+      tasks: tasks.slice(0, options.limit),
+      pagination: { nextCursor: `${opaqueCursor("all")}2` },
+    };
+  });
+  const widgets = [];
+  const ctx = {
+    ui: {
+      setWidget: (...args) => widgets.push(args),
+      notify: () => assert.fail("unexpected notification"),
+    },
+  };
+  const cursor = opaqueCursor("all");
+  await command.handler(`all ${cursor}`, ctx);
+
+  assert.deepEqual(calls, [{ scope: "all", limit: 50, cursor }]);
+  assert.match(widgets[0][1].at(-1), /continue with \/crew all [A-Za-z0-9_-]+/);
+});
+
+test("/crew notifies an error for an invalid bare cursor instead of rendering", async () => {
+  const command = createCrewCommand(async () => assert.fail("getPage must not run for an invalid cursor"));
+  const widgets = [];
+  const notifications = [];
+  const ctx = {
+    ui: {
+      setWidget: (...args) => widgets.push(args),
+      notify: (message, level) => notifications.push([message, level]),
+    },
+  };
+  await command.handler("not-a-cursor", ctx);
+
+  assert.equal(widgets.length, 0);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0][1], "error");
+  assert.match(notifications[0][0], /cursor/i);
+});

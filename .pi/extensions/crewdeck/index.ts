@@ -109,11 +109,11 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
       profile: Type.Optional(Type.String({ description: "Default profile for this batch" })),
       tasks: Type.Array(
         Type.Object({
-          id: Type.String({ description: "Unique lowercase task id, max 24 characters" }),
+          id: Type.String({ pattern: "^[a-z][a-z0-9-]{0,23}$", description: "Unique lowercase task id, max 24 characters" }),
           kind: Type.String({
             description: "Task kind configured in config/kinds.yml",
           }),
-          task: Type.String({ description: "Concrete task and acceptance criteria" }),
+          task: Type.String({ minLength: 8, description: "Concrete task and acceptance criteria" }),
           profile: Type.Optional(Type.String({ description: "Optional per-task profile override" })),
           workflow: Type.Optional(Type.String({ description: "direct (default) or reviewed-pr for change tasks" })),
         }),
@@ -132,9 +132,9 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     description:
       "Launch the one configured read-only review kind in a proven detached worktree for exactly the current collected candidate SHA of a reviewed-pr build. Refuses concurrent or duplicate reviewers.",
     parameters: Type.Object({
-      id: Type.String({ description: "Unique review task id" }),
+      id: Type.String({ pattern: "^[a-z][a-z0-9-]{0,23}$", description: "Unique review task id" }),
       parentTaskId: Type.String({ description: "Reviewed-pr build task id" }),
-      reviewedHead: Type.String({ description: "Exact 40-character current candidate SHA" }),
+      reviewedHead: Type.String({ pattern: "^[0-9a-f]{40}$", description: "Exact 40-character current candidate SHA" }),
       task: Type.String({ description: "Concrete review scope and acceptance criteria" }),
       profile: Type.Optional(Type.String({ description: "Optional reviewer profile" })),
     }),
@@ -153,7 +153,7 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     name: "crew_status",
     label: "Crew Status",
     description:
-      "Bounded status only. With id, return one targeted token-safe projection used by completion. Without id, return a paginated active page (20 by default, 50 maximum). scope=history/all is explicit. Opaque nextCursor values are generation-bound. Full unbounded troubleshooting is available only with mode=diagnostic and one id. Result references are safe identifiers, not filesystem paths.",
+      "Bounded status only. With id, return one targeted token-safe projection used by completion. Without id, return a paginated active page (20 by default, 50 maximum). scope=history/all is explicit. Opaque nextCursor values are generation-bound. id is mutually exclusive with scope, limit, and cursor, and mode=diagnostic requires id. Full unbounded troubleshooting is available only with mode=diagnostic and one id. Result references are safe identifiers, not filesystem paths.",
     parameters: Type.Object({
       id: Type.Optional(Type.String({ description: "Task id for one bounded projection" })),
       mode: Type.Optional(Type.Union([Type.Literal("bounded"), Type.Literal("diagnostic")], { default: "bounded" })),
@@ -188,7 +188,7 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     name: "crew_read_result",
     label: "Explicitly Reinspect Result",
     description: "Explicit selective, token-redacted access to one report id or one exact build-id@candidate-N version. This is not part of normal completion and never exposes raw journal paths or integrity tokens.",
-    parameters: Type.Object({ key: Type.String() }),
+    parameters: Type.Object({ key: Type.String({ pattern: "^([a-z][a-z0-9-]{0,23})(?:@candidate-[1-9][0-9]*)?$" }) }),
     async execute(_id, params) { return text(await readResultDetail(CONFIG, params.key)); },
   });
 
@@ -209,7 +209,7 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     description: "Send a concise follow-up or conflict-resolution instruction to an existing Crewdeck worker.",
     parameters: Type.Object({
       id: Type.String(),
-      message: Type.String(),
+      message: Type.String({ minLength: 2 }),
       wait: Type.Optional(Type.Boolean({ default: false })),
     }),
     async execute(_id, params) {
@@ -253,8 +253,8 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
       repo: Type.String({ description: "GitHub owner/name" }),
       base: Type.String(),
       head: Type.String({ description: "Remote head; must equal the task-owned crew/<id> branch" }),
-      title: Type.String(),
-      body: Type.String(),
+      title: Type.String({ minLength: 1 }),
+      body: Type.String({ minLength: 1 }),
     }),
     async execute(_id, params) {
       return text(await publishPullRequest(CONFIG, params.id, params));
@@ -303,11 +303,11 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "crew_state_lock",
     label: "Diagnose/Recover State Lock",
-    description: "Diagnose the verifiable local state-lock owner. Recovery is separately confirmed, never steals an active lock, and requires a durable reason.",
+    description: "Diagnose the verifiable local state-lock owner. A status-only call omits both parameters. Recovery is separately confirmed, never steals an active lock, and reason is required whenever recover is true.",
     parameters: Type.Object({ recover: Type.Optional(Type.Boolean({ default: false })), reason: Type.Optional(Type.String({ minLength: 1, maxLength: 4000 })) }),
     async execute(_id, params, _signal, _update, ctx) {
       if (!params.recover) return text(await stateLockStatus());
-      if (!params.reason) throw new Error("crew_state_lock recovery requires a reason");
+      if (!params.reason) throw new Error('crew_state_lock recovery requires a reason; retry with { recover: true, reason: "<durable reason>" }');
       if (!ctx.hasUI) throw new Error("crew_state_lock recovery requires interactive confirmation");
       const confirmed = await ctx.ui.confirm("Recover stale Crewdeck state lock?", `Never steal an active lock; quarantine only a dead or grace-aged unverifiable lock? Reason: ${params.reason}`);
       if (!confirmed) return text({ recovered: false, reason: "user declined" });
@@ -385,7 +385,7 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
       "Explicitly abandon a clean, non-integrated change task, then close its agent/workspace and remove only its isolated worktree and branch. Refuses report, integrated, cleaned, already abandoned, active, or dirty tasks and always asks for independent confirmation.",
     parameters: Type.Object({
       id: Type.String(),
-      reason: Type.Optional(Type.String({ description: "Durable reason this change is no longer needed" })),
+      reason: Type.Optional(Type.String({ minLength: 1, description: "Durable reason this change is no longer needed" })),
     }),
     async execute(_id, params, _signal, _update, ctx) {
       if (!ctx.hasUI) throw new Error("crew_abandon requires interactive confirmation");
@@ -405,7 +405,7 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
       "Explicitly finalize a report task only after its Herdr workspace and Git worktree were manually removed. Requires a durable reason and independent confirmation, preserves reports/history, refuses surviving resources, dirty worktrees, unintegrated commits, change tasks, and uncertain absence, and never changes base or pushes.",
     parameters: Type.Object({
       id: Type.String(),
-      reason: Type.String({ description: "Durable reason the report resources were removed outside Crewdeck" }),
+      reason: Type.String({ minLength: 1, description: "Durable reason the report resources were removed outside Crewdeck" }),
     }),
     async execute(_id, params, _signal, _update, ctx) {
       if (!ctx.hasUI) throw new Error("crew_reconcile_orphan_report requires interactive confirmation");
@@ -438,6 +438,7 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
   pi.registerCommand("crew", createCrewCommand((options: any) => getStatusSummary(CONFIG, options)));
 
   pi.on("session_start", async (_event, ctx) => {
+    const config = await loadConfig(CONFIG);
     activeContext = ctx;
     ctx.ui.setStatus("crewdeck", "crewdeck");
     const directory = reportDirectory();
@@ -453,7 +454,10 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
         pi.sendUserMessage(`CREWDECK BASE ADVANCES ${offset + 1}-${offset + chunk.length}/${advances.length}: ${chunk.map((entry: any) => `${entry.taskId}#${entry.sequence}:${entry.classification}/${entry.status || "pending"}`).join(", ")}. Use bounded crew_status by id, then crew_forward_base_advance. Unknown classifications fail closed. Remaining work stays visible in /crew.`, { deliverAs: "followUp" });
       }
     };
+    let observing = false;
     const observe = async (reconcilePending = false) => {
+      if (observing) return;
+      observing = true;
       try {
         const observations = await observePublishedPullRequests(CONFIG);
         const created = [];
@@ -467,10 +471,12 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
         announceBaseAdvances(reconcilePending ? await getPendingBaseAdvanceKeys(CONFIG) : created);
       } catch (error: any) {
         activeContext?.ui.notify(`Crewdeck PR observer: ${error.message}`, "warning");
+      } finally {
+        observing = false;
       }
     };
     await observe(true);
-    const config = await loadConfig(CONFIG);
+    if (observerTimer) clearInterval(observerTimer);
     observerTimer = setInterval(observe, config.prObserverIntervalSeconds * 1000);
   });
 

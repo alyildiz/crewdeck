@@ -1910,6 +1910,19 @@ function decodeStatusCursor(cursor, scope, generation, records) {
   }
 }
 
+export function statusCursorScope(cursor) {
+  if (typeof cursor !== "string" || cursor === "") {
+    throw new CrewdeckError("Status cursor must be an opaque cursor string", "invalid_status_cursor");
+  }
+  try {
+    const decoded = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (decoded.v !== 1 || typeof decoded.scope !== "string") throw new Error("cursor scope missing");
+    return decoded.scope;
+  } catch (error) {
+    throw new CrewdeckError(`Status cursor is stale or invalid; restart pagination: ${error.message}`, "invalid_status_cursor");
+  }
+}
+
 export async function getStatusView(configPath, { id, mode = "bounded", scope, limit, cursor } = {}) {
   if (!["bounded", "diagnostic"].includes(mode)) throw new CrewdeckError("Status mode must be bounded or diagnostic", "invalid_status_mode");
   if (id && (scope !== undefined || limit !== undefined || cursor !== undefined)) {
@@ -2099,7 +2112,7 @@ export async function readResultDetail(configPath, key) {
   return { inboxKey: id, task: collectionTaskProjection(normalized), result: { available: true, ref: `result:${id}`, report } };
 }
 
-export async function collectResults(configPath, ids, { cleanupReports, cleanupScouts } = {}) {
+export async function collectResults(configPath, ids, { cleanupReports } = {}) {
   if (ids !== undefined && !Array.isArray(ids)) throw new CrewdeckError("ids must be an array", "invalid_inbox_keys");
   if (ids?.length > COLLECTION_LIMIT) throw new CrewdeckError(`At most ${COLLECTION_LIMIT} inbox keys may be collected`, "too_many_inbox_keys");
   if (ids && new Set(ids).size !== ids.length) throw new CrewdeckError("Duplicate inbox keys are not allowed", "duplicate_inbox_key");
@@ -2226,7 +2239,7 @@ export async function collectResults(configPath, ids, { cleanupReports, cleanupS
     });
   }
 
-  const shouldCleanupReports = cleanupReports ?? cleanupScouts ?? true;
+  const shouldCleanupReports = cleanupReports ?? true;
   if (shouldCleanupReports) {
     for (const item of collected) {
       if (
