@@ -304,7 +304,7 @@ The project extension exposes:
 
 - `crew_spawn_batch` (`workflow` may be `direct` or `reviewed-pr`)
 - `crew_spawn_review`
-- `crew_status`, `crew_collect_results`, `crew_diff`
+- `crew_status` (bounded all-task summary without `id`; full single-task record with `id`), `crew_collect_results`, `crew_diff`
 - `crew_steer`, `crew_forward_review`, `crew_resume_build`
 - `crew_publish_pr`, read-only `crew_observe_prs`, controlled `crew_forward_base_advance`
 - separately confirmed `crew_reconcile_verdict`, `crew_extend_review_rounds`, `crew_retire_agent`, and state-lock recovery
@@ -313,6 +313,8 @@ The project extension exposes:
 
 When durable events arrive, the extension uses `pi.sendUserMessage(..., { deliverAs: "followUp" })`. The orchestrator must call status and collection; no background LLM polling occurs.
 
+Status is two-level. `crew_status` without an id returns a bounded per-task summary for every task: only the orchestration loop fields (next action, review round/max, escalation, verdict/checks/observer state, PR, agent, git, result/candidate paths, compact review inbox, latest PR observation). Terminal tasks collapse to one compact line. `crew_status` with an id returns the full durable record for that single task. Report and review content is never inlined in the summary: read the durable files at `result.path` (report) and `candidates.path` (candidate journal). The CLI `crewdeck status --summary` uses the same bounded view; `crewdeck status [id]` keeps the full output.
+
 ## Manual CLI
 
 ```bash
@@ -320,6 +322,7 @@ When durable events arrive, the extension uses `pi.sendUserMessage(..., { delive
 bin/crewdeck spawn my-project scout inspect "Inspect without changing code" --profile local-fast
 bin/crewdeck spawn my-project build direct-fix "Implement the accepted fix" --profile cloud-medium
 bin/crewdeck collect inspect
+bin/crewdeck status --summary
 bin/crewdeck prepare direct-fix
 bin/crewdeck merge direct-fix --confirm
 

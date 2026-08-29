@@ -1499,11 +1499,206 @@ function operatorStatus(record, candidates, observedStatus, config) {
     observerState: record.prObservation?.status || "not-observed" };
 }
 
+const TERMINAL_STATUSES = new Set(["cleaned", "orphan-reconciled", "retired", "pr-merged"]);
+
+function isTerminalStatusRecord(record) {
+  return TERMINAL_STATUSES.has(record.status) || (record.status === "abandoned" && record.cleanedAt);
+}
+
+// Bounded per-task projection of a full status record: only the orchestrator
+// loop fields. Report/review payloads, PR bodies, raw agent state, and
+// observation history stay in the durable files referenced by the paths.
+function summarizeStatusRecord(record) {
+  if (isTerminalStatusRecord(record)) {
+    const summary = {
+      id: record.id,
+      project: record.project,
+      kind: record.kind,
+      status: record.status,
+      observedStatus: record.observedStatus,
+    };
+    const terminalAt =
+      record.cleanedAt || record.orphanReconciledAt || record.prMergedAt || record.agentRetiredAt || record.abandonedAt;
+    if (terminalAt) summary.terminalAt = terminalAt;
+    return summary;
+  }
+  const summary = {
+    id: record.id,
+    project: record.project,
+    kind: record.kind,
+    workflow: record.workflow,
+    status: record.status,
+    observedStatus: record.observedStatus,
+    nextAction: record.nextAction,
+    reviewRound: record.reviewRound,
+    currentMaxReviewRounds: record.currentMaxReviewRounds,
+    verdictState: record.verdictState,
+    checkState: record.checkState,
+    observerState: record.observerState,
+  };
+  if (record.escalation) {
+    summary.escalation = {
+      reviewTaskId: record.escalation.reviewTaskId,
+      verdict: record.escalation.verdict,
+      reason: record.escalation.reason,
+    };
+  }
+  if (record.pr) summary.pr = { number: record.pr.number, url: record.pr.url, state: record.pr.state };
+  if (record.agent) summary.agent = { available: record.agent.available, state: record.agent.state };
+  if (record.git) {
+    summary.git = record.git.available
+      ? { available: true, clean: record.git.clean, ahead: record.git.ahead, head: record.git.head }
+      : { available: false };
+  }
+  if (record.result) {
+    summary.result = record.result.available
+      ? { available: true, path: record.result.path, state: "available" }
+      : { available: false, state: record.result.state || "error" };
+  }
+  if (record.candidates) {
+    summary.candidates = record.candidates.available
+      ? {
+          available: true,
+          path: record.candidates.path,
+          versions: record.candidates.journal.candidates.map((candidate) => ({
+            version: candidate.version,
+            head: candidate.head,
+          })),
+        }
+      : { available: false, state: record.candidates.state || "error" };
+  }
+  if (record.publication?.number) {
+    summary.publication = { number: record.publication.number, url: record.publication.url, headSha: record.publication.headSha };
+  }
+  if (Array.isArray(record.reviewInbox) && record.reviewInbox.length > 0) {
+    summary.reviewInbox = record.reviewInbox.map((item) => ({
+      reviewTaskId: item.reviewTaskId,
+      candidateVersion: item.candidateVersion,
+      reviewedHead: item.reviewedHead,
+      verdict: item.verdict,
+      forwardStatus: item.forwardStatus,
+    }));
+  }
+  if (record.baseAdvanceState) summary.baseAdvanceState = record.baseAdvanceState;
+  if (record.mergeReconciliation) {
+    summary.mergeReconciliation = { status: record.mergeReconciliation.status };
+    if (record.mergeReconciliation.prNumber !== undefined) summary.mergeReconciliation.prNumber = record.mergeReconciliation.prNumber;
+    if (record.mergeReconciliation.mergeCommit !== undefined) summary.mergeReconciliation.mergeCommit = record.mergeReconciliation.mergeCommit;
+  }
+  if (record.prObservation) summary.prObservation = record.prObservation;
+  return summary;
+}
+
+async function computeStatusRecord(config, state, storedRecord) {
+  const record = {
+    ...storedRecord,
+    kind: storedRecord.kind || (storedRecord.profile === "scout" ? "scout" : "build"),
+  };
+  record.lifecycle ||= config.kinds[record.kind]?.lifecycle || (record.kind === "scout" ? "report" : "change");
+  record.contract ||= config.kinds[record.kind]?.contract || "standard";
+  record.workflow ||= "direct";
+  record.cleanup ||= config.kinds[record.kind]?.cleanup ||
+    (record.lifecycle === "report" ? "after-collection" : "after-integration");
+  if (
+    record.status === "cleaned" ||
+    record.status === "orphan-reconciled" ||
+    record.status === "retired" ||
+    record.status === "pr-merged" ||
+    (record.status === "abandoned" && record.cleanedAt)
+  ) {
+    const terminal = {
+      ...publicTaskRecord(record),
+      observedStatus: record.status,
+      agent: { available: false, state: "closed" },
+      git: { available: false, state: "worktree-removed" },
+    };
+    if (["abandoned", "orphan-reconciled"].includes(record.status) || record.contract === "review") {
+      terminal.result = publicTaskReport(await readTaskReport(record));
+    }
+    if (record.status === "pr-merged") {
+      terminal.candidates = publicCandidateJournal(await readCandidateJournal(record));
+    }
+    Object.assign(terminal, operatorStatus(record, terminal.candidates, terminal.observedStatus, config));
+    if (record.contract === "review") {
+      const parent = state.tasks[record.parentTaskId];
+      const parentSnapshot = parent ? await gitSnapshot(parent) : { available: false };
+      terminal.reviewValidity = {
+        reviewedHead: record.reviewedHead,
+        validForCurrentHead: parentSnapshot.available && parentSnapshot.head === record.reviewedHead,
+      };
+    }
+    return terminal;
+  }
+  const [agent, snapshot, result, candidates] = await Promise.all([
+    liveAgent(record),
+    gitSnapshot(record),
+    readTaskReport(record),
+    readCandidateJournal(record),
+  ]);
+  let observedStatus = record.status;
+  if (record.status === "abandoned" && !record.cleanedAt) observedStatus = "abandon-cleanup-pending";
+  if (record.status === "running" && agent.state === "blocked") observedStatus = "blocked";
+  if (record.lifecycle === "report" && result.available) {
+    observedStatus = record.resultCollectedAt ? "report-collected" : "report-ready";
+    if (record.contract === "review") {
+      const parent = state.tasks[record.parentTaskId];
+      const parentSnapshot = parent ? await gitSnapshot(parent) : { available: false };
+      const stillCurrent =
+        parentSnapshot.available &&
+        parentSnapshot.head === record.reviewedHead &&
+        result.report.reviewedHead === record.reviewedHead;
+      observedStatus = stillCurrent
+        ? record.resultCollectedAt ? "report-collected" : "review-ready"
+        : "review-stale";
+    }
+  }
+  if (record.workflow === "reviewed-pr" && candidates.available) {
+    const candidate = candidates.journal.candidates.at(-1);
+    if (candidate) {
+      const review = (record.reviewInbox || [])
+        .filter((item) => item.reviewedHead === candidate.head)
+        .at(-1);
+      if (!snapshot.available || snapshot.head !== candidate.head) observedStatus = "candidate-stale";
+      else if ((record.candidateCollectedVersion || 0) < candidate.version) observedStatus = "candidate-submitted";
+      else if (review?.validAtCollection) observedStatus = `review-${review.verdict}`;
+      else observedStatus = "candidate";
+    }
+  }
+  if (["cleanup-pending", "cleanup-failed"].includes(record.mergeReconciliation?.status)) {
+    observedStatus = `merge-${record.mergeReconciliation.status}`;
+  }
+  const reportedCommit = result.available ? result.report.payload?.commit : undefined;
+  const commitMatches =
+    typeof reportedCommit === "string" && snapshot.available && snapshot.head.startsWith(reportedCommit);
+  if (
+    record.lifecycle === "change" &&
+    record.status === "running" &&
+    ["idle", "done"].includes(agent.state) &&
+    result.available &&
+    snapshot.available &&
+    snapshot.clean &&
+    snapshot.ahead > 0 &&
+    commitMatches
+  ) {
+    observedStatus = "candidate";
+  }
+  return {
+    ...publicTaskRecord(record),
+    observedStatus,
+    agent,
+    git: snapshot,
+    result: publicTaskReport(result),
+    candidates: publicCandidateJournal(candidates),
+    ...operatorStatus(record, candidates, observedStatus, config),
+  };
+}
+
 export async function getStatus(configPath, id) {
   const config = await loadConfig(configPath);
   const state = await loadState();
   const records = id ? [state.tasks[id]].filter(Boolean) : Object.values(state.tasks);
   if (id && records.length === 0) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
+<<<<<<< HEAD
   return Promise.all(
     records.map(async (storedRecord) => {
       const record = {
@@ -1617,6 +1812,13 @@ export async function getStatus(configPath, id) {
       };
     }),
   );
+=======
+  return Promise.all(records.map((storedRecord) => computeStatusRecord(config, state, storedRecord)));
+}
+
+export async function getStatusSummary(configPath) {
+  return (await getStatus(configPath)).map(summarizeStatusRecord);
+>>>>>>> 5863351 (feat: bounded all-task status summary)
 }
 
 export async function getPendingResultIds(configPath) {

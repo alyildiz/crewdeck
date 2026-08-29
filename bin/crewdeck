@@ -7,6 +7,7 @@ import {
   cleanupTask,
   collectResults,
   getStatus,
+  getStatusSummary,
   getTaskDiff,
   loadConfig,
   forwardReviewFindings,
@@ -42,7 +43,7 @@ Usage:
   crewdeck project list
   crewdeck spawn <project> <kind> <id> <task> [--profile <name>] [--reviewed-pr]
   crewdeck review <parent-id> <review-id> <reviewed-head> <task> [--profile <name>]
-  crewdeck status [id]
+  crewdeck status [id] [--summary]   # no id: full records; --summary: bounded all-task summary
   crewdeck collect [id|inbox-key ...] [--keep-reports]
   crewdeck diff <build-id>
   crewdeck prompt <id> <message> [--wait]
@@ -128,7 +129,9 @@ try {
       break;
     }
     case "status":
-      result = await getStatus(configPath, args[0]);
+      result = args.includes("--summary")
+        ? await getStatusSummary(configPath)
+        : await getStatus(configPath, args.find((arg) => !arg.startsWith("--")));
       break;
     case "collect":
       result = await collectResults(

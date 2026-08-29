@@ -12,6 +12,7 @@ import {
   collectResults,
   getPendingResultIds,
   getStatus,
+  getStatusSummary,
   forwardReviewFindings,
   forwardBaseAdvance,
   extendReviewRounds,
@@ -147,10 +148,13 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "crew_status",
     label: "Crew Status",
-    description: "Read current Herdr and Git state for all Crewdeck tasks or one task without waking workers.",
-    parameters: Type.Object({ id: Type.Optional(Type.String()) }),
+    description:
+      "Bounded per-task status summary for all Crewdeck tasks without waking workers: orchestration loop fields only (next action, review round/max, escalation, verdict/checks/observer state, PR, agent, git, result/candidate paths, compact review inbox, latest PR observation). Pass id for one task's full durable record. Read the durable files at result.path or candidates.path for report or review content.",
+    parameters: Type.Object({
+      id: Type.Optional(Type.String({ description: "Task id; omit for the bounded all-task summary, set for the full single-task record" })),
+    }),
     async execute(_id, params) {
-      return text(await getStatus(CONFIG, params.id));
+      return text(params.id ? await getStatus(CONFIG, params.id) : await getStatusSummary(CONFIG));
     },
   });
 

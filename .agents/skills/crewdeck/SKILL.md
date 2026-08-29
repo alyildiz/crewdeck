@@ -40,7 +40,7 @@ After dispatch, report task names, kinds, workflows, profiles, and purposes. Do 
 
 The completion watcher reconciles durable inbox events on writes and restart, then necessarily wakes this orchestrator with `CREWDECK COMPLETION`. On that follow-up:
 
-1. Call `crew_status` for the named task ids (strip `@candidate-N` from inbox keys).
+1. Call `crew_status` with the named task ids (strip `@candidate-N` from inbox keys); an id returns that task's full durable record.
 2. Call `crew_collect_results` with the exact inbox keys from the follow-up.
 3. Treat collection as acknowledgement. Never infer completion from Herdr `idle`/`done` alone.
 
@@ -86,6 +86,8 @@ Use `crew_abandon` for a clean settled obsolete unintegrated change. It has inde
 ## Steering and recovery
 
 Use `crew_steer` for ordinary missing requirements or conflict instructions. Use `crew_forward_review` instead for collected review findings.
+
+Status is two-level. `crew_status` without an id returns a bounded per-task summary for all tasks: only the orchestration loop fields (next action, current/max review round, escalation, PR URL/state, verdict, checks, observer state, candidate versions, compact review inbox, latest PR observation, result/candidate paths). Terminal tasks are one compact line. `crew_status` with an id returns the full durable record for that task. Report and review content is not inlined in the summary: read the durable files at `result.path` (report) and `candidates.path` (candidate journal) when you need the content.
 
 Use `crew_status` after restart; next action, current/max round, escalation, PR URL/state, verdict, checks, observer state, candidate journals, review inboxes, and reconciliation attempts are durable. The authenticated observer rescans at startup and on a bounded cadence; merged observation only notifies and never replaces confirmed reconciliation. Missing/closed-unmerged/unknown/lookup failure are never merged.
 
