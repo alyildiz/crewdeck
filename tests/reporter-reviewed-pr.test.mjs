@@ -37,7 +37,7 @@ async function reporterHarness() {
   return { root, extension: path.join(extensionDir, "reporter.ts") };
 }
 
-function runReporter({ extension, cwd, reportDir, workflow, script }) {
+function runReporter({ extension, cwd, reportDir, workflow, script, env = {} }) {
   return spawnSync(
     process.execPath,
     ["--experimental-strip-types", "--input-type=module", "-e", script],
@@ -58,10 +58,60 @@ function runReporter({ extension, cwd, reportDir, workflow, script }) {
         CREWDECK_MAX_REVIEW_ROUNDS: "3",
         CREWDECK_REPORT_TOKEN: "a".repeat(48),
         CREWDECK_REPORT_DIR: reportDir,
+        ...env,
       },
     },
   );
 }
+
+test("review reporter attaches and verifies evidence automatically without model attestation", async (t) => {
+  const harness = await reporterHarness();
+  t.after(() => rm(harness.root, { recursive: true, force: true }));
+  const repo = path.join(harness.root, "review-repo");
+  const reportDir = path.join(harness.root, "review-reports");
+  execFileSync("git", ["init", "-q", "-b", "main", repo]);
+  git(repo, "config", "user.name", "Fixture");
+  git(repo, "config", "user.email", "fixture@example.com");
+  await writeFile(path.join(repo, "file.txt"), "reviewed\n");
+  git(repo, "add", "file.txt");
+  git(repo, "commit", "-qm", "reviewed candidate");
+  const head = git(repo, "rev-parse", "HEAD");
+  await mkdir(reportDir, { recursive: true });
+  const patchPath = path.join(reportDir, "review-one.review-full.patch");
+  const patch = Buffer.from("diff fixture\n");
+  await writeFile(patchPath, patch);
+  const patchSha = (await import("node:crypto")).createHash("sha256").update(patch).digest("hex");
+  const evidencePayload = {
+    schemaVersion: 2, parentTaskId: "build-one", reviewTaskId: "review-one", reviewDepth: "standard",
+    baseSha: "1".repeat(40), candidateSha: head, candidateVersion: 1, generatedAt: new Date().toISOString(),
+    featureScope: "fixture", candidate: { summary: "fixture", tests: [], risks: [], openQuestions: [] },
+    commits: [], diffstat: "", changedFiles: ["M\\tfile.txt"],
+    fullPatch: { path: patchPath, bytes: patch.byteLength, sourceBytes: patch.byteLength, truncated: false, contentSha256: patchSha },
+  };
+  const evidenceSha = (await import("node:crypto")).createHash("sha256").update(JSON.stringify(evidencePayload), "utf8").digest("hex");
+  const evidencePath = path.join(reportDir, "review-one.review-evidence.json");
+  await writeFile(evidencePath, JSON.stringify({ ...evidencePayload, contentSha256: evidenceSha }));
+  const script = `
+    const tools=[]; const pi={registerTool(tool){tools.push(tool)}};
+    const {default: reporter}=await import(process.env.CREW_REPORTER_EXTENSION); reporter(pi);
+    const payload={parentTaskId:"build-one",reviewedHead:${JSON.stringify(head)},verdict:"approved",summary:"focused review passed",findings:[],checks:["inspected correction"],openQuestions:[]};
+    const result=await tools.find(t=>t.name==="crew_complete").execute("review",payload);
+    console.log(JSON.stringify({terminate:result.terminate}));
+  `;
+  const result = runReporter({
+    extension: harness.extension, cwd: repo, reportDir, workflow: "direct", script,
+    env: {
+      CREWDECK_TASK_ID: "review-one", CREWDECK_TASK_KIND: "review", CREWDECK_TASK_LIFECYCLE: "report",
+      CREWDECK_TASK_CONTRACT: "review", CREWDECK_PARENT_TASK_ID: "build-one", CREWDECK_REVIEWED_HEAD: head,
+      CREWDECK_REVIEW_EVIDENCE_PATH: evidencePath, CREWDECK_REVIEW_EVIDENCE_SHA256: evidenceSha,
+      CREWDECK_REVIEW_DEPTH: "standard",
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).terminate, true);
+  const report = JSON.parse(await readFile(path.join(reportDir, "review-one.json"), "utf8"));
+  assert.equal(report.payload.evidenceSha256, evidenceSha);
+});
 
 test("reproduces immutable terminating crew_complete and keeps reviewed-pr candidates non-terminating and versioned", async (t) => {
   const harness = await reporterHarness();

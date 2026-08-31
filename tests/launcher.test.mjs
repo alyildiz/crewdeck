@@ -32,6 +32,18 @@ test("orchestrator launcher disables discovery and loads only the Crewdeck skill
   ]);
 });
 
+test("Crewdeck skill keeps startup context small and routes detailed procedures on demand", async () => {
+  const skillRoot = path.join(root, ".agents", "skills", "crewdeck");
+  const skill = await readFile(path.join(skillRoot, "SKILL.md"), "utf8");
+  assert.ok(Buffer.byteLength(skill, "utf8") < 6 * 1024, "startup skill must stay below 6 KiB");
+  for (const name of ["reviewed-pr", "publication", "reconciliation", "recovery", "status"]) {
+    assert.match(skill, new RegExp(`references/${name}\\.md`));
+    const reference = await readFile(path.join(skillRoot, "references", `${name}.md`), "utf8");
+    assert.ok(reference.length > 500, `${name} reference must contain its operational contract`);
+    assert.doesNotMatch(reference, /^---$/m, "reference files must not be discovered as extra skills");
+  }
+});
+
 test("orchestrator launcher refuses additional skills", async () => {
   await assert.rejects(
     () => execFileAsync(launcher, ["--skill", "/tmp/unapproved-skill"]),

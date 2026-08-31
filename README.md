@@ -22,6 +22,8 @@ The Herdr 0.8 API was verified rather than assumed: `worktree create` without `-
 
 ## Layout and durable state
 
+Agents modifying Crewdeck itself should start with [`docs/architecture.md`](docs/architecture.md), which routes each domain to its implementation and focused verification command. Status, review evidence, publication, and merged/base-advance reconciliation live in dedicated modules under `src/core/`; `src/core.mjs` remains the stable public facade.
+
 ```text
 ~/projects/crewdeck/                                      orchestrator cwd
 ~/.local/share/crewdeck/worktrees/<project>/<task>/      worker cwd
@@ -126,7 +128,8 @@ Requirements: Node.js, Git, Pi, Herdr 0.8+, and `gh` for draft-PR publication/re
 
 ```bash
 npm install
-npm test
+npm run test:status       # focused iteration example
+npm test                  # required final suite
 npm run check
 ```
 
@@ -194,7 +197,9 @@ Candidate events use keys such as `build-id@candidate-1` in the existing complet
 
 `crew_spawn_review` requires the parent reviewed-pr build, a collected current candidate, and its full SHA. It refuses a moving writer, stale SHA, duplicate reviewer, another open reviewer, or exhausted rounds. The review task is detached at that exact commit and exposes no shell/write/steering tool.
 
-Before launch Crewdeck precomputes an authoritative bounded evidence document from the pinned `baseSha...reviewedHead`: full commit identities, diffstat, and a patch capped at 40 KiB. The document includes parent/reviewer/base/candidate identity and a SHA-256 digest, is outside the build worktree, and is exposed read-only to the shell-free reviewer. The reviewer attests `evidenceSha256`; collection recomputes the digest and refuses stale or tampered evidence.
+Before launch Crewdeck precomputes authoritative bounded review context from the pinned `baseSha...reviewedHead`: feature scope, candidate summary/tests/risks, full commit identities, changed files, diffstat, and a separately hashed full patch capped at 40 KiB. From candidate v2 onward it also includes prior findings and a correction-only patch capped at 24 KiB, so standard review starts with the delta instead of rereading the whole feature. The full patch remains available as fallback. Context and patches live outside the build worktree and are exposed read-only to the shell-free reviewer. Crewdeck attaches `evidenceSha256` automatically and both the reporter and collection independently recompute context and patch digests, refusing stale or tampered evidence.
+
+Review depth defaults to `standard`: one focused pass over changed code, direct callers, and associated tests, with no unrelated repository audit. `reviewDepth: deep` (CLI `--deep`) is explicit for security, authorization, concurrency, persistence, destructive, cryptographic, or public-contract risk. Standard review refuses xhigh/max profiles; use low/medium normally. Output is bounded to 20 findings and a 3,000-character summary for standard review, versus 50 findings and 8,000 characters for deep review.
 
 Its terminating result contains:
 
@@ -203,7 +208,7 @@ Its terminating result contains:
   "parentTaskId": "build-id",
   "reviewedHead": "0123456789abcdef0123456789abcdef01234567",
   "verdict": "approved | changes-requested | blocked | inconclusive",
-  "evidenceSha256": "<64 hex characters>",
+  "evidenceSha256": "<automatically attached 64 hex characters>",
   "summary": "...",
   "findings": [{
     "severity": "blocking | major | minor | nit",
@@ -304,18 +309,18 @@ The project extension exposes:
 
 - `crew_spawn_batch` (`workflow` may be `direct` or `reviewed-pr`)
 - `crew_spawn_review`
-- `crew_status` (bounded active or targeted summary by default; explicit paginated `history`/`all`; full single-task troubleshooting only with `mode=diagnostic`), `crew_collect_results`, explicit selective `crew_read_result`, `crew_diff`
+- `crew_status` (token-minimal action projection by default; bounded `mode=detail`; explicit paginated `history`/`all`; full single-task troubleshooting only with `mode=diagnostic`), `crew_collect_results`, explicit selective `crew_read_result`, `crew_diff`
 - `crew_steer`, `crew_forward_review`, `crew_resume_build`
 - `crew_publish_pr`, read-only `crew_observe_prs`, controlled `crew_forward_base_advance`
 - separately confirmed `crew_reconcile_verdict`, `crew_extend_review_rounds`, `crew_retire_agent`, and state-lock recovery
 - separately confirmed `crew_reconcile_merged_pr`
 - existing `crew_prepare_integration`, confirmed `crew_merge`, confirmed `crew_abandon`, confirmed `crew_reconcile_orphan_report`, and confirmed `crew_cleanup`
 
-When durable events arrive, the extension uses `pi.sendUserMessage(..., { deliverAs: "followUp" })`. Completion keys are announced in chunks of 20. Announcement memory is session-local by design: every restart reconciles and reannounces still-pending durable keys, so a delivered message can never hide an uncollected event after restart. The orchestrator calls bounded targeted status and then collection; no background LLM polling occurs. Merged-PR base-advance notices use the same 20-item chunk ceiling.
+When durable events arrive, the extension uses `pi.sendUserMessage(..., { deliverAs: "followUp" })`. Completion keys are announced in chunks of 20. Announcement memory is session-local by design: every restart reconciles and reannounces still-pending durable keys, so a delivered message can never hide an uncollected event after restart. The orchestrator collects the announced exact keys directly; no status preflight or background LLM polling occurs. Merged-PR base-advance notices use the same 20-item chunk ceiling.
 
-`crew_status` is bounded by default. With an `id` it returns one targeted token-safe projection and does not inline result payloads, candidate journals, task descriptions, or raw paths. Without an id it returns an active/actionable page of 20; `scope=history|all` and `limit` up to 50 are explicit. Returned opaque cursors bind scope and a task-membership generation, and fail visibly with `invalid_status_cursor` after creation or scope transitions instead of silently skipping work. Legacy non-negative safe-integer offsets remain accepted as best-effort input, but every new continuation is opaque. The actual indented UTF-8 Pi/CLI boundary has a 128 KiB hard budget, including Unicode and JSON escaping. Terminal summaries expose safe `result:<id>` and `candidates:<id>` references where relevant; `pr-merged.terminalAt` is local `mergedReconciledAt`, while `remotePrMergedAt` is GitHub's merge time.
+`crew_status` defaults to a token-minimal action projection. With an `id` it returns task identity, observed state, a stable next-action code, and only the fields required for that action, such as an exact candidate SHA when spawning a review. Without an id it returns an active page of 20; `scope=history|all` and `limit` up to 50 are explicit. Returned opaque cursors bind scope and a task-membership generation, and fail visibly with `invalid_status_cursor` after creation or scope transitions instead of silently skipping work. Legacy non-negative safe-integer offsets remain accepted as best-effort input, but every new continuation is opaque. `mode=detail` retains the bounded operational projection and its 128 KiB hard budget. Terminal detail summaries expose safe `result:<id>` and `candidates:<id>` references where relevant.
 
-Full historical behavior remains available only as explicit troubleshooting: Pi uses `crew_status { id, mode: "diagnostic" }`; CLI uses `crewdeck status --diagnostic <id>`. The old CLI `--summary` flag remains a bounded no-op for compatibility, but `status [id]` now defaults safe. Raw report/candidate paths are never model-facing. Use `crew_read_result { key }` or `crewdeck read-result <key>` to selectively read one token-redacted report or one exact candidate version.
+Completion collection performs the durable validation and returns the task projection with each payload exactly once. Use action status only when the next step is unclear or after restart without a completion event. Full historical behavior remains available only as explicit troubleshooting: Pi uses `crew_status { id, mode: "diagnostic" }`; CLI uses `crewdeck status --diagnostic <id>`. Pi uses `mode: "detail"`, and CLI uses `status --detail`, for the bounded operational projection. The old CLI `--summary` flag aliases `--detail`. Raw report/candidate paths are never model-facing. Use `crew_read_result { key }` or `crewdeck read-result <key>` to selectively read one token-redacted report or one exact candidate version.
 
 `crew_collect_results` accepts at most 20 exact keys. For explicit keys, the backward-compatible result array contains each report/candidate payload exactly once plus a minimal task projection. Omitted ids return one bounded `{ items, pagination }` page with `remaining/hasMore` metadata. A reviewed build id never means all candidate versions: use sequential exact `build-id@candidate-N` keys. Duplicate, out-of-order, oversized, missing, and already-collected requests fail clearly.
 
@@ -327,6 +332,7 @@ bin/crewdeck spawn my-project scout inspect "Inspect without changing code" --pr
 bin/crewdeck spawn my-project build direct-fix "Implement the accepted fix" --profile cloud-medium
 bin/crewdeck collect inspect
 bin/crewdeck status --scope active --limit 20
+bin/crewdeck status --detail reviewed-fix
 # explicit troubleshooting only:
 bin/crewdeck status --diagnostic direct-fix
 bin/crewdeck prepare direct-fix
@@ -335,7 +341,9 @@ bin/crewdeck merge direct-fix --confirm
 # Reviewed PR
 bin/crewdeck spawn my-project build reviewed-fix "Implement the accepted fix" --profile cloud-medium --reviewed-pr
 bin/crewdeck collect reviewed-fix@candidate-1
-bin/crewdeck review reviewed-fix reviewed-fix-r1 <40-char-sha> "Review correctness and regressions" --profile cloud-deep
+bin/crewdeck review reviewed-fix reviewed-fix-r1 <40-char-sha> "Review correctness and regressions" --profile cloud-medium
+# For explicitly high-risk work only:
+bin/crewdeck review reviewed-fix reviewed-fix-r1 <40-char-sha> "Deep security review" --profile cloud-deep --deep
 bin/crewdeck collect reviewed-fix-r1
 bin/crewdeck forward-review reviewed-fix-r1
 # after a later approved current SHA:

@@ -10,7 +10,12 @@
   },
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "check": "node --check src/core.mjs && node --check src/completion-wake.mjs && node --check src/crew-view.mjs && node --check bin/crewdeck && node --experimental-strip-types --check worker/reporter.ts && node --experimental-strip-types --check .pi/extensions/crewdeck/index.ts && bash -n bin/crewdeck-pi"
+    "test:status": "node --test tests/status-summary.test.mjs tests/crew-view.test.mjs tests/completion-wake.test.mjs tests/completion-boundary.test.mjs",
+    "test:core": "node --test tests/core.test.mjs tests/config-templates.test.mjs tests/fresh-remote-base.test.mjs tests/state-lock.test.mjs",
+    "test:review": "node --test tests/reviewed-pr.test.mjs tests/reporter-reviewed-pr.test.mjs",
+    "test:publication": "node --test tests/reviewed-pr.test.mjs",
+    "test:reconciliation": "node --test tests/merged-pr-reconcile.test.mjs tests/orphan-reconcile.test.mjs tests/abandon.test.mjs tests/base-advance.test.mjs",
+    "check": "node --check src/core.mjs && node --check src/core/status.mjs && node --check src/core/review.mjs && node --check src/core/publication.mjs && node --check src/core/reconciliation.mjs && node --check src/completion-wake.mjs && node --check src/crew-view.mjs && node --check bin/crewdeck && node --experimental-strip-types --check worker/reporter.ts && node --experimental-strip-types --check .pi/extensions/crewdeck/index.ts && bash -n bin/crewdeck-pi"
   },
   "pi": {
     "extensions": [

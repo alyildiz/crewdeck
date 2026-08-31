@@ -380,6 +380,7 @@ test("summary validates scope, maximum limit, and cursor", async () => {
     await assert.rejects(() => getStatusSummary(configPath, { cursor: 1.5 }), { code: "invalid_status_cursor" });
     await assert.rejects(() => getStatusView(configPath, { id: "reviewed-build", limit: 1 }), { code: "invalid_status_arguments" });
     await assert.rejects(() => getStatusView(configPath, { mode: "diagnostic", scope: "active" }), { code: "invalid_status_arguments" });
+    await assert.rejects(() => getStatusView(configPath, { mode: "verbose" }), { code: "invalid_status_mode" });
   });
 });
 
@@ -587,7 +588,33 @@ test("full status with an id remains the durable diagnostic record", async () =>
   });
 });
 
-test("CLI defaults to bounded status and keeps full diagnostics explicit", async () => {
+test("default action projection omits operational detail and stays below 500 bytes per task", async () => {
+  const { stateDir, configPath } = await fixture();
+  await withStateDir(stateDir, async () => {
+    const page = await getStatusView(configPath, { mode: "action" });
+    assert.equal(page.scope, "active");
+    assert.equal(page.total, 2);
+    assert.deepEqual(page.tasks.map((item) => item.id), ["abandoned-pending", "reviewed-build"]);
+    const build = page.tasks.find((item) => item.id === "reviewed-build");
+    assert.deepEqual(build, {
+      id: "reviewed-build",
+      project: "demo",
+      state: "merge-cleanup-pending",
+      action: "resolve-review-escalation",
+      round: "250/300",
+      pr: { number: 42, state: "open" },
+    });
+    assert.equal(build.nextAction, undefined);
+    assert.equal(build.git, undefined);
+    assert.equal(build.agent, undefined);
+    assert.equal(build.reviews, undefined);
+    for (const task of page.tasks) {
+      assert.ok(Buffer.byteLength(JSON.stringify(task), "utf8") < 500, `${task.id} action projection exceeds 500 bytes`);
+    }
+  });
+});
+
+test("action status stays minimal while detail and diagnostics remain explicit", async () => {
   const { stateDir, configPath, historyIds } = await fixture();
   const env = { ...process.env, CREWDECK_STATE_DIR: stateDir, CREWDECK_CONFIG: configPath };
   const pageResult = spawnSync(process.execPath, [CLI, "status", "--summary", "--scope", "history", "--limit", "3", "--cursor", "2"], {
@@ -607,10 +634,15 @@ test("CLI defaults to bounded status and keeps full diagnostics explicit", async
   assert.equal(invalid.status, 1);
   assert.equal(JSON.parse(invalid.stderr).code, "invalid_status_limit");
 
-  const bounded = spawnSync(process.execPath, [CLI, "status", "old-scout"], { env, encoding: "utf8" });
-  assert.equal(bounded.status, 0, bounded.stderr);
-  assert.equal(JSON.parse(bounded.stdout).id, "old-scout");
-  assert.ok(!bounded.stdout.includes("SECRET-LARGE-"));
+  const action = spawnSync(process.execPath, [CLI, "status", "old-scout"], { env, encoding: "utf8" });
+  assert.equal(action.status, 0, action.stderr);
+  assert.deepEqual(JSON.parse(action.stdout), { id: "old-scout", project: "demo", state: "cleaned", action: "inspect" });
+  assert.ok(Buffer.byteLength(action.stdout, "utf8") < 500);
+  assert.ok(!action.stdout.includes("SECRET-LARGE-"));
+
+  const detail = spawnSync(process.execPath, [CLI, "status", "--detail", "old-scout"], { env, encoding: "utf8" });
+  assert.equal(detail.status, 0, detail.stderr);
+  assert.equal(JSON.parse(detail.stdout).observedStatus, "cleaned");
 
   const full = spawnSync(process.execPath, [CLI, "status", "--diagnostic", "old-scout"], { env, encoding: "utf8" });
   assert.equal(full.status, 0, full.stderr);

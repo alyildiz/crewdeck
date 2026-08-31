@@ -42,8 +42,9 @@ Usage:
   crewdeck project add <name> <path> [--base <branch>] [--base-remote <remote>] [--trust]
   crewdeck project list
   crewdeck spawn <project> <kind> <id> <task> [--profile <name>] [--reviewed-pr]
-  crewdeck review <parent-id> <review-id> <reviewed-head> <task> [--profile <name>]
+  crewdeck review <parent-id> <review-id> <reviewed-head> <task> [--profile <name>] [--deep]
   crewdeck status [id] [--scope active|history|all] [--limit 1..50] [--cursor <opaque>]
+  crewdeck status --detail [id]       # bounded operational projection
   crewdeck status --diagnostic <id>   # explicit legacy full record
   crewdeck collect [id|inbox-key ...] [--keep-reports]
   crewdeck read-result <id|exact-candidate-key>
@@ -127,20 +128,24 @@ try {
         reviewedHead: args[2],
         task: args[3],
         profile: option("--profile"),
+        reviewDepth: args.includes("--deep") ? "deep" : "standard",
       });
       break;
     }
     case "status": {
       let id;
-      let diagnostic = false;
+      let mode = "action";
       let scope;
       let limit;
       let cursor;
       for (let index = 0; index < args.length; index += 1) {
         const argument = args[index];
-        if (argument === "--summary") continue; // backward-compatible no-op: bounded is now the default.
+        if (argument === "--summary" || argument === "--detail") {
+          mode = "detail";
+          continue;
+        }
         if (argument === "--diagnostic") {
-          diagnostic = true;
+          mode = "diagnostic";
           continue;
         }
         if (["--scope", "--limit", "--cursor"].includes(argument)) {
@@ -162,7 +167,7 @@ try {
         if (id !== undefined) throw new Error("status accepts at most one task id");
         id = argument;
       }
-      result = await getStatusView(configPath, { id, mode: diagnostic ? "diagnostic" : "bounded", scope, limit, cursor });
+      result = await getStatusView(configPath, { id, mode, scope, limit, cursor });
       break;
     }
     case "collect":

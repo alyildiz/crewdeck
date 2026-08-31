@@ -115,7 +115,7 @@ test("merged observation durably fans out, classifies, excludes, deduplicates, a
   assert.equal(again.status, 0, again.stderr); assert.equal(JSON.parse(again.stdout).idempotent, true);
   assert.equal(await readFile(fx.herdrLog, "utf8"), once);
 
-  const status = run(fx, "status", "conflict");
+  const status = run(fx, "status", "--detail", "conflict");
   assert.equal(status.status, 0, status.stderr);
   assert.equal(JSON.parse(status.stdout).baseAdvanceState.status, "forwarded");
 

@@ -1,11 +1,17 @@
 import { execFile } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parse as parseYaml } from "yaml";
+import { createPublicationService } from "./core/publication.mjs";
+import { createReconciliationService } from "./core/reconciliation.mjs";
+import { createReviewService } from "./core/review.mjs";
+import { COLLECTION_LIMIT, createStatusService } from "./core/status.mjs";
+
+export { DEFAULT_STATUS_LIMIT, MAX_STATUS_LIMIT, STATUS_OUTPUT_BUDGET_BYTES } from "./core/status.mjs";
 
 const execFileAsync = promisify(execFile);
 const TASK_ID_RE = /^[a-z][a-z0-9-]{0,23}$/;
@@ -16,6 +22,7 @@ const WORKFLOWS = new Set(["direct", "reviewed-pr"]);
 const BUILTIN_TOOLS = new Set(["read", "grep", "find", "ls", "bash", "edit", "write"]);
 const MUTATING_TOOLS = new Set(["bash", "edit", "write"]);
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const REVIEW_DEPTHS = new Set(["standard", "deep"]);
 const REPORTER_EXTENSION = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../worker/reporter.ts");
 
 export class CrewdeckError extends Error {
@@ -56,27 +63,6 @@ function taskCandidatesPath(id) {
   return path.join(reportsRoot(), `${id}.candidates.json`);
 }
 
-function reviewEvidencePath(id) {
-  return path.join(reportsRoot(), `${id}.review-evidence.json`);
-}
-
-async function verifyReviewEvidence(record) {
-  if (!record.reviewEvidence) return { available: false, state: "legacy-absent" };
-  try {
-    const evidence = JSON.parse(await readFile(record.reviewEvidence.path, "utf8"));
-    const { contentSha256, ...payload } = evidence;
-    const actual = createHash("sha256").update(JSON.stringify(payload), "utf8").digest("hex");
-    if (
-      actual !== contentSha256 || contentSha256 !== record.reviewEvidence.contentSha256 ||
-      evidence.parentTaskId !== record.parentTaskId || evidence.reviewTaskId !== record.id ||
-      evidence.baseSha !== record.reviewEvidence.baseSha || evidence.candidateSha !== record.reviewedHead
-    ) throw new Error("identity or digest mismatch");
-    return { available: true, evidence };
-  } catch (error) {
-    return { available: false, error: `Reviewer evidence is stale or tampered: ${error.message}` };
-  }
-}
-
 async function readCandidateJournal(record) {
   try {
     const journal = JSON.parse(await readFile(taskCandidatesPath(record.id), "utf8"));
@@ -103,6 +89,10 @@ async function readCandidateJournal(record) {
     return { available: false, error: error.message };
   }
 }
+
+const reviewService = createReviewService({ CrewdeckError, git, readCandidateJournal, reportsRoot });
+const createReviewEvidence = reviewService.createReviewEvidence;
+const verifyReviewEvidence = reviewService.verifyReviewEvidence;
 
 async function readTaskReport(record) {
   try {
@@ -676,6 +666,9 @@ function validateTaskInput(task, config) {
   if (kind.contract === "review" && (!task.parentTaskId || !task.reviewedHead)) {
     throw new CrewdeckError("Review tasks must be spawned with parentTaskId and reviewedHead", "invalid_review_contract");
   }
+  if (kind.contract === "review" && !REVIEW_DEPTHS.has(task.reviewDepth || "standard")) {
+    throw new CrewdeckError("Review depth must be standard or deep", "invalid_review_depth");
+  }
 }
 
 function agentName(id) {
@@ -688,9 +681,12 @@ function workerPrompt(task, project, kind) {
     delivery = [
       `This is a ${task.kind} review task: ${kind.description}`,
       `Review exactly commit ${task.reviewedHead} for parent build ${task.parentTaskId}. The detached worktree is immutable; never review another HEAD.`,
-      `Authoritative shell-free evidence is precomputed at ${task.reviewEvidence?.path || "(unavailable)"}; verify its parent/base/candidate identity and SHA-256 ${task.reviewEvidence?.contentSha256 || "(legacy)"} before reviewing.`,
-      "Filesystem access is strictly read-only and no shell is available. Do not message or steer the build agent.",
-      "Finish by calling crew_complete exactly once with the bound parentTaskId/reviewedHead, verdict, summary, structured findings, checks, and openQuestions.",
+      `Start with the authoritative review context at ${task.reviewEvidence?.path || "(unavailable)"}. Crewdeck verifies its exact-SHA identity and attached patch digests deterministically.`,
+      task.reviewDepth === "deep"
+        ? "This is an explicit deep review. Inspect the complete change and relevant architecture, security, concurrency, persistence, and regression surfaces. Stay evidence-based and avoid unrelated cleanup advice."
+        : "This is a standard bounded review. Start with the correction delta when present, then inspect changed code, direct callers, and associated tests only. Do not audit unrelated repository areas. Stop after one focused pass when no concrete defect remains; keep findings concise and actionable.",
+      "Filesystem access is strictly read-only and no shell is available. Do not attempt to rerun tests, message, or steer the build agent; assess declared test evidence and code instead.",
+      "Finish by calling crew_complete exactly once with the bound parentTaskId/reviewedHead, verdict, concise summary, structured findings, checks, and openQuestions. Crewdeck attaches the evidence digest automatically.",
     ];
   } else if (kind.lifecycle === "report") {
     delivery = [
@@ -764,133 +760,6 @@ function validBranchName(value) {
   );
 }
 
-const VERDICT_COMMENT_MAX_BYTES = 48 * 1024;
-const REVIEW_SEVERITIES = new Set(["blocking", "major", "minor", "nit"]);
-
-function truncateUtf8(value, maxBytes) {
-  const text = String(value);
-  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-  const suffix = "\n… [truncated by Crewdeck]";
-  const available = maxBytes - Buffer.byteLength(suffix, "utf8");
-  let bytes = 0;
-  let truncated = "";
-  for (const character of text) {
-    const size = Buffer.byteLength(character, "utf8");
-    if (bytes + size > available) break;
-    truncated += character;
-    bytes += size;
-  }
-  return `${truncated}${suffix}`;
-}
-
-function safeReviewJson(value, maxBytes) {
-  const json = JSON.stringify(value, null, 2).replace(/[\u202a-\u202e\u2066-\u2069]/g, (character) =>
-    `\\u${character.codePointAt(0).toString(16).padStart(4, "0")}`,
-  );
-  const escaped = json
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll("@", "&#64;&#8203;");
-  return truncateUtf8(escaped, maxBytes);
-}
-
-function validatedVerdictPayload(taskId, candidate, approval) {
-  if (
-    !TASK_ID_RE.test(taskId) ||
-    !approval ||
-    approval.verdict !== "approved" ||
-    approval.reviewedHead !== candidate.head ||
-    approval.candidateVersion !== candidate.version ||
-    !TASK_ID_RE.test(approval.reviewTaskId || "") ||
-    typeof approval.summary !== "string" ||
-    !approval.summary ||
-    !Array.isArray(approval.checks) ||
-    approval.checks.length > 100 ||
-    approval.checks.some((item) => typeof item !== "string") ||
-    !Array.isArray(approval.findings) ||
-    approval.findings.length > 100 ||
-    approval.findings.some((finding) =>
-      !finding ||
-      !REVIEW_SEVERITIES.has(finding.severity) ||
-      finding.severity === "blocking" ||
-      ["title", "detail", "location", "recommendation"].some(
-        (field) => typeof finding[field] !== "string",
-      )
-    ) ||
-    !Array.isArray(approval.openQuestions) ||
-    approval.openQuestions.length > 100 ||
-    approval.openQuestions.some((item) => typeof item !== "string")
-  ) {
-    throw new CrewdeckError("Approved reviewer data is invalid", "invalid_review_result");
-  }
-  return {
-    verdict: approval.verdict,
-    approvedSha: candidate.head,
-    reviewerTaskId: approval.reviewTaskId,
-    candidateVersion: candidate.version,
-    taskId,
-    summary: approval.summary,
-    checks: approval.checks,
-    findings: approval.findings,
-    openQuestions: approval.openQuestions,
-  };
-}
-
-function renderVerdictComment(taskId, candidate, approval) {
-  const payload = validatedVerdictPayload(taskId, candidate, approval);
-  const marker = `<!-- crewdeck-verdict:${taskId}:${candidate.head} -->`;
-  const body = [
-    marker,
-    "## Crewdeck immutable reviewed-PR verdict",
-    "",
-    "This append-only audit comment is bound to one exact commit. Crewdeck never edits or deletes it, even if the PR head later changes.",
-    "**This comment is not an official GitHub approval.**",
-    "",
-    "### Verdict identity",
-    "<pre>",
-    safeReviewJson({
-      verdict: payload.verdict,
-      approvedSha: payload.approvedSha,
-      reviewerTaskId: payload.reviewerTaskId,
-      candidateVersion: payload.candidateVersion,
-      taskId: payload.taskId,
-    }, 2 * 1024),
-    "</pre>",
-    "",
-    "### Summary",
-    "<pre>",
-    safeReviewJson(payload.summary, 7 * 1024),
-    "</pre>",
-    "",
-    "### Checks",
-    "<pre>",
-    safeReviewJson(payload.checks, 8 * 1024),
-    "</pre>",
-    "",
-    "### Findings",
-    "<pre>",
-    safeReviewJson(payload.findings, 20 * 1024),
-    "</pre>",
-    "",
-    "### Open questions",
-    "<pre>",
-    safeReviewJson(payload.openQuestions, 8 * 1024),
-    "</pre>",
-  ].join("\n");
-  if (
-    Buffer.byteLength(body, "utf8") > VERDICT_COMMENT_MAX_BYTES ||
-    body.split(marker).length !== 2
-  ) {
-    throw new CrewdeckError("Rendered verdict comment exceeds its safe bound", "verdict_comment_too_large");
-  }
-  return {
-    marker,
-    body,
-    contentSha256: createHash("sha256").update(body, "utf8").digest("hex"),
-  };
-}
-
 async function bindWorkerEnvironment(paneId, record) {
   const values = {
     CREWDECK_TASK_ID: record.id,
@@ -905,6 +774,7 @@ async function bindWorkerEnvironment(paneId, record) {
     CREWDECK_REVIEWED_HEAD: record.reviewedHead || "",
     CREWDECK_REVIEW_EVIDENCE_PATH: record.reviewEvidence?.path || "",
     CREWDECK_REVIEW_EVIDENCE_SHA256: record.reviewEvidence?.contentSha256 || "",
+    CREWDECK_REVIEW_DEPTH: record.reviewDepth || "standard",
     CREWDECK_MAX_REVIEW_ROUNDS: record.effectiveMaxReviewRounds || record.maxReviewRounds || 3,
     CREWDECK_REPORT_TOKEN: record.reportToken,
     CREWDECK_REPORT_DIR: reportsRoot(),
@@ -1139,6 +1009,7 @@ async function createOne(config, project, sourceWorkspace, task, profileName, ch
     ...(task.reviewedHead ? { reviewedHead: task.reviewedHead } : {}),
     ...(task.candidateVersion ? { candidateVersion: task.candidateVersion } : {}),
     ...(task.reviewEvidence ? { reviewEvidence: task.reviewEvidence } : {}),
+    ...(kind.contract === "review" ? { reviewDepth: task.reviewDepth || "standard" } : {}),
     maxReviewRounds: config.maxReviewRounds,
     effectiveMaxReviewRounds: config.maxReviewRounds,
     base: project.base,
@@ -1254,45 +1125,13 @@ export async function spawnBatch(configPath, { project: projectName, tasks, prof
   );
 }
 
-async function createReviewEvidence(parent, reviewTaskId, candidate) {
-  if (!/^[0-9a-f]{40}$/.test(parent.baseSha || "")) {
-    throw new CrewdeckError("Reviewer evidence requires the parent's pinned base SHA", "base_sha_unproven");
-  }
-  const range = `${parent.baseSha}...${candidate.head}`;
-  const [commits, diffstat, patchResult] = await Promise.all([
-    git(parent.worktree, ["log", "--format=%H%x09%s", `${parent.baseSha}..${candidate.head}`]),
-    git(parent.worktree, ["diff", "--stat", range]),
-    git(parent.worktree, ["diff", "--no-ext-diff", "--unified=3", range], { maxBuffer: 4 * 1024 * 1024 }),
-  ]);
-  const maxPatchBytes = 40 * 1024;
-  const patchBytes = Buffer.byteLength(patchResult.stdout, "utf8");
-  const payload = {
-    schemaVersion: 1, parentTaskId: parent.id, reviewTaskId,
-    baseSha: parent.baseSha, candidateSha: candidate.head, candidateVersion: candidate.version,
-    generatedAt: new Date().toISOString(),
-    commits: commits.stdout ? commits.stdout.split("\n").map((line) => {
-      const [sha, ...subject] = line.split("\t");
-      return { sha, subject: subject.join("\t") };
-    }) : [],
-    diffstat: diffstat.stdout,
-    patch: patchBytes <= maxPatchBytes ? patchResult.stdout
-      : `${Buffer.from(patchResult.stdout, "utf8").subarray(0, maxPatchBytes).toString("utf8")}\n\n[patch truncated: ${patchBytes - maxPatchBytes} bytes omitted]`,
-    patchBytes, truncated: patchBytes > maxPatchBytes,
-  };
-  const contentSha256 = createHash("sha256").update(JSON.stringify(payload), "utf8").digest("hex");
-  const target = reviewEvidencePath(reviewTaskId);
-  await mkdir(reportsRoot(), { recursive: true, mode: 0o700 });
-  await writeFile(target, `${JSON.stringify({ ...payload, contentSha256 }, null, 2)}\n`, { mode: 0o400, flag: "wx" });
-  return { path: target, contentSha256, baseSha: parent.baseSha, candidateSha: candidate.head };
-}
-
 function reviewRoundMax(record, config) {
   return record.effectiveMaxReviewRounds || record.maxReviewRounds || config.maxReviewRounds;
 }
 
 export async function spawnReview(
   configPath,
-  { id, parentTaskId, reviewedHead, task, profile },
+  { id, parentTaskId, reviewedHead, task, profile, reviewDepth = "standard" },
 ) {
   if (process.env.HERDR_ENV !== "1") {
     throw new CrewdeckError("Crewdeck must run inside a Herdr-managed pane", "not_in_herdr");
@@ -1300,7 +1139,19 @@ export async function spawnReview(
   if (!TASK_ID_RE.test(parentTaskId || "") || !/^[0-9a-f]{40}$/.test(reviewedHead || "")) {
     throw new CrewdeckError("Review requires a valid parentTaskId and full reviewedHead SHA", "invalid_review_contract");
   }
+  if (!REVIEW_DEPTHS.has(reviewDepth)) {
+    throw new CrewdeckError("Review depth must be standard or deep", "invalid_review_depth");
+  }
   const config = await loadConfig(configPath);
+  const selectedProfile = profile || config.defaultProfile;
+  const reviewProfile = config.profiles[selectedProfile];
+  if (!reviewProfile) throw new CrewdeckError(`Unknown profile '${selectedProfile}'`, "unknown_profile");
+  if (reviewDepth === "standard" && ["xhigh", "max"].includes(reviewProfile.thinking)) {
+    throw new CrewdeckError(
+      `Standard review refuses ${reviewProfile.thinking} thinking; choose a medium/low profile or request reviewDepth=deep explicitly`,
+      "review_profile_too_deep",
+    );
+  }
   const reviewKinds = Object.entries(config.kinds).filter(([, kind]) => kind.contract === "review");
   if (reviewKinds.length !== 1) {
     throw new CrewdeckError("Configure exactly one review contract kind", "invalid_review_kind_configuration");
@@ -1393,7 +1244,7 @@ export async function spawnReview(
   const project = resolveProject(config, parent.project);
   let reviewEvidence;
   try {
-    reviewEvidence = await createReviewEvidence(parent, id, candidate);
+    reviewEvidence = await createReviewEvidence(parent, id, candidate, reviewDepth);
     await validateProject(project);
     const sourceWorkspace = await ensureProjectWorkspace(project);
     return await createOne(
@@ -1409,12 +1260,15 @@ export async function spawnReview(
         parentTaskId,
         reviewedHead,
         candidateVersion: candidate.version,
+        reviewDepth,
         reviewEvidence,
       },
       profile,
     );
   } catch (error) {
     if (reviewEvidence?.path) await rm(reviewEvidence.path, { force: true });
+    if (reviewEvidence?.fullPatch?.path) await rm(reviewEvidence.fullPatch.path, { force: true });
+    if (reviewEvidence?.correctionPatch?.path) await rm(reviewEvidence.correctionPatch.path, { force: true });
     await withStateLock(async () => {
       const next = await loadState();
       const nextParent = next.tasks[parentTaskId];
@@ -1463,48 +1317,31 @@ async function gitSnapshot(record) {
   }
 }
 
-function operatorStatus(record, candidates, observedStatus, config) {
-  const candidate = candidates?.available ? candidates.journal.candidates.at(-1) : undefined;
-  const review = candidate && latestRelevantReview(record.reviewInbox, candidate.head);
-  const intent = candidate && Array.isArray(record.publication?.verdictComments)
-    ? record.publication.verdictComments.find((item) => item.headSha === candidate.head) : undefined;
-  const baseAdvance = (record.baseAdvances || []).at(-1);
-  let nextAction = "inspect task";
-  if (baseAdvance?.status === "pending") {
-    nextAction = baseAdvance.classification === "unknown"
-      ? "resolve unknown base compatibility; do not mutate or forward"
-      : baseAdvance.classification === "compatible" && (record.publication?.number || baseAdvance.requiresRefresh === false)
-        ? "settle compatible base advance without rewriting the candidate"
-        : `forward base advance ${baseAdvance.sequence} to the sole writer`;
-  } else if (baseAdvance?.status === "awaiting-writer") nextAction = "resume the sole writer, then forward the pending base advance";
-  else if (baseAdvance?.status === "forwarding") nextAction = "retry base-advance forwarding; delivery may be at-least-once";
-  else if (record.agentRetirement?.status === "retiring") nextAction = "retry confirmed agent retirement with the same reason";
-  else if (record.prObservation?.status === "merged-awaiting-confirmed-reconciliation") nextAction = "confirm merged PR reconciliation";
-  else if (["ambiguous", "dispatched"].includes(intent?.status)) nextAction = "confirm verdict reconciliation";
-  else if (record.reviewEscalation && !record.reviewEscalation.resolvedAt) nextAction = "confirm review-round extension or decide escalation";
-  else if (observedStatus === "candidate-submitted") nextAction = "collect candidate";
-  else if (observedStatus === "candidate") nextAction = "spawn exact-SHA review";
-  else if (observedStatus === "review-changes-requested") nextAction = "forward durable review";
-  else if (observedStatus === "review-approved" && !record.publication?.number) nextAction = "publish draft PR after checks";
-  else if (record.publication?.number) nextAction = "observe external PR; reconciliation remains confirmed";
-  return { nextAction, reviewRound: candidate?.version || 0, currentMaxReviewRounds: reviewRoundMax(record, config),
-    escalation: record.reviewEscalation,
-    pr: record.publication?.number ? { number: record.publication.number, url: record.publication.url, headSha: record.publication.headSha, state: record.prObservation?.status || "unobserved" } : undefined,
-    verdictState: intent?.status || (review?.verdict ? `review-${review.verdict}` : "none"),
-    checkState: record.publication?.checks?.status || "not-checked",
-    baseAdvanceState: baseAdvance ? {
-      sequence: baseAdvance.sequence, status: baseAdvance.status, classification: baseAdvance.classification,
-      priorBaseSha: baseAdvance.priorBaseSha, newBaseSha: baseAdvance.newBaseSha, sourceTaskId: baseAdvance.sourceTaskId,
-    } : undefined,
-    observerState: record.prObservation?.status || "not-observed" };
-}
+const statusService = createStatusService({
+  boundedStatusText,
+  CrewdeckError,
+  gitAncestorProof,
+  gitSnapshot,
+  liveAgent,
+  loadConfig,
+  loadState,
+  publicCandidateJournal,
+  publicTaskRecord,
+  publicTaskReport,
+  readCandidateJournal,
+  readTaskReport,
+  reviewRoundMax,
+  safeDiagnosticText,
+  taskIdPattern: TASK_ID_RE,
+  normalizeStatusRecord,
+});
 
-const TERMINAL_STATUSES = new Set(["cleaned", "orphan-reconciled", "retired", "pr-merged"]);
-const STATUS_SCOPES = new Set(["active", "history", "all"]);
-export const COLLECTION_LIMIT = 20;
-export const DEFAULT_STATUS_LIMIT = 20;
-export const MAX_STATUS_LIMIT = 50;
-export const STATUS_OUTPUT_BUDGET_BYTES = 128 * 1024;
+export const getStatus = statusService.getStatus;
+export const getStatusSummary = statusService.getStatusSummary;
+export const getStatusView = statusService.getStatusView;
+export const getTaskActionStatus = statusService.getTaskActionStatus;
+export const getTaskStatus = statusService.getTaskStatus;
+export const statusCursorScope = statusService.statusCursorScope;
 
 function normalizeStatusRecord(config, storedRecord) {
   const record = {
@@ -1519,10 +1356,6 @@ function normalizeStatusRecord(config, storedRecord) {
   return record;
 }
 
-function isTerminalStatusRecord(record) {
-  return TERMINAL_STATUSES.has(record.status) || (record.status === "abandoned" && Boolean(record.cleanedAt));
-}
-
 function boundedStatusText(value, maxLength = 256) {
   if (typeof value !== "string") return undefined;
   if (value.length <= maxLength) return value;
@@ -1535,443 +1368,6 @@ function safeDiagnosticText(value, maxLength = 512) {
     .replace(/\b[0-9a-f]{40,}\b/gi, "[redacted-digest]")
     .replace(/\b[A-Za-z0-9_-]{48,}\b/g, "[redacted-token]");
   return boundedStatusText(redacted, maxLength);
-}
-
-function statusInteger(value) {
-  return Number.isSafeInteger(value) ? value : undefined;
-}
-
-function latestRelevantReview(reviewInbox, head) {
-  if (!head || !Array.isArray(reviewInbox)) return undefined;
-  for (let index = reviewInbox.length - 1; index >= 0; index -= 1) {
-    if (reviewInbox[index]?.reviewedHead === head) return reviewInbox[index];
-  }
-  return undefined;
-}
-
-function projectResultAvailability(result, ref) {
-  const projected = result.available
-    ? { available: true, ref, state: "available" }
-    : { available: false, ref, state: result.state === "missing" ? "missing" : "error" };
-  if (!result.available && result.error) projected.error = safeDiagnosticText(result.error, 512);
-  return projected;
-}
-
-function projectLatestPrObservation(observation) {
-  if (!observation || typeof observation !== "object") return undefined;
-  const projected = {
-    status: boundedStatusText(observation.status, 80),
-    observedAt: boundedStatusText(observation.observedAt, 64),
-  };
-  if (observation.repo !== undefined) projected.repo = boundedStatusText(observation.repo, 256);
-  if (statusInteger(observation.number) !== undefined) projected.number = observation.number;
-  if (observation.url !== undefined) projected.url = boundedStatusText(observation.url, 512);
-  if (observation.headSha !== undefined) projected.headSha = boundedStatusText(observation.headSha, 64);
-  if (observation.mergedAt !== undefined) projected.mergedAt = boundedStatusText(observation.mergedAt, 64);
-  if (observation.mergeCommit !== undefined) projected.mergeCommit = boundedStatusText(observation.mergeCommit, 64);
-  return projected;
-}
-
-function terminalStatusSummary(record) {
-  const summary = {
-    id: boundedStatusText(record.id, 24),
-    project: boundedStatusText(record.project, 64),
-    kind: boundedStatusText(record.kind, 32),
-    status: boundedStatusText(record.status, 64),
-    observedStatus: boundedStatusText(record.status, 64),
-  };
-  const terminalAt = record.status === "pr-merged"
-    ? record.mergedReconciledAt
-    : record.cleanedAt || record.orphanReconciledAt || record.agentRetiredAt || record.abandonedAt;
-  if (terminalAt) summary.terminalAt = boundedStatusText(terminalAt, 64);
-  if (record.status === "pr-merged" && record.prMergedAt) summary.remotePrMergedAt = boundedStatusText(record.prMergedAt, 64);
-  if (record.lifecycle === "report" || record.resultCollectedAt) summary.result = { ref: `result:${record.id}` };
-  if (record.workflow === "reviewed-pr") summary.candidates = { ref: `candidates:${record.id}` };
-  if (record.publication?.number) summary.publication = {
-    number: statusInteger(record.publication.number),
-    url: boundedStatusText(record.publication.url, 256),
-  };
-  return summary;
-}
-
-async function computeStatusRecord(config, state, storedRecord) {
-  const record = normalizeStatusRecord(config, storedRecord);
-  if (
-    record.status === "cleaned" ||
-    record.status === "orphan-reconciled" ||
-    record.status === "retired" ||
-    record.status === "pr-merged" ||
-    (record.status === "abandoned" && record.cleanedAt)
-  ) {
-    const terminal = {
-      ...publicTaskRecord(record),
-      observedStatus: record.status,
-      agent: { available: false, state: "closed" },
-      git: { available: false, state: "worktree-removed" },
-    };
-    if (["abandoned", "orphan-reconciled"].includes(record.status) || record.contract === "review") {
-      terminal.result = publicTaskReport(await readTaskReport(record));
-    }
-    if (record.status === "pr-merged") {
-      terminal.candidates = publicCandidateJournal(await readCandidateJournal(record));
-    }
-    Object.assign(terminal, operatorStatus(record, terminal.candidates, terminal.observedStatus, config));
-    if (record.contract === "review") {
-      const parent = state.tasks[record.parentTaskId];
-      const parentSnapshot = parent ? await gitSnapshot(parent) : { available: false };
-      terminal.reviewValidity = {
-        reviewedHead: record.reviewedHead,
-        validForCurrentHead: parentSnapshot.available && parentSnapshot.head === record.reviewedHead,
-      };
-    }
-    return terminal;
-  }
-  const [agent, snapshot, result, candidates] = await Promise.all([
-    liveAgent(record),
-    gitSnapshot(record),
-    readTaskReport(record),
-    readCandidateJournal(record),
-  ]);
-  let observedStatus = record.status;
-  if (record.status === "abandoned" && !record.cleanedAt) observedStatus = "abandon-cleanup-pending";
-  if (record.status === "running" && agent.state === "blocked") observedStatus = "blocked";
-  if (record.lifecycle === "report" && result.available) {
-    observedStatus = record.resultCollectedAt ? "report-collected" : "report-ready";
-    if (record.contract === "review") {
-      const parent = state.tasks[record.parentTaskId];
-      const parentSnapshot = parent ? await gitSnapshot(parent) : { available: false };
-      const stillCurrent =
-        parentSnapshot.available &&
-        parentSnapshot.head === record.reviewedHead &&
-        result.report.reviewedHead === record.reviewedHead;
-      observedStatus = stillCurrent
-        ? record.resultCollectedAt ? "report-collected" : "review-ready"
-        : "review-stale";
-    }
-  }
-  if (record.workflow === "reviewed-pr" && candidates.available) {
-    const candidate = candidates.journal.candidates.at(-1);
-    if (candidate) {
-      const review = latestRelevantReview(record.reviewInbox, candidate.head);
-      if (!snapshot.available || snapshot.head !== candidate.head) observedStatus = "candidate-stale";
-      else if ((record.candidateCollectedVersion || 0) < candidate.version) observedStatus = "candidate-submitted";
-      else if (review?.validAtCollection) observedStatus = `review-${review.verdict}`;
-      else observedStatus = "candidate";
-    }
-  }
-  const pendingBaseRefresh = (record.baseAdvances || []).some((item) =>
-    ["forwarding", "forwarded"].includes(item.status) && item.requiresRefresh !== false &&
-    item.newBaseSha === record.requiredBaseSha
-  );
-  if (pendingBaseRefresh && snapshot.available) {
-    const refreshed = await gitAncestorProof(record.repo, record.requiredBaseSha, snapshot.head);
-    if (!refreshed.available || !refreshed.ancestor) observedStatus = "base-refresh-required";
-  }
-  if (["cleanup-pending", "cleanup-failed"].includes(record.mergeReconciliation?.status)) {
-    observedStatus = `merge-${record.mergeReconciliation.status}`;
-  }
-  const reportedCommit = result.available ? result.report.payload?.commit : undefined;
-  const commitMatches =
-    typeof reportedCommit === "string" && snapshot.available && snapshot.head.startsWith(reportedCommit);
-  if (
-    record.lifecycle === "change" &&
-    record.status === "running" &&
-    ["idle", "done"].includes(agent.state) &&
-    result.available &&
-    snapshot.available &&
-    snapshot.clean &&
-    snapshot.ahead > 0 &&
-    commitMatches
-  ) {
-    observedStatus = "candidate";
-  }
-  return {
-    ...publicTaskRecord(record),
-    observedStatus,
-    agent,
-    git: snapshot,
-    result: publicTaskReport(result),
-    candidates: publicCandidateJournal(candidates),
-    ...operatorStatus(record, candidates, observedStatus, config),
-  };
-}
-
-async function computeStatusSummaryRecord(config, state, storedRecord) {
-  const record = normalizeStatusRecord(config, storedRecord);
-  if (isTerminalStatusRecord(record)) return terminalStatusSummary(record);
-
-  const needsResult = record.lifecycle === "report" || record.workflow === "direct";
-  const needsCandidates = record.workflow === "reviewed-pr";
-  const [agent, snapshot, result, candidates] = await Promise.all([
-    liveAgent(record),
-    gitSnapshot(record),
-    needsResult ? readTaskReport(record) : Promise.resolve(undefined),
-    needsCandidates ? readCandidateJournal(record) : Promise.resolve(undefined),
-  ]);
-  let observedStatus = record.status;
-  if (record.status === "abandoned" && !record.cleanedAt) observedStatus = "abandon-cleanup-pending";
-  if (record.status === "running" && agent.state === "blocked") observedStatus = "blocked";
-  if (record.lifecycle === "report" && result?.available) {
-    observedStatus = record.resultCollectedAt ? "report-collected" : "report-ready";
-    if (record.contract === "review") {
-      const parent = state.tasks[record.parentTaskId];
-      const parentSnapshot = parent ? await gitSnapshot(parent) : { available: false };
-      const stillCurrent =
-        parentSnapshot.available &&
-        parentSnapshot.head === record.reviewedHead &&
-        result.report.reviewedHead === record.reviewedHead;
-      observedStatus = stillCurrent
-        ? record.resultCollectedAt ? "report-collected" : "review-ready"
-        : "review-stale";
-    }
-  }
-
-  const latestCandidate = candidates?.available ? candidates.journal.candidates.at(-1) : undefined;
-  const latestReview = latestRelevantReview(record.reviewInbox, latestCandidate?.head);
-  if (latestCandidate) {
-    if (!snapshot.available || snapshot.head !== latestCandidate.head) observedStatus = "candidate-stale";
-    else if ((record.candidateCollectedVersion || 0) < latestCandidate.version) observedStatus = "candidate-submitted";
-    else if (latestReview?.validAtCollection) observedStatus = `review-${latestReview.verdict}`;
-    else observedStatus = "candidate";
-  }
-
-  const pendingBaseRefresh = (record.baseAdvances || []).some((item) =>
-    ["forwarding", "forwarded"].includes(item.status) && item.requiresRefresh !== false &&
-    item.newBaseSha === record.requiredBaseSha
-  );
-  if (pendingBaseRefresh && snapshot.available) {
-    const refreshed = await gitAncestorProof(record.repo, record.requiredBaseSha, snapshot.head);
-    if (!refreshed.available || !refreshed.ancestor) observedStatus = "base-refresh-required";
-  }
-  if (["cleanup-pending", "cleanup-failed"].includes(record.mergeReconciliation?.status)) {
-    observedStatus = `merge-${record.mergeReconciliation.status}`;
-  }
-  const reportedCommit = result?.available ? result.report.payload?.commit : undefined;
-  const commitMatches =
-    typeof reportedCommit === "string" && snapshot.available && snapshot.head.startsWith(reportedCommit);
-  if (
-    record.lifecycle === "change" &&
-    record.status === "running" &&
-    ["idle", "done"].includes(agent.state) &&
-    result?.available &&
-    snapshot.available &&
-    snapshot.clean &&
-    snapshot.ahead > 0 &&
-    commitMatches
-  ) {
-    observedStatus = "candidate";
-  }
-
-  const operator = operatorStatus(record, candidates, observedStatus, config);
-  const summary = {
-    id: boundedStatusText(record.id, 24),
-    project: boundedStatusText(record.project, 64),
-    kind: boundedStatusText(record.kind, 32),
-    workflow: boundedStatusText(record.workflow, 32),
-    status: boundedStatusText(record.status, 64),
-    observedStatus: boundedStatusText(observedStatus, 80),
-    nextAction: boundedStatusText(operator.nextAction, 256),
-    reviewRound: statusInteger(operator.reviewRound),
-    currentMaxReviewRounds: statusInteger(operator.currentMaxReviewRounds),
-    verdictState: boundedStatusText(operator.verdictState, 80),
-    checkState: boundedStatusText(operator.checkState, 80),
-    observerState: boundedStatusText(operator.observerState, 80),
-    agent: {
-      available: Boolean(agent.available),
-      state: boundedStatusText(agent.state, 80),
-      ...(!agent.available && agent.error ? { error: safeDiagnosticText(agent.error, 256) } : {}),
-    },
-    git: snapshot.available
-      ? { available: true, clean: Boolean(snapshot.clean), ahead: statusInteger(snapshot.ahead), head: boundedStatusText(snapshot.head, 64) }
-      : { available: false, ...(snapshot.error ? { error: safeDiagnosticText(snapshot.error, 256) } : {}) },
-  };
-  if (operator.escalation) {
-    summary.escalation = {
-      reviewTaskId: boundedStatusText(operator.escalation.reviewTaskId, 24),
-      reviewedHead: boundedStatusText(operator.escalation.reviewedHead, 64),
-      verdict: boundedStatusText(operator.escalation.verdict, 80),
-      escalatedAt: boundedStatusText(operator.escalation.escalatedAt, 64),
-      resolvedAt: boundedStatusText(operator.escalation.resolvedAt, 64),
-    };
-  }
-  if (operator.pr) {
-    summary.pr = {
-      number: statusInteger(operator.pr.number),
-      url: boundedStatusText(operator.pr.url, 256),
-      headSha: boundedStatusText(operator.pr.headSha, 64),
-      state: boundedStatusText(operator.pr.state, 80),
-    };
-  }
-  if (result) summary.result = projectResultAvailability(result, `result:${record.id}`);
-  if (candidates) {
-    summary.candidates = {
-      ...projectResultAvailability(candidates, `candidates:${record.id}`),
-      count: candidates.available ? candidates.journal.candidates.length : 0,
-    };
-    if (latestCandidate) {
-      summary.candidates.latest = {
-        version: latestCandidate.version,
-        head: boundedStatusText(latestCandidate.head, 64),
-      };
-    }
-    let relevantCount = 0;
-    if (latestCandidate && Array.isArray(record.reviewInbox)) {
-      for (const item of record.reviewInbox) {
-        if (item?.reviewedHead === latestCandidate.head) relevantCount += 1;
-      }
-    }
-    summary.reviews = {
-      count: Array.isArray(record.reviewInbox) ? record.reviewInbox.length : 0,
-      relevantCount,
-    };
-    if (latestReview) {
-      summary.reviews.latest = {
-        reviewTaskId: boundedStatusText(latestReview.reviewTaskId, 24),
-        candidateVersion: statusInteger(latestReview.candidateVersion),
-        reviewedHead: boundedStatusText(latestReview.reviewedHead, 64),
-        verdict: boundedStatusText(latestReview.verdict, 80),
-        forwardStatus: boundedStatusText(latestReview.forwardStatus, 80),
-        validAtCollection: Boolean(latestReview.validAtCollection),
-      };
-    }
-  }
-  if (operator.baseAdvanceState) {
-    summary.baseAdvanceState = {
-      sequence: statusInteger(operator.baseAdvanceState.sequence),
-      status: boundedStatusText(operator.baseAdvanceState.status, 80),
-      classification: boundedStatusText(operator.baseAdvanceState.classification, 80),
-      priorBaseSha: boundedStatusText(operator.baseAdvanceState.priorBaseSha, 64),
-      newBaseSha: boundedStatusText(operator.baseAdvanceState.newBaseSha, 64),
-      sourceTaskId: boundedStatusText(operator.baseAdvanceState.sourceTaskId, 24),
-    };
-  }
-  if (record.mergeReconciliation) {
-    summary.mergeReconciliation = { status: boundedStatusText(record.mergeReconciliation.status, 80) };
-    if (statusInteger(record.mergeReconciliation.prNumber) !== undefined) summary.mergeReconciliation.prNumber = record.mergeReconciliation.prNumber;
-    if (record.mergeReconciliation.mergeCommit !== undefined) summary.mergeReconciliation.mergeCommit = boundedStatusText(record.mergeReconciliation.mergeCommit, 64);
-    if (record.mergeReconciliation.lastError) summary.mergeReconciliation.error = safeDiagnosticText(record.mergeReconciliation.lastError);
-    if (record.mergeReconciliation.reason) summary.mergeReconciliation.reason = safeDiagnosticText(record.mergeReconciliation.reason);
-    if (record.mergeReconciliation.code) summary.mergeReconciliation.errorCode = boundedStatusText(record.mergeReconciliation.code, 80);
-  }
-  if (record.error) summary.error = safeDiagnosticText(record.error);
-  if (record.errorCode) summary.errorCode = boundedStatusText(record.errorCode, 80);
-  if (record.abandonmentReason) summary.reason = safeDiagnosticText(record.abandonmentReason);
-  const observation = projectLatestPrObservation(record.prObservation);
-  if (observation) {
-    if (operator.pr) {
-      delete observation.url;
-      delete observation.number;
-      delete observation.headSha;
-    }
-    summary.prObservation = observation;
-  }
-  return summary;
-}
-
-export async function getStatus(configPath, id) {
-  const config = await loadConfig(configPath);
-  const state = await loadState();
-  const records = id ? [state.tasks[id]].filter(Boolean) : Object.values(state.tasks);
-  if (id && records.length === 0) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
-  return Promise.all(records.map((storedRecord) => computeStatusRecord(config, state, storedRecord)));
-}
-
-export async function getTaskStatus(configPath, id) {
-  if (!TASK_ID_RE.test(id || "")) throw new CrewdeckError("A valid task id is required", "invalid_task_id");
-  const config = await loadConfig(configPath);
-  const state = await loadState();
-  const record = state.tasks[id];
-  if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
-  return computeStatusSummaryRecord(config, state, record);
-}
-
-function statusGeneration(records, scope) {
-  return createHash("sha256").update(`${scope}\n${records.map((record) => `${record.id}:${record.status}:${record.cleanedAt || ""}`).join("\n")}`).digest("hex").slice(0, 16);
-}
-
-function encodeStatusCursor(scope, generation, after) {
-  return Buffer.from(JSON.stringify({ v: 1, scope, generation, after }), "utf8").toString("base64url");
-}
-
-function decodeStatusCursor(cursor, scope, generation, records) {
-  if (cursor === undefined || cursor === null || cursor === "" || cursor === 0) return 0;
-  if (Number.isSafeInteger(cursor) && cursor >= 0) return cursor;
-  if (typeof cursor !== "string") throw new CrewdeckError("Status cursor must be an opaque cursor string", "invalid_status_cursor");
-  try {
-    const decoded = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
-    if (decoded.v !== 1 || decoded.scope !== scope || decoded.generation !== generation || typeof decoded.after !== "string") {
-      throw new Error("cursor scope or generation changed");
-    }
-    const index = records.findIndex((record) => record.id === decoded.after);
-    if (index < 0) throw new Error("cursor task no longer exists in this scope");
-    return index + 1;
-  } catch (error) {
-    throw new CrewdeckError(`Status cursor is stale or invalid; restart pagination: ${error.message}`, "invalid_status_cursor");
-  }
-}
-
-export function statusCursorScope(cursor) {
-  if (typeof cursor !== "string" || cursor === "") {
-    throw new CrewdeckError("Status cursor must be an opaque cursor string", "invalid_status_cursor");
-  }
-  try {
-    const decoded = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
-    if (decoded.v !== 1 || typeof decoded.scope !== "string") throw new Error("cursor scope missing");
-    return decoded.scope;
-  } catch (error) {
-    throw new CrewdeckError(`Status cursor is stale or invalid; restart pagination: ${error.message}`, "invalid_status_cursor");
-  }
-}
-
-export async function getStatusView(configPath, { id, mode = "bounded", scope, limit, cursor } = {}) {
-  if (!["bounded", "diagnostic"].includes(mode)) throw new CrewdeckError("Status mode must be bounded or diagnostic", "invalid_status_mode");
-  if (id && (scope !== undefined || limit !== undefined || cursor !== undefined)) {
-    throw new CrewdeckError("Status id is incompatible with summary pagination arguments", "invalid_status_arguments");
-  }
-  if (mode === "diagnostic" && !id) throw new CrewdeckError("Diagnostic status requires exactly one task id", "invalid_status_arguments");
-  if (id) return mode === "diagnostic" ? getStatus(configPath, id) : getTaskStatus(configPath, id);
-  return getStatusSummary(configPath, { scope, limit, cursor });
-}
-
-export async function getStatusSummary(
-  configPath,
-  { scope = "active", limit = DEFAULT_STATUS_LIMIT, cursor = 0 } = {},
-) {
-  if (!STATUS_SCOPES.has(scope)) {
-    throw new CrewdeckError("Status scope must be active, history, or all", "invalid_status_scope");
-  }
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_STATUS_LIMIT) {
-    throw new CrewdeckError(`Status limit must be a safe integer from 1 to ${MAX_STATUS_LIMIT}`, "invalid_status_limit");
-  }
-  const config = await loadConfig(configPath);
-  const state = await loadState();
-  const records = Object.values(state.tasks)
-    .filter((record) => {
-      const terminal = isTerminalStatusRecord(record);
-      return scope === "all" || (scope === "history" ? terminal : !terminal);
-    })
-    .sort((left, right) => {
-      const leftId = String(left.id || "");
-      const rightId = String(right.id || "");
-      return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
-    });
-  const generation = statusGeneration(records, scope);
-  const offset = decodeStatusCursor(cursor, scope, generation, records);
-  const selected = records.slice(offset, offset + limit);
-  const tasks = await Promise.all(selected.map((record) => computeStatusSummaryRecord(config, state, record)));
-  const nextCursor = offset + tasks.length < records.length
-    ? encodeStatusCursor(scope, generation, selected.at(-1).id)
-    : null;
-  const page = {
-    scope,
-    pagination: { cursor: cursor || null, generation, limit, returned: tasks.length, total: records.length, nextCursor },
-    tasks,
-  };
-  const bytes = Buffer.byteLength(JSON.stringify(page, null, 2), "utf8");
-  if (bytes > STATUS_OUTPUT_BUDGET_BYTES) {
-    throw new CrewdeckError(`Serialized status page exceeds the ${STATUS_OUTPUT_BUDGET_BYTES}-byte budget`, "status_output_budget", { bytes });
-  }
-  return page;
 }
 
 export async function getPendingBaseAdvanceKeys(configPath) {
@@ -2795,851 +2191,38 @@ export async function reconcileOrphanReport(configPath, id, { reason } = {}) {
   return publicTaskRecord(record);
 }
 
-function verdictCommentIdentity(comment, repo, prNumber, expectedBody) {
-  if (
-    !comment ||
-    comment.body !== expectedBody ||
-    !Number.isInteger(comment.id) ||
-    comment.id < 1 ||
-    typeof comment.html_url !== "string"
-  ) {
-    throw new CrewdeckError("GitHub returned an invalid verdict comment identity", "invalid_comment_identity");
-  }
-  let commentUrl;
-  try {
-    commentUrl = new URL(comment.html_url);
-  } catch {
-    throw new CrewdeckError("GitHub returned an invalid verdict comment URL", "invalid_comment_identity");
-  }
-  if (
-    commentUrl.protocol !== "https:" ||
-    commentUrl.hostname.toLowerCase() !== "github.com" ||
-    commentUrl.pathname.toLowerCase() !== `/${repo}/pull/${prNumber}`.toLowerCase() ||
-    commentUrl.hash !== `#issuecomment-${comment.id}`
-  ) {
-    throw new CrewdeckError("Verdict comment identity does not belong to the exact PR", "invalid_comment_identity");
-  }
-  return { id: comment.id, url: comment.html_url };
-}
+const publicationService = createPublicationService({
+  CrewdeckError,
+  exactHeadRepository,
+  git,
+  gitAncestorProof,
+  githubRepositoryFromUrl,
+  gitSnapshot,
+  liveAgent,
+  loadConfig,
+  loadState,
+  publicTaskRecord,
+  readCandidateJournal,
+  resolveChangeBase,
+  resolveProject,
+  run,
+  runJson,
+  saveState,
+  taskIdPattern: TASK_ID_RE,
+  validBranchName,
+  validRemoteName,
+  validRepositoryName,
+  withStateLock,
+});
 
-async function findVerdictComment(repo, prNumber, marker, expectedBody) {
-  const comments = [];
-  for (let page = 1; page <= 100; page += 1) {
-    let listed;
-    try {
-      listed = await runJson("gh", [
-        "api", `repos/${repo}/issues/${prNumber}/comments?per_page=100&page=${page}`,
-      ], { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 });
-    } catch (error) {
-      throw new CrewdeckError("Cannot list immutable verdict comments", "forge_unavailable", {
-        error: error.message,
-      });
-    }
-    if (!Array.isArray(listed) || listed.length > 100) {
-      throw new CrewdeckError("GitHub comment page is invalid", "invalid_comment_lookup");
-    }
-    comments.push(...listed);
-    if (listed.length < 100) break;
-    if (page === 100) {
-      throw new CrewdeckError("GitHub comment lookup exceeds its 10,000-comment bound", "invalid_comment_lookup");
-    }
-  }
-  let markerCount = 0;
-  let markedComment;
-  for (const comment of comments) {
-    if (typeof comment?.body !== "string") continue;
-    let offset = 0;
-    while (true) {
-      const found = comment.body.indexOf(marker, offset);
-      if (found < 0) break;
-      markerCount += 1;
-      markedComment = comment;
-      offset = found + marker.length;
-    }
-  }
-  if (markerCount > 1) {
-    throw new CrewdeckError("The immutable verdict marker collides on this PR", "verdict_comment_collision", {
-      marker,
-      occurrences: markerCount,
-    });
-  }
-  if (markerCount === 0) return undefined;
-  if (markedComment.body !== expectedBody) {
-    throw new CrewdeckError("The immutable verdict marker has divergent content", "verdict_comment_divergent", {
-      marker,
-    });
-  }
-  return verdictCommentIdentity(markedComment, repo, prNumber, expectedBody);
-}
-
-function matchingVerdictIntent(publication, headSha) {
-  const entries = publication?.verdictComments || [];
-  if (!Array.isArray(entries)) {
-    throw new CrewdeckError("Durable verdict intent journal is invalid", "verdict_comment_divergent");
-  }
-  const matches = entries.filter((item) => item?.headSha === headSha);
-  if (matches.length > 1) {
-    throw new CrewdeckError("Durable verdict comment intent collides for this SHA", "verdict_comment_collision");
-  }
-  return matches[0];
-}
-
-function validateVerdictIntent(intent, { marker, contentSha256, prNumber, approval }) {
-  if (
-    !["dispatched", "ambiguous", "published"].includes(intent.status) ||
-    intent.marker !== marker ||
-    intent.contentSha256 !== contentSha256 ||
-    intent.prNumber !== prNumber ||
-    intent.reviewerTaskId !== approval.reviewTaskId ||
-    intent.candidateVersion !== approval.candidateVersion
-  ) {
-    throw new CrewdeckError("Durable verdict intent has divergent immutable content", "verdict_comment_divergent");
-  }
-}
-
-async function currentApprovedVerdict(id, fallbackRecord, expectedHead, expectedVersion, expectedReviewTaskId) {
-  const state = await loadState();
-  const record = state.tasks[id];
-  if (!record || record.cleanedAt || ["cleaned", "integrated", "abandoned", "pr-merged"].includes(record.status)) {
-    throw new CrewdeckError("Build became terminal before verdict publication", "stale_candidate");
-  }
-  if (["cleanup-pending", "cleanup-failed"].includes(record.mergeReconciliation?.status)) {
-    throw new CrewdeckError("Build is reserved for merged PR reconciliation", "reconciliation_in_progress");
-  }
-  const [snapshot, journal] = await Promise.all([
-    gitSnapshot(record),
-    readCandidateJournal(record),
-  ]);
-  const candidate = journal.available ? journal.journal.candidates.at(-1) : undefined;
-  const approval = (record.reviewInbox || [])
-    .filter((item) =>
-      item.reviewTaskId === expectedReviewTaskId &&
-      item.reviewedHead === expectedHead &&
-      item.verdict === "approved" &&
-      item.validAtCollection
-    )
-    .at(-1);
-  if (
-    !snapshot.available ||
-    !snapshot.clean ||
-    snapshot.head !== expectedHead ||
-    candidate?.head !== expectedHead ||
-    candidate?.version !== expectedVersion ||
-    (record.candidateCollectedVersion || 0) < expectedVersion ||
-    !approval ||
-    (record.reviewEscalation && record.reviewEscalation.reviewedHead === expectedHead)
-  ) {
-    throw new CrewdeckError("Approved candidate became stale before verdict comment POST", "stale_candidate", {
-      approvedHead: expectedHead,
-      currentHead: snapshot.head,
-      currentCandidateHead: candidate?.head,
-    });
-  }
-  if (
-    record.repo !== fallbackRecord.repo ||
-    record.worktree !== fallbackRecord.worktree ||
-    record.branch !== fallbackRecord.branch
-  ) {
-    throw new CrewdeckError("Build resources changed before verdict publication", "state_changed");
-  }
-  validatedVerdictPayload(id, candidate, approval);
-  return { record, snapshot, candidate, approval };
-}
-
-async function inspectGitHubChecks(project, repo, headSha) {
-  const checkedAt = new Date().toISOString();
-  if (project.githubChecks === "none") {
-    return { policy: "none", status: "disabled", headSha, checkedAt, reason: "project explicitly opts out of GitHub checks" };
-  }
-  let checks;
-  let statuses;
-  try {
-    [checks, statuses] = await Promise.all([
-      runJson("gh", ["api", `repos/${repo}/commits/${headSha}/check-runs?per_page=100`], { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 }),
-      runJson("gh", ["api", `repos/${repo}/commits/${headSha}/status?per_page=100`], { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 }),
-    ]);
-  } catch (error) {
-    return { policy: "required", status: "unavailable", headSha, checkedAt, reason: error.message };
-  }
-  if (!Array.isArray(checks?.check_runs) || !Number.isInteger(checks.total_count) || checks.total_count !== checks.check_runs.length || checks.check_runs.length > 100 || statuses?.sha !== headSha || !Array.isArray(statuses.statuses) || statuses.statuses.length > 100) {
-    return { policy: "required", status: "ambiguous", headSha, checkedAt, reason: "invalid or stale-SHA GitHub checks response" };
-  }
-  const stale = checks.check_runs.some((item) => item?.head_sha !== headSha);
-  const checkStates = checks.check_runs.map((item) => ({ name: item.name, status: item.status, conclusion: item.conclusion }));
-  const contextStates = statuses.statuses.map((item) => ({ context: item.context, state: item.state }));
-  let status = "passing";
-  let reason;
-  if (stale) ({ status, reason } = { status: "stale", reason: "a check run belongs to another SHA" });
-  else if (checkStates.length + contextStates.length === 0) ({ status, reason } = { status: "missing", reason: "no checks or status contexts exist" });
-  else if (checkStates.some((item) => item.status !== "completed") || contextStates.some((item) => item.state === "pending")) ({ status, reason } = { status: "pending", reason: "checks have not completed" });
-  else if (checkStates.some((item) => !["success", "neutral", "skipped"].includes(item.conclusion)) || contextStates.some((item) => item.state !== "success")) ({ status, reason } = { status: "failing", reason: "one or more checks failed" });
-  return { policy: "required", status, headSha, checkedAt, checks: checkStates, contexts: contextStates, ...(reason ? { reason } : {}) };
-}
-
-function requirePassingChecks(observation, phase) {
-  if (!["passing", "disabled"].includes(observation.status)) {
-    throw new CrewdeckError(`GitHub checks refuse ${phase}: ${observation.reason || observation.status}`, "github_checks_not_passing", observation);
-  }
-}
-
-async function observePublishedVerdict(id, approvedHead) {
-  try {
-    const state = await loadState();
-    const record = state.tasks[id];
-    if (!record) return { status: "unknown", approvedHead, error: "task missing" };
-    const [snapshot, journal] = await Promise.all([gitSnapshot(record), readCandidateJournal(record)]);
-    const candidate = journal.available ? journal.journal.candidates.at(-1) : undefined;
-    const stillApproved = (record.reviewInbox || []).some((item) =>
-      item.reviewedHead === approvedHead && item.verdict === "approved" && item.validAtCollection
-    );
-    const current =
-      snapshot.available &&
-      snapshot.clean &&
-      snapshot.head === approvedHead &&
-      candidate?.head === approvedHead &&
-      stillApproved;
-    return {
-      status: current ? "current" : "stale",
-      approvedHead,
-      currentHead: snapshot.head,
-      currentCandidateHead: candidate?.head,
-    };
-  } catch (error) {
-    return { status: "unknown", approvedHead, error: error.message };
-  }
-}
-
-export async function publishPullRequest(
-  configPath,
-  id,
-  { remote, repo, base, head, title, body },
-) {
-  const config = await loadConfig(configPath);
-  if (!validRemoteName(remote) || !validRepositoryName(repo) || !validBranchName(base) || !validBranchName(head)) {
-    throw new CrewdeckError("remote, repo, base, and head must be explicit valid GitHub publication targets", "invalid_publication_target");
-  }
-  if (typeof title !== "string" || !title.trim() || typeof body !== "string" || !body.trim()) {
-    throw new CrewdeckError("Draft PR title and body are required", "invalid_publication_target");
-  }
-  const intendedTitle = title.trim();
-  const intendedBody = body.trim();
-  const state = await loadState();
-  const record = state.tasks[id];
-  if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
-  record.kind ||= record.profile === "scout" ? "scout" : "build";
-  record.lifecycle ||= config.kinds[record.kind]?.lifecycle || "change";
-  record.workflow ||= "direct";
-  if (record.lifecycle !== "change" || record.workflow !== "reviewed-pr") {
-    throw new CrewdeckError("Draft PR publication requires a reviewed-pr build", "invalid_publication_task");
-  }
-  if (record.status === "cleaned" || record.cleanedAt || ["integrated", "abandoned", "pr-merged"].includes(record.status)) {
-    throw new CrewdeckError("Terminal builds cannot be published", "invalid_publication_task");
-  }
-  if (["cleanup-pending", "cleanup-failed"].includes(record.mergeReconciliation?.status)) {
-    throw new CrewdeckError("Build is reserved for merged PR reconciliation", "reconciliation_in_progress");
-  }
-  const project = resolveProject(config, record.project);
-  if (
-    record.branch !== `crew/${id}` ||
-    head !== record.branch ||
-    base !== record.base ||
-    head === base ||
-    path.resolve(record.worktree) !== path.join(config.worktreeRoot, record.project, id) ||
-    path.resolve(record.repo) !== project.path
-  ) {
-    throw new CrewdeckError("Publication must push only the task-owned crew branch, never the base", "unsafe_publication_ref");
-  }
-  const agent = await liveAgent(record);
-  if (agent.available && !["idle", "done"].includes(agent.state)) {
-    throw new CrewdeckError(`Build writer is ${agent.state}; publication requires a settled writer`, "worker_not_settled");
-  }
-  if (!agent.available && !/agent[^\n]*(not[_ -]?found|missing)|not[_ -]?found[^\n]*agent/i.test(agent.error || "")) {
-    throw new CrewdeckError("Cannot prove build writer state before publication", "agent_state_unknown", agent);
-  }
-  const [snapshot, journal] = await Promise.all([gitSnapshot(record), readCandidateJournal(record)]);
-  if (!snapshot.available || !snapshot.clean) {
-    throw new CrewdeckError("Publication refuses a dirty or unavailable build worktree", "dirty_worktree", snapshot);
-  }
-  if (record.requiredBaseSha) {
-    const requiredBase = await gitAncestorProof(record.repo, record.requiredBaseSha, snapshot.head);
-    if (!requiredBase.available || !requiredBase.ancestor) {
-      throw new CrewdeckError("Current candidate does not contain the required advanced base", "base_refresh_required", requiredBase);
-    }
-  }
-  if (snapshot.ahead < 1) throw new CrewdeckError("Current candidate has no commits ahead of base", "no_commits");
-  const candidate = journal.available ? journal.journal.candidates.at(-1) : undefined;
-  if (!candidate) throw new CrewdeckError("No reviewed-pr candidate is available", "missing_candidate");
-  if (snapshot.head !== candidate.head) {
-    throw new CrewdeckError("Build HEAD changed after candidate submission", "stale_candidate");
-  }
-  if ((record.candidateCollectedVersion || 0) < candidate.version) {
-    throw new CrewdeckError("Current candidate has not been collected", "candidate_not_collected");
-  }
-  const approval = (record.reviewInbox || [])
-    .filter((item) => item.reviewedHead === snapshot.head && item.verdict === "approved" && item.validAtCollection)
-    .at(-1);
-  if (!approval) throw new CrewdeckError("Current HEAD has no collected approved review", "review_not_approved");
-  if (record.reviewEscalation && record.reviewEscalation.reviewedHead === snapshot.head) {
-    throw new CrewdeckError("Current review requires escalation", "review_not_approved");
-  }
-
-  let remoteUrl;
-  try {
-    remoteUrl = (await git(record.worktree, ["remote", "get-url", "--push", remote])).stdout;
-  } catch (error) {
-    throw new CrewdeckError(`Git remote '${remote}' is unavailable`, "remote_unavailable", { error: error.message });
-  }
-  const remoteRepo = githubRepositoryFromUrl(remoteUrl);
-  if (!remoteRepo || remoteRepo.toLowerCase() !== repo.toLowerCase()) {
-    throw new CrewdeckError("Git remote is not the requested GitHub repository", "remote_repo_mismatch", { remoteUrl, repo });
-  }
-  try {
-    await run("gh", ["auth", "status", "--hostname", "github.com"], { timeout: 15_000 });
-  } catch (error) {
-    throw new CrewdeckError("GitHub credentials are unavailable", "credentials_unavailable", { error: error.message });
-  }
-  let forgeRepo;
-  try {
-    forgeRepo = await runJson("gh", ["repo", "view", repo, "--json", "nameWithOwner"], { timeout: 20_000 });
-  } catch (error) {
-    throw new CrewdeckError("GitHub repository is unavailable through gh", "forge_unavailable", { error: error.message });
-  }
-  if (forgeRepo?.nameWithOwner?.toLowerCase() !== repo.toLowerCase()) {
-    throw new CrewdeckError("gh resolved a different GitHub repository", "forge_repo_mismatch", forgeRepo);
-  }
-
-  const baseRef = `refs/heads/${base}`;
-  const remoteRef = `refs/heads/${head}`;
-  const readRemoteSha = async (ref) => {
-    const output = (await git(record.worktree, ["ls-remote", "--heads", remote, ref], { timeout: 30_000 })).stdout;
-    if (!output) return undefined;
-    const lines = output.split("\n").filter(Boolean);
-    if (lines.length !== 1) throw new CrewdeckError(`Remote ref ${ref} is ambiguous`, "ambiguous_remote_ref");
-    const [sha, foundRef] = lines[0].split(/\s+/);
-    if (!/^[0-9a-f]{40}$/.test(sha || "") || foundRef !== ref) {
-      throw new CrewdeckError(`Remote returned an invalid ref for ${ref}`, "invalid_remote_ref");
-    }
-    return sha;
-  };
-  const publicationBaseSha = await readRemoteSha(baseRef);
-  if (!publicationBaseSha) {
-    throw new CrewdeckError(`Remote base ${base} does not exist`, "remote_base_missing");
-  }
-  let configuredBaseEvidence = { source: "publication-remote", remote, sha: publicationBaseSha, verifiedAt: new Date().toISOString() };
-  if (record.baseSource?.mode === "remote") {
-    const resolved = await resolveChangeBase(project);
-    configuredBaseEvidence = { source: "configured-base-remote", remote: record.baseSource.remote, sha: resolved.sha, verifiedAt: new Date().toISOString() };
-  }
-  if (record.baseSha && configuredBaseEvidence.sha !== record.baseSha) {
-    throw new CrewdeckError("Configured reviewed base advanced after spawn; a new candidate/review contract is required", "base_advanced", {
-      pinnedBaseSha: record.baseSha, currentBaseSha: configuredBaseEvidence.sha, baseSource: record.baseSource,
-    });
-  }
-  if (record.baseSha && publicationBaseSha !== record.baseSha) {
-    throw new CrewdeckError("Publication base differs from the pinned reviewed base", "base_drift", {
-      pinnedBaseSha: record.baseSha, publicationBaseSha, remote, base,
-    });
-  }
-
-  const prFields = [
-    "number", "url", "isDraft", "headRefName", "baseRefName", "headRefOid",
-    "isCrossRepository", "headRepository", "headRepositoryOwner", "state", "title", "body",
-  ].join(",");
-  const validatePr = (pr, expectedHeadSha = undefined) => {
-    const urlMatch = typeof pr?.url === "string"
-      ? pr.url.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9][0-9]*)$/i)
-      : undefined;
-    if (
-      !pr ||
-      !Number.isInteger(pr.number) ||
-      !urlMatch ||
-      urlMatch[1].toLowerCase() !== repo.toLowerCase() ||
-      Number(urlMatch[2]) !== pr.number ||
-      typeof pr.title !== "string" ||
-      typeof pr.body !== "string" ||
-      pr.isDraft !== true ||
-      pr.headRefName !== head ||
-      pr.baseRefName !== base ||
-      pr.isCrossRepository !== false ||
-      !exactHeadRepository(pr.headRepository, pr.headRepositoryOwner, repo) ||
-      (pr.state !== undefined && pr.state !== "OPEN") ||
-      (expectedHeadSha !== undefined && pr.headRefOid !== expectedHeadSha)
-    ) {
-      throw new CrewdeckError("Existing GitHub PR is not the expected open draft", "invalid_existing_pr", pr);
-    }
-    return pr;
-  };
-  const validateExactPr = (pr, expectedHeadSha = undefined) => {
-    const validated = validatePr(pr, expectedHeadSha);
-    if (
-      validated.title !== intendedTitle ||
-      validated.body !== intendedBody ||
-      validated.baseRefName !== base
-    ) {
-      throw new CrewdeckError(
-        "GitHub PR title, body, or base does not match the intended publication",
-        "invalid_existing_pr",
-        validated,
-      );
-    }
-    return validated;
-  };
-
-  const publication = record.publication;
-  if (
-    publication &&
-    (publication.remote !== remote ||
-      publication.repo.toLowerCase() !== repo.toLowerCase() ||
-      publication.base !== base ||
-      publication.remoteHead !== head)
-  ) {
-    throw new CrewdeckError("Publication target cannot change after first attempt", "publication_target_mismatch");
-  }
-  let existingPr;
-  if (publication?.number) {
-    try {
-      existingPr = validatePr(await runJson("gh", [
-        "pr", "view", String(publication.number), "--repo", repo,
-        "--json", prFields,
-      ], { timeout: 20_000 }));
-    } catch (error) {
-      if (error instanceof CrewdeckError && error.code === "invalid_existing_pr") throw error;
-      throw new CrewdeckError("Stored draft PR is unavailable", "forge_unavailable", { error: error.message });
-    }
-  } else {
-    let listed;
-    try {
-      listed = await runJson("gh", [
-        "pr", "list", "--repo", repo, "--head", head, "--base", base, "--state", "open",
-        "--json", prFields, "--limit", "2",
-      ], { timeout: 20_000 });
-    } catch (error) {
-      throw new CrewdeckError("Cannot query GitHub draft PRs", "forge_unavailable", { error: error.message });
-    }
-    if (!Array.isArray(listed) || listed.length > 1) {
-      throw new CrewdeckError("GitHub PR lookup is invalid or ambiguous", "ambiguous_pull_request", listed);
-    }
-    if (listed.length === 1) existingPr = validatePr(listed[0]);
-  }
-
-  let remoteSha = await readRemoteSha(remoteRef);
-  const ownedRemote =
-    !remoteSha ||
-    publication?.remoteSha === remoteSha ||
-    (remoteSha === snapshot.head && existingPr?.headRefName === head);
-  if (!ownedRemote) {
-    throw new CrewdeckError("Remote head exists but is not owned by this durable publication", "remote_head_changed", {
-      expected: publication?.remoteSha,
-      actual: remoteSha,
-    });
-  }
-  let pushedAt = publication?.pushedAt;
-  if (remoteSha !== snapshot.head) {
-    const lease = `--force-with-lease=${remoteRef}:${remoteSha || ""}`;
-    await git(record.worktree, ["push", lease, remote, `${snapshot.head}:${remoteRef}`], { timeout: 120_000 });
-    remoteSha = await readRemoteSha(remoteRef);
-    if (remoteSha !== snapshot.head) {
-      throw new CrewdeckError("Remote head does not equal the approved SHA after push", "push_verification_failed");
-    }
-    pushedAt = new Date().toISOString();
-  }
-  const afterPush = await gitSnapshot(record);
-  if (!afterPush.available || !afterPush.clean || afterPush.head !== snapshot.head) {
-    throw new CrewdeckError("Build HEAD changed during publication; review and CI are stale", "stale_candidate");
-  }
-
-  const attemptAt = new Date().toISOString();
-  await withStateLock(async () => {
-    const next = await loadState();
-    const stored = next.tasks[id];
-    if (!stored) throw new CrewdeckError("Build disappeared during publication", "state_changed");
-    stored.publication = {
-      ...(stored.publication || {}),
-      remote,
-      repo,
-      base,
-      remoteHead: head,
-      remoteSha,
-      title: intendedTitle,
-      body: intendedBody,
-      headSha: snapshot.head,
-      baseEvidence: configuredBaseEvidence,
-      pushedAt,
-      createdAt: stored.publication?.createdAt || attemptAt,
-      firstAttemptAt: stored.publication?.firstAttemptAt || attemptAt,
-      lastAttemptAt: attemptAt,
-    };
-    await saveState(next);
-  });
-
-  let pr = existingPr;
-  let prCreatedAt = publication?.prCreatedAt;
-  if (!pr) {
-    try {
-      await run("gh", [
-        "pr", "create", "--draft", "--repo", repo, "--base", base, "--head", head,
-        "--title", intendedTitle, "--body", intendedBody,
-      ], { timeout: 60_000 });
-    } catch (error) {
-      throw new CrewdeckError("Draft PR creation failed; retry will reconcile by head/base", "pr_create_failed", {
-        error: error.message,
-        remoteSha,
-      });
-    }
-    const listed = await runJson("gh", [
-      "pr", "list", "--repo", repo, "--head", head, "--base", base, "--state", "open",
-      "--json", prFields, "--limit", "2",
-    ], { timeout: 20_000 });
-    if (!Array.isArray(listed) || listed.length !== 1) {
-      throw new CrewdeckError("Created draft PR cannot be reconciled uniquely", "ambiguous_pull_request", listed);
-    }
-    pr = validateExactPr(listed[0], snapshot.head);
-    prCreatedAt = new Date().toISOString();
-  } else if (
-    pr.title !== intendedTitle ||
-    pr.body !== intendedBody ||
-    pr.baseRefName !== base ||
-    publication?.headSha !== snapshot.head
-  ) {
-    try {
-      await run("gh", [
-        "api", "--method", "PATCH", `repos/${repo}/pulls/${pr.number}`,
-        "--raw-field", `title=${intendedTitle}`,
-        "--raw-field", `body=${intendedBody}`,
-        "--raw-field", `base=${base}`,
-      ], { timeout: 30_000 });
-    } catch (error) {
-      throw new CrewdeckError(
-        "Draft PR REST update failed; retry will re-read authoritative PR state",
-        "pr_update_failed",
-        { error: error.message, number: pr.number, remoteSha },
-      );
-    }
-    try {
-      pr = validateExactPr(await runJson("gh", [
-        "pr", "view", String(pr.number), "--repo", repo,
-        "--json", prFields,
-      ], { timeout: 20_000 }), snapshot.head);
-    } catch (error) {
-      if (error instanceof CrewdeckError && error.code === "invalid_existing_pr") throw error;
-      throw new CrewdeckError("Cannot verify the draft PR after REST update", "forge_unavailable", {
-        error: error.message,
-      });
-    }
-  }
-
-  const updatedAt = new Date().toISOString();
-  await withStateLock(async () => {
-    const next = await loadState();
-    const stored = next.tasks[id];
-    if (!stored?.publication || stored.publication.remoteSha !== snapshot.head) {
-      throw new CrewdeckError("Publication state changed before PR persistence", "state_changed");
-    }
-    stored.publication = {
-      ...stored.publication,
-      number: pr.number,
-      url: pr.url,
-      draft: true,
-      prCreatedAt: stored.publication.prCreatedAt || prCreatedAt || updatedAt,
-      updatedAt,
-      lastVerifiedAt: updatedAt,
-    };
-    await saveState(next);
-  });
-
-  const checkObservation = await inspectGitHubChecks(project, repo, snapshot.head);
-  await withStateLock(async () => {
-    const next = await loadState();
-    const stored = next.tasks[id];
-    if (!stored?.publication || stored.publication.number !== pr.number || stored.publication.headSha !== snapshot.head) {
-      throw new CrewdeckError("Publication changed before checks persistence", "state_changed");
-    }
-    stored.publication.checks = checkObservation;
-    await saveState(next);
-  });
-  requirePassingChecks(checkObservation, "publication completion");
-
-  const prWasIdempotent =
-    publication?.headSha === snapshot.head &&
-    publication?.title === intendedTitle &&
-    publication?.body === intendedBody &&
-    existingPr?.number === pr.number &&
-    existingPr?.title === intendedTitle &&
-    existingPr?.body === intendedBody &&
-    existingPr?.baseRefName === base;
-  const readExactCommentPr = async () => {
-    try {
-      return validateExactPr(await runJson("gh", [
-        "pr", "view", String(pr.number), "--repo", repo, "--json", prFields,
-      ], { timeout: 20_000 }), snapshot.head);
-    } catch (error) {
-      if (error instanceof CrewdeckError && error.code === "invalid_existing_pr") throw error;
-      throw new CrewdeckError("Cannot validate the exact draft PR before verdict POST", "forge_unavailable", {
-        error: error.message,
-      });
-    }
-  };
-
-  // The exact PR and approved local state are checked after PR create/REST update and
-  // immediately around marker lookup. No comment POST is allowed before these checks.
-  await readExactCommentPr();
-  let current = await currentApprovedVerdict(
-    id,
-    record,
-    snapshot.head,
-    candidate.version,
-    approval.reviewTaskId,
-  );
-  let rendered = renderVerdictComment(id, current.candidate, current.approval);
-  let foundComment = await findVerdictComment(repo, pr.number, rendered.marker, rendered.body);
-
-  const intentMetadata = {
-    headSha: snapshot.head,
-    marker: rendered.marker,
-    contentSha256: rendered.contentSha256,
-    prNumber: pr.number,
-    reviewerTaskId: current.approval.reviewTaskId,
-    candidateVersion: current.candidate.version,
-  };
-  const persistCommentIdentity = async (identity, { adopted = false } = {}) => {
-    let persisted;
-    await withStateLock(async () => {
-      const next = await loadState();
-      const stored = next.tasks[id];
-      if (
-        !stored?.publication ||
-        stored.publication.number !== pr.number ||
-        stored.publication.repo?.toLowerCase() !== repo.toLowerCase() ||
-        stored.publication.base !== base ||
-        stored.publication.remoteHead !== head
-      ) {
-        throw new CrewdeckError("Publication target changed before verdict identity persistence", "state_changed");
-      }
-      stored.publication.verdictComments ||= [];
-      let intent = matchingVerdictIntent(stored.publication, snapshot.head);
-      if (!intent) {
-        if (!adopted) {
-          throw new CrewdeckError("Durable verdict dispatch intent is missing", "state_changed");
-        }
-        intent = { ...intentMetadata, status: "published" };
-        stored.publication.verdictComments.push(intent);
-      } else {
-        validateVerdictIntent(intent, {
-          ...rendered,
-          prNumber: pr.number,
-          approval: current.approval,
-        });
-      }
-      if (intent.comment && (intent.comment.id !== identity.id || intent.comment.url !== identity.url)) {
-        throw new CrewdeckError("Durable verdict comment identity changed", "verdict_comment_collision");
-      }
-      intent.status = "published";
-      intent.comment = identity;
-      persisted = { record: { ...stored }, intent: { ...intent } };
-      await saveState(next);
-    });
-    return persisted;
-  };
-  const publicationResult = async (persisted, { adopted, idempotent }) => ({
-    published: true,
-    idempotent: prWasIdempotent && idempotent,
-    task: publicTaskRecord(persisted.record),
-    publication: persisted.record.publication,
-    verdictComment: {
-      ...persisted.intent.comment,
-      marker: persisted.intent.marker,
-      headSha: persisted.intent.headSha,
-      reviewerTaskId: persisted.intent.reviewerTaskId,
-      candidateVersion: persisted.intent.candidateVersion,
-      immutable: true,
-      adopted,
-    },
-    currentVerdictState: await observePublishedVerdict(id, snapshot.head),
-  });
-
-  if (foundComment) {
-    const persisted = await persistCommentIdentity(foundComment, { adopted: true });
-    return publicationResult(persisted, { adopted: true, idempotent: true });
-  }
-
-  // Recheck both authorities after lookup. This catches a stale HEAD/PR before
-  // the first and only possible comment POST for this task+SHA marker.
-  current = await currentApprovedVerdict(
-    id,
-    record,
-    snapshot.head,
-    candidate.version,
-    approval.reviewTaskId,
-  );
-  const rerendered = renderVerdictComment(id, current.candidate, current.approval);
-  if (rerendered.body !== rendered.body || rerendered.marker !== rendered.marker) {
-    throw new CrewdeckError("Approved verdict data changed before dispatch", "state_changed");
-  }
-  rendered = rerendered;
-  await readExactCommentPr();
-  current = await currentApprovedVerdict(
-    id,
-    record,
-    snapshot.head,
-    candidate.version,
-    approval.reviewTaskId,
-  );
-  if (renderVerdictComment(id, current.candidate, current.approval).body !== rendered.body) {
-    throw new CrewdeckError("Approved verdict data changed before dispatch", "state_changed");
-  }
-
-  let shouldPost = false;
-  let existingIntentStatus;
-  await withStateLock(async () => {
-    const next = await loadState();
-    const stored = next.tasks[id];
-    if (
-      !stored?.publication ||
-      stored.publication.number !== pr.number ||
-      stored.publication.headSha !== snapshot.head ||
-      stored.publication.remoteSha !== snapshot.head
-    ) {
-      throw new CrewdeckError("Publication changed before verdict dispatch", "state_changed");
-    }
-    const lockedApproval = (stored.reviewInbox || []).find((item) =>
-      item.reviewTaskId === approval.reviewTaskId &&
-      item.reviewedHead === snapshot.head &&
-      item.verdict === "approved" &&
-      item.validAtCollection
-    );
-    if (
-      stored.cleanedAt ||
-      ["cleaned", "integrated", "abandoned", "pr-merged"].includes(stored.status) ||
-      ["cleanup-pending", "cleanup-failed"].includes(stored.mergeReconciliation?.status) ||
-      (stored.candidateCollectedVersion || 0) < candidate.version ||
-      !lockedApproval ||
-      (stored.reviewEscalation && stored.reviewEscalation.reviewedHead === snapshot.head) ||
-      renderVerdictComment(id, current.candidate, lockedApproval).body !== rendered.body
-    ) {
-      throw new CrewdeckError("Approved candidate state changed before verdict dispatch", "stale_candidate");
-    }
-    stored.publication.verdictComments ||= [];
-    const intent = matchingVerdictIntent(stored.publication, snapshot.head);
-    if (intent) {
-      validateVerdictIntent(intent, {
-        ...rendered,
-        prNumber: pr.number,
-        approval: current.approval,
-      });
-      existingIntentStatus = intent.status;
-      return;
-    }
-    stored.publication.verdictComments.push({
-      ...intentMetadata,
-      status: "dispatched",
-      dispatchedAt: new Date().toISOString(),
-    });
-    shouldPost = true;
-    await saveState(next);
-  });
-
-  if (!shouldPost) {
-    // A concurrent or interrupted caller owns the sole dispatch. Reconcile only;
-    // absence is durably ambiguous and can never authorize an automatic repost.
-    foundComment = await findVerdictComment(repo, pr.number, rendered.marker, rendered.body);
-    if (foundComment) {
-      const persisted = await persistCommentIdentity(foundComment, { adopted: true });
-      return publicationResult(persisted, { adopted: true, idempotent: true });
-    }
-    await withStateLock(async () => {
-      const next = await loadState();
-      const stored = next.tasks[id];
-      const intent = matchingVerdictIntent(stored?.publication, snapshot.head);
-      if (intent && intent.status !== "published") {
-        validateVerdictIntent(intent, {
-          ...rendered,
-          prNumber: pr.number,
-          approval: current.approval,
-        });
-        intent.status = "ambiguous";
-        intent.ambiguousAt ||= new Date().toISOString();
-        await saveState(next);
-      }
-    });
-    throw new CrewdeckError(
-      existingIntentStatus === "published"
-        ? "Published immutable verdict comment is no longer present; Crewdeck will not replace it"
-        : "Verdict dispatch outcome is ambiguous; Crewdeck will not issue a second POST",
-      existingIntentStatus === "published" ? "verdict_comment_missing" : "verdict_comment_ambiguous",
-      { marker: rendered.marker, prNumber: pr.number },
-    );
-  }
-
-  let postedIdentity;
-  try {
-    const posted = await runJson("gh", [
-      "api", "--method", "POST", `repos/${repo}/issues/${pr.number}/comments`,
-      "--raw-field", `body=${rendered.body}`,
-    ], { timeout: 60_000, maxBuffer: 2 * 1024 * 1024 });
-    postedIdentity = verdictCommentIdentity(posted, repo, pr.number, rendered.body);
-  } catch (error) {
-    // The dispatched intent is intentionally left intact. A later invocation
-    // may only relist/adopt; it can never compensate or send another POST.
-    throw new CrewdeckError(
-      "Verdict comment POST may have been applied; retry will reconcile without reposting",
-      "verdict_comment_post_ambiguous",
-      { error: error.message, marker: rendered.marker, prNumber: pr.number },
-    );
-  }
-  const persisted = await persistCommentIdentity(postedIdentity);
-  return publicationResult(persisted, { adopted: false, idempotent: false });
-}
-
-export async function reconcileVerdictComment(configPath, id, { reason } = {}) {
-  await loadConfig(configPath);
-  if (typeof reason !== "string" || !reason.trim()) throw new CrewdeckError("Verdict reconciliation requires a durable reason", "invalid_reason");
-  const state = await loadState();
-  const record = state.tasks[id];
-  if (!record?.publication?.number || !record.publication.repo) throw new CrewdeckError("Task has no exact published PR", "publication_incomplete");
-  const journal = await readCandidateJournal(record);
-  const candidate = journal.available ? journal.journal.candidates.at(-1) : undefined;
-  const approval = candidate && (record.reviewInbox || []).find((item) => item.reviewedHead === candidate.head && item.verdict === "approved" && item.validAtCollection);
-  if (!candidate || !approval || record.publication.headSha !== candidate.head) throw new CrewdeckError("Current exact approval/publication evidence is missing", "invalid_approval_evidence");
-  const rendered = renderVerdictComment(id, candidate, approval);
-  const intent = matchingVerdictIntent(record.publication, candidate.head);
-  if (!intent || !["dispatched", "ambiguous"].includes(intent.status)) {
-    if (intent?.status === "published") return { reconciled: true, idempotent: true, intent };
-    throw new CrewdeckError("No ambiguous exact verdict dispatch can be reconciled", "verdict_reconciliation_not_applicable");
-  }
-  validateVerdictIntent(intent, { ...rendered, prNumber: record.publication.number, approval });
-  let found;
-  let refusal;
-  try {
-    found = await findVerdictComment(record.publication.repo, record.publication.number, rendered.marker, rendered.body);
-    if (!found) refusal = { code: "verdict_comment_absent", message: "Exact immutable verdict comment is absent" };
-  } catch (error) {
-    refusal = { code: error.code || "verdict_lookup_failed", message: error.message, details: error.details };
-  }
-  const reconciledAt = new Date().toISOString();
-  let persisted;
-  await withStateLock(async () => {
-    const next = await loadState();
-    const stored = next.tasks[id];
-    const current = matchingVerdictIntent(stored?.publication, candidate.head);
-    if (!current || current.contentSha256 !== rendered.contentSha256 || !["dispatched", "ambiguous"].includes(current.status)) {
-      throw new CrewdeckError("Verdict intent changed concurrently", "state_changed");
-    }
-    stored.verdictReconciliations ||= [];
-    const outcome = { headSha: candidate.head, prNumber: record.publication.number, reason: reason.trim(), reconciledAt,
-      outcome: found ? "adopted-exact" : "refused", ...(refusal ? { refusal } : {}) };
-    stored.verdictReconciliations.push(outcome);
-    if (found) {
-      current.status = "published";
-      current.comment = found;
-      current.reconciledAt = reconciledAt;
-      current.reconciliationReason = reason.trim();
-    }
-    persisted = { outcome, intent: { ...current } };
-    await saveState(next);
-  });
-  if (!found) throw new CrewdeckError(refusal.message, refusal.code, { ...refusal.details, durableOutcome: persisted.outcome });
-  return { reconciled: true, idempotent: false, ...persisted };
-}
+const findVerdictComment = publicationService.findVerdictComment;
+const inspectGitHubChecks = publicationService.inspectGitHubChecks;
+const matchingVerdictIntent = publicationService.matchingVerdictIntent;
+export const publishPullRequest = publicationService.publishPullRequest;
+export const reconcileVerdictComment = publicationService.reconcileVerdictComment;
+const renderVerdictComment = publicationService.renderVerdictComment;
+const requirePassingChecks = publicationService.requirePassingChecks;
+const validatedVerdictPayload = publicationService.validatedVerdictPayload;
 
 function provenMissingAgent(agent) {
   return (
@@ -3743,881 +2326,44 @@ async function listedWorktrees(repoPath) {
   );
 }
 
-const BASE_ADVANCE_TERMINAL = new Set(["cleaned", "integrated", "abandoned", "pr-merged", "orphan-reconciled", "retired"]);
+const reconciliationService = createReconciliationService({
+  CrewdeckError,
+  exactHeadRepository,
+  exactIssueCommentUrl,
+  exactPullRequestUrl,
+  findVerdictComment,
+  git,
+  gitAncestorProof,
+  githubRepositoryFromUrl,
+  gitSnapshot,
+  inspectGitHubChecks,
+  listedWorktrees,
+  liveAgent,
+  loadConfig,
+  loadState,
+  missingWorkspace,
+  provenMissingAgent,
+  publicTaskRecord,
+  readCandidateJournal,
+  readTaskReport,
+  remoteBranchSha,
+  renderVerdictComment,
+  requirePassingChecks,
+  resolveProject,
+  run,
+  runJson,
+  saveState,
+  taskIdPattern: TASK_ID_RE,
+  validatedVerdictPayload,
+  validBranchName,
+  validRemoteName,
+  validRepositoryName,
+  withStateLock,
+});
 
-async function classifyBaseAdvance(record, newBaseSha) {
-  if (!/^[0-9a-f]{40}$/.test(record.baseSha || "") || !/^[0-9a-f]{40}$/.test(newBaseSha || "")) {
-    return { classification: "unknown", reason: "missing exact pinned or advanced base commit" };
-  }
-  const behind = await gitAncestorProof(record.repo, record.baseSha, newBaseSha);
-  if (!behind.available || !behind.ancestor) {
-    return { classification: "unknown", reason: behind.error || "pinned base is not proven ancestral to the merged base" };
-  }
-  const snapshot = await gitSnapshot(record);
-  if (!snapshot.available) return { classification: "unknown", reason: snapshot.error || "build HEAD is unavailable" };
-  const contains = await gitAncestorProof(record.repo, newBaseSha, snapshot.head);
-  if (contains.available && contains.ancestor) {
-    return { classification: "compatible", requiresRefresh: false, headSha: snapshot.head, evidence: "advanced base already contained by build HEAD" };
-  }
-  try {
-    await git(record.repo, ["merge-tree", "--write-tree", "--merge-base", record.baseSha, newBaseSha, snapshot.head]);
-    return { classification: "compatible", requiresRefresh: true, headSha: snapshot.head, evidence: "git merge-tree completed without conflicts" };
-  } catch (error) {
-    if (error.code === "command_failed" && Number(error.details?.exitCode) === 1) {
-      return { classification: "conflicting", requiresRefresh: true, headSha: snapshot.head, evidence: "git merge-tree reported conflicts" };
-    }
-    return { classification: "unknown", headSha: snapshot.head, reason: error.message };
-  }
-}
-
-async function recordBaseAdvanceFanout(source, outcome) {
-  if (outcome.status !== "merged-awaiting-confirmed-reconciliation" || !/^[0-9a-f]{40}$/.test(outcome.mergeCommit || "")) return [];
-  const snapshot = await loadState();
-  const eligible = Object.values(snapshot.tasks).filter((record) => {
-    const lifecycle = record.lifecycle || (record.kind === "scout" ? "report" : "change");
-    return record.id !== source.id && record.project === source.project && lifecycle === "change" &&
-      record.base === source.base && !record.cleanedAt && !BASE_ADVANCE_TERMINAL.has(record.status) &&
-      record.baseSha !== outcome.mergeCommit;
-  });
-  const classified = [];
-  for (const record of eligible) classified.push({ record, result: await classifyBaseAdvance(record, outcome.mergeCommit) });
-  const created = [];
-  await withStateLock(async () => {
-    const next = await loadState();
-    for (const { record, result } of classified) {
-      const stored = next.tasks[record.id];
-      if (!stored || stored.id === source.id || stored.project !== source.project || stored.lifecycle === "report" ||
-          stored.cleanedAt || BASE_ADVANCE_TERMINAL.has(stored.status)) continue;
-      stored.baseAdvances ||= [];
-      const identity = `${source.id}:${stored.baseSha || "unknown"}:${outcome.mergeCommit}`;
-      const existing = stored.baseAdvances.find((item) => item.identity === identity);
-      if (existing) {
-        if (["pending", "awaiting-writer"].includes(existing.status) && result.headSha && existing.headSha !== result.headSha) {
-          Object.assign(existing, {
-            classification: result.classification,
-            ...(result.requiresRefresh !== undefined ? { requiresRefresh: result.requiresRefresh } : {}),
-            headSha: result.headSha,
-            ...(result.evidence ? { evidence: result.evidence, reason: undefined } : {}),
-            ...(result.reason ? { reason: result.reason, evidence: undefined } : {}),
-            reclassifiedAt: new Date().toISOString(),
-          });
-          created.push({ taskId: stored.id, ...existing, updated: true });
-        }
-        continue;
-      }
-      const notification = {
-        sequence: stored.baseAdvances.length + 1,
-        identity,
-        status: "pending",
-        sourceTaskId: source.id,
-        sourcePrNumber: outcome.number,
-        sourcePrUrl: outcome.url,
-        priorBaseSha: stored.baseSha,
-        newBaseSha: outcome.mergeCommit,
-        mergedAt: outcome.mergedAt,
-        observedAt: outcome.observedAt,
-        classification: result.classification,
-        ...(result.requiresRefresh !== undefined ? { requiresRefresh: result.requiresRefresh } : {}),
-        ...(result.headSha ? { headSha: result.headSha } : {}),
-        ...(result.evidence ? { evidence: result.evidence } : {}),
-        ...(result.reason ? { reason: result.reason } : {}),
-      };
-      stored.baseAdvances.push(notification);
-      created.push({ taskId: stored.id, ...notification });
-    }
-    if (created.length) await saveState(next);
-  });
-  return created;
-}
-
-export async function observePublishedPullRequests(configPath, id) {
-  const config = await loadConfig(configPath);
-  const state = await loadState();
-  const records = Object.values(state.tasks).filter((record) =>
-    (!id || record.id === id) && record.status === "running" && record.workflow === "reviewed-pr" && record.publication?.number
-  );
-  if (id && records.length === 0) throw new CrewdeckError("No active published reviewed-pr task matches", "publication_incomplete");
-  const observations = [];
-  for (const record of records) {
-    const publication = record.publication;
-    const fields = "number,url,state,isDraft,headRefName,baseRefName,headRefOid,isCrossRepository,headRepository,headRepositoryOwner,mergeCommit,mergedAt";
-    let outcome;
-    try {
-      const pr = await runJson("gh", ["pr", "view", String(publication.number), "--repo", publication.repo, "--json", fields], { timeout: 20_000 });
-      const identityExact = pr?.number === publication.number && pr?.url === publication.url &&
-        exactPullRequestUrl(pr?.url, publication.repo, publication.number) && pr?.headRefName === publication.remoteHead &&
-        pr?.baseRefName === publication.base && pr?.headRefOid === publication.headSha && pr?.isCrossRepository === false &&
-        exactHeadRepository(pr?.headRepository, pr?.headRepositoryOwner, publication.repo);
-      if (!identityExact) throw new CrewdeckError("Observed PR identity diverges from durable publication", "observer_identity_mismatch", pr);
-      if (pr.state === "MERGED" && (!/^[0-9a-f]{40}$/.test(pr.mergeCommit?.oid || "") ||
-          typeof pr.mergedAt !== "string" || Number.isNaN(Date.parse(pr.mergedAt)))) {
-        throw new CrewdeckError("Merged observation lacks exact merge identity", "observer_identity_mismatch", pr);
-      }
-      const stateName = pr.state === "MERGED" ? "merged-awaiting-confirmed-reconciliation"
-        : pr.state === "OPEN" ? "open" : pr.state === "CLOSED" ? "closed-unmerged" : "unknown";
-      outcome = { status: stateName, observedAt: new Date().toISOString(), repo: publication.repo,
-        number: publication.number, url: publication.url, headSha: publication.headSha,
-        ...(pr.state === "MERGED" ? { mergedAt: pr.mergedAt, mergeCommit: pr.mergeCommit?.oid } : {}) };
-    } catch (error) {
-      outcome = { status: "lookup-failed", observedAt: new Date().toISOString(), repo: publication.repo,
-        number: publication.number, url: publication.url, headSha: publication.headSha, reason: error.message };
-    }
-    let newlyObserved = false;
-    await withStateLock(async () => {
-      const next = await loadState();
-      const stored = next.tasks[record.id];
-      if (stored?.publication?.number === publication.number && stored.publication.headSha === publication.headSha) {
-        newlyObserved = stored.prObservation?.status !== outcome.status;
-        stored.prObservation = outcome;
-        stored.prObservationHistory ||= [];
-        if (newlyObserved) stored.prObservationHistory.push(outcome);
-        await saveState(next);
-      }
-    });
-    // Run fanout on every exact merged observation. Durable identities deduplicate it;
-    // this closes the crash window between persisting the PR observation and fanout.
-    const baseAdvances = outcome.status === "merged-awaiting-confirmed-reconciliation"
-      ? await recordBaseAdvanceFanout(record, outcome) : [];
-    observations.push({ id: record.id, ...outcome, newlyObserved, baseAdvances });
-  }
-  return observations;
-}
-
-export async function forwardBaseAdvance(configPath, id, sequence, { wait = false } = {}) {
-  if (sequence !== undefined && (!Number.isSafeInteger(sequence) || sequence < 1)) throw new CrewdeckError("Base-advance sequence must be a positive safe integer", "invalid_base_advance_sequence");
-  const config = await loadConfig(configPath);
-  const state = await loadState();
-  const record = state.tasks[id];
-  if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
-  record.lifecycle ||= config.kinds[record.kind]?.lifecycle || "change";
-  if (record.lifecycle !== "change" || record.cleanedAt || BASE_ADVANCE_TERMINAL.has(record.status)) {
-    throw new CrewdeckError("Only a nonterminal change task can receive a base advance", "invalid_base_advance_task");
-  }
-  const notification = sequence === undefined
-    ? (record.baseAdvances || []).filter((item) => item.status === "pending" || item.status === "awaiting-writer").at(-1)
-    : (record.baseAdvances || []).find((item) => item.sequence === sequence);
-  if (!notification) throw new CrewdeckError("Pending base-advance notification is missing", "base_advance_missing");
-  if (notification.status === "forwarded" || notification.status === "compatible-preserved") {
-    return { forwarded: notification.status === "forwarded", preserved: notification.status === "compatible-preserved", idempotent: true, notification };
-  }
-  if (notification.classification === "unknown") {
-    throw new CrewdeckError("Base compatibility is unknown; resolve Git evidence before notifying a writer", "base_compatibility_unknown", notification);
-  }
-  const currentSnapshot = await gitSnapshot(record);
-  if (!currentSnapshot.available || (notification.headSha && currentSnapshot.head !== notification.headSha)) {
-    throw new CrewdeckError("Build HEAD changed after base compatibility classification; wait for observer reclassification", "base_advance_stale", {
-      classifiedHead: notification.headSha, currentHead: currentSnapshot.head, error: currentSnapshot.error,
-    });
-  }
-  if (notification.classification === "compatible" && (record.publication?.number || notification.requiresRefresh === false)) {
-    await withStateLock(async () => {
-      const next = await loadState();
-      const item = (next.tasks[id]?.baseAdvances || []).find((entry) => entry.identity === notification.identity);
-      if (!item) throw new CrewdeckError("Base advance changed", "state_changed");
-      item.status = "compatible-preserved";
-      item.settledAt ||= new Date().toISOString();
-      await saveState(next);
-    });
-    return {
-      forwarded: false, preserved: true, idempotent: false,
-      reason: record.publication?.number
-        ? "published exact-SHA PR is locally compatible and is not rewritten"
-        : "build HEAD already contains the advanced base; candidate and approval identity do not require refresh",
-    };
-  }
-  const agent = await liveAgent(record);
-  if (!agent.available) {
-    if (!provenMissingAgent(agent)) throw new CrewdeckError("Cannot prove sole writer state", "agent_state_unknown", agent);
-    await withStateLock(async () => {
-      const next = await loadState();
-      const item = (next.tasks[id]?.baseAdvances || []).find((entry) => entry.identity === notification.identity);
-      if (!item) throw new CrewdeckError("Base advance changed", "state_changed");
-      item.status = "awaiting-writer";
-      item.writerAbsentAt ||= new Date().toISOString();
-      await saveState(next);
-    });
-    return { forwarded: false, writerAbsent: true, nextAction: "resume the sole writer, then forward this base advance" };
-  }
-  const attemptedAt = new Date().toISOString();
-  await withStateLock(async () => {
-    const next = await loadState();
-    const stored = next.tasks[id];
-    const item = (stored?.baseAdvances || []).find((entry) => entry.identity === notification.identity);
-    if (!item) throw new CrewdeckError("Base advance changed", "state_changed");
-    item.status = "forwarding";
-    item.forwardAttempts = (item.forwardAttempts || 0) + 1;
-    item.forwardAttemptedAt = attemptedAt;
-    stored.baseShaHistory ||= [];
-    if (stored.baseSha !== notification.newBaseSha) {
-      stored.baseShaHistory.push({ sha: stored.baseSha, supersededBy: notification.newBaseSha, at: attemptedAt, sourceTaskId: notification.sourceTaskId });
-      stored.baseSha = notification.newBaseSha;
-    }
-    stored.requiredBaseSha = notification.newBaseSha;
-    for (const review of stored.reviewInbox || []) {
-      if (review.validAtCollection) {
-        review.validAtCollection = false;
-        review.staleAt ||= attemptedAt;
-        review.staleReason = "pinned base advanced";
-      }
-    }
-    await saveState(next);
-  });
-  const message = [
-    `CREWDECK BASE ADVANCE ${notification.sequence}: ${notification.sourceTaskId} merged and the pinned base advanced from ${notification.priorBaseSha} to ${notification.newBaseSha}.`,
-    `Local deterministic classification: ${notification.classification}.`,
-    "Adapt/rebase the existing sole-writer branch without discarding work, rerun verification, commit any resulting changes, and submit a new exact-HEAD candidate when the SHA changes. Prior candidate review/approval is stale. Do not reuse it.",
-  ].join("\n");
-  const args = ["agent", "prompt", record.agentName, message];
-  if (wait) args.push("--wait", "--timeout", "600000");
-  await runJson("herdr", args, { timeout: wait ? 610_000 : 15_000 });
-  const forwardedAt = new Date().toISOString();
-  await withStateLock(async () => {
-    const next = await loadState();
-    const item = (next.tasks[id]?.baseAdvances || []).find((entry) => entry.identity === notification.identity);
-    if (!item) throw new CrewdeckError("Base advance changed after delivery", "state_changed");
-    item.status = "forwarded";
-    item.forwardedAt ||= forwardedAt;
-    await saveState(next);
-  });
-  return { forwarded: true, idempotent: false, taskId: id, sequence: notification.sequence, forwardedAt };
-}
-
-function mergedReconciliationResult(record, idempotent) {
-  return {
-    reconciled: true,
-    idempotent,
-    status: "merged-reconciled",
-    task: publicTaskRecord(record),
-    publication: record.publication,
-    reconciliation: record.mergeReconciliation,
-  };
-}
-
-export async function reconcileMergedPullRequest(configPath, id) {
-  const config = await loadConfig(configPath);
-  const state = await loadState();
-  const record = state.tasks[id];
-  if (!record) throw new CrewdeckError(`Unknown task '${id}'`, "unknown_task");
-  record.kind ||= record.profile === "scout" ? "scout" : "build";
-  record.lifecycle ||= config.kinds[record.kind]?.lifecycle || "change";
-  record.workflow ||= "direct";
-  record.cleanup ||= config.kinds[record.kind]?.cleanup || "after-integration";
-
-  if (record.status === "pr-merged") {
-    if (record.mergeReconciliation?.status !== "merged-reconciled") {
-      throw new CrewdeckError("Merged PR task has incomplete reconciliation evidence", "invalid_reconciliation_state");
-    }
-    return mergedReconciliationResult(record, true);
-  }
-  if (record.lifecycle !== "change" || record.workflow !== "reviewed-pr") {
-    throw new CrewdeckError("Merged PR reconciliation requires a reviewed-pr change task", "invalid_reconciliation_task");
-  }
-  if (record.status !== "running" || record.cleanedAt) {
-    throw new CrewdeckError(
-      `Task status '${record.status}' is not eligible for merged PR reconciliation`,
-      "invalid_reconciliation_state",
-    );
-  }
-  const recovery = ["cleanup-pending", "cleanup-failed"].includes(record.mergeReconciliation?.status);
-  if (record.mergeReconciliation && !recovery) {
-    throw new CrewdeckError("Task has invalid merge reconciliation state", "invalid_reconciliation_state");
-  }
-  if (record.resumeReservation) {
-    throw new CrewdeckError("A build adoption reservation is active", "writer_already_present");
-  }
-  const activeReview = Object.values(state.tasks).find((item) =>
-    item.parentTaskId === id &&
-    !item.cleanedAt &&
-    !["cleaned", "orphan-reconciled"].includes(item.status)
-  );
-  if (activeReview) {
-    throw new CrewdeckError("A reviewer for this build is still active", "reviewer_already_active", {
-      reviewTaskId: activeReview.id,
-    });
-  }
-
-  const project = resolveProject(config, record.project);
-  if (
-    record.branch !== `crew/${id}` ||
-    record.base !== project.base ||
-    path.resolve(record.worktree) !== path.join(config.worktreeRoot, record.project, id) ||
-    path.resolve(record.repo) !== project.path
-  ) {
-    throw new CrewdeckError("Task does not reference its expected isolated Git resources", "unsafe_task_resources");
-  }
-
-  const publication = record.publication;
-  if (
-    !publication ||
-    !validRemoteName(publication.remote) ||
-    !validRepositoryName(publication.repo) ||
-    !validBranchName(publication.base) ||
-    !validBranchName(publication.remoteHead) ||
-    !Number.isInteger(publication.number) ||
-    publication.number < 1 ||
-    !exactPullRequestUrl(publication.url, publication.repo, publication.number) ||
-    publication.base !== record.base ||
-    publication.remoteHead !== record.branch ||
-    publication.headSha !== publication.remoteSha ||
-    !/^[0-9a-f]{40}$/.test(publication.headSha || "")
-  ) {
-    throw new CrewdeckError("Durable publication identity is missing or inconsistent", "invalid_publication_identity");
-  }
-
-  const journalResult = await readCandidateJournal(record);
-  if (!journalResult.available) {
-    throw new CrewdeckError(journalResult.error || "Candidate journal is missing", "missing_candidate");
-  }
-  const candidate = journalResult.journal.candidates.at(-1);
-  if (
-    !candidate ||
-    candidate.head !== publication.headSha ||
-    record.candidateCollectedVersion !== candidate.version
-  ) {
-    throw new CrewdeckError("Published approved SHA is not the latest collected candidate", "stale_candidate", {
-      publishedHead: publication.headSha,
-      candidateHead: candidate?.head,
-      candidateVersion: candidate?.version,
-      collectedVersion: record.candidateCollectedVersion,
-    });
-  }
-  const approvals = (record.reviewInbox || []).filter((item) =>
-    item.reviewedHead === candidate.head &&
-    item.candidateVersion === candidate.version &&
-    item.verdict === "approved" &&
-    item.validAtCollection === true
-  );
-  if (approvals.length !== 1) {
-    throw new CrewdeckError("Published candidate does not have one exact durable approval", "ambiguous_approval", {
-      matches: approvals.length,
-    });
-  }
-  const approval = approvals[0];
-  validatedVerdictPayload(id, candidate, approval);
-  const reviewRecord = state.tasks[approval.reviewTaskId];
-  const reviewResult = reviewRecord ? await readTaskReport(reviewRecord) : { available: false };
-  if (
-    !reviewRecord ||
-    reviewRecord.contract !== "review" ||
-    reviewRecord.parentTaskId !== id ||
-    reviewRecord.reviewedHead !== candidate.head ||
-    reviewRecord.candidateVersion !== candidate.version ||
-    !reviewRecord.resultCollectedAt ||
-    !reviewResult.available ||
-    reviewResult.report.payload?.verdict !== "approved" ||
-    reviewResult.report.payload?.parentTaskId !== id ||
-    reviewResult.report.payload?.reviewedHead !== candidate.head ||
-    reviewResult.report.payload?.summary !== approval.summary ||
-    JSON.stringify(reviewResult.report.payload?.findings) !== JSON.stringify(approval.findings) ||
-    JSON.stringify(reviewResult.report.payload?.checks) !== JSON.stringify(approval.checks) ||
-    JSON.stringify(reviewResult.report.payload?.openQuestions) !== JSON.stringify(approval.openQuestions)
-  ) {
-    throw new CrewdeckError("Exact durable reviewer evidence is missing or inconsistent", "invalid_approval_evidence");
-  }
-  if (record.reviewEscalation?.reviewedHead === candidate.head) {
-    throw new CrewdeckError("Published candidate has unresolved review escalation", "review_not_approved");
-  }
-
-  const hasVerdictJournal = Object.hasOwn(publication, "verdictComments");
-  let verdictEvidence;
-  if (!hasVerdictJournal) {
-    // Publications completed by a process that loaded the pre-verdict implementation
-    // have no journal at all. Absence is distinct from any present, incomplete intent.
-    verdictEvidence = {
-      status: "legacy-absent",
-      headSha: candidate.head,
-      candidateVersion: candidate.version,
-      reviewerTaskId: approval.reviewTaskId,
-    };
-  } else {
-    const verdicts = publication.verdictComments;
-    if (
-      !Array.isArray(verdicts) ||
-      verdicts.length === 0 ||
-      verdicts.some((item) => {
-        if (
-          item?.status !== "published" ||
-          !/^[0-9a-f]{40}$/.test(item.headSha || "") ||
-          item.marker !== `<!-- crewdeck-verdict:${id}:${item.headSha} -->` ||
-          item.prNumber !== publication.number ||
-          !Number.isInteger(item.candidateVersion) ||
-          !TASK_ID_RE.test(item.reviewerTaskId || "") ||
-          !/^[0-9a-f]{64}$/.test(item.contentSha256 || "") ||
-          !Number.isInteger(item.comment?.id) ||
-          item.comment.id < 1 ||
-          !exactIssueCommentUrl(item.comment?.url, publication.repo, publication.number, item.comment?.id)
-        ) {
-          return true;
-        }
-        const intentCandidate = journalResult.journal.candidates.find((entry) =>
-          entry.head === item.headSha && entry.version === item.candidateVersion
-        );
-        const intentApprovals = (record.reviewInbox || []).filter((entry) =>
-          entry.reviewTaskId === item.reviewerTaskId &&
-          entry.reviewedHead === item.headSha &&
-          entry.candidateVersion === item.candidateVersion &&
-          entry.verdict === "approved" &&
-          entry.validAtCollection === true
-        );
-        if (!intentCandidate || intentApprovals.length !== 1) return true;
-        try {
-          const rendered = renderVerdictComment(id, intentCandidate, intentApprovals[0]);
-          return item.marker !== rendered.marker || item.contentSha256 !== rendered.contentSha256;
-        } catch {
-          return true;
-        }
-      }) ||
-      new Set(verdicts.map((item) => item.headSha)).size !== verdicts.length
-    ) {
-      throw new CrewdeckError("Durable publication is missing or ambiguous", "ambiguous_publication");
-    }
-    const matchingVerdicts = verdicts.filter((item) =>
-      item.headSha === candidate.head &&
-      item.candidateVersion === candidate.version &&
-      item.reviewerTaskId === approval.reviewTaskId
-    );
-    if (matchingVerdicts.length !== 1) {
-      throw new CrewdeckError("Approved candidate has no unique published verdict", "ambiguous_publication", {
-        matches: matchingVerdicts.length,
-      });
-    }
-    const [matchingVerdict] = matchingVerdicts;
-    verdictEvidence = {
-      status: "published",
-      headSha: matchingVerdict.headSha,
-      candidateVersion: matchingVerdict.candidateVersion,
-      reviewerTaskId: matchingVerdict.reviewerTaskId,
-      marker: matchingVerdict.marker,
-      contentSha256: matchingVerdict.contentSha256,
-      comment: { ...matchingVerdict.comment },
-    };
-  }
-  let remoteUrl;
-  try {
-    remoteUrl = (await git(record.repo, ["remote", "get-url", "--push", publication.remote])).stdout;
-  } catch (error) {
-    throw new CrewdeckError(`Git remote '${publication.remote}' is unavailable`, "remote_unavailable", {
-      error: error.message,
-    });
-  }
-  const remoteRepo = githubRepositoryFromUrl(remoteUrl);
-  if (!remoteRepo || remoteRepo.toLowerCase() !== publication.repo.toLowerCase()) {
-    throw new CrewdeckError("Durable publication remote and GitHub repository differ", "remote_repo_mismatch", {
-      remoteUrl,
-      repo: publication.repo,
-    });
-  }
-  let forgeRepo;
-  try {
-    forgeRepo = await runJson("gh", ["repo", "view", publication.repo, "--json", "nameWithOwner"], {
-      timeout: 20_000,
-    });
-  } catch (error) {
-    throw new CrewdeckError("GitHub repository is unavailable through gh", "forge_unavailable", {
-      error: error.message,
-    });
-  }
-  if (forgeRepo?.nameWithOwner?.toLowerCase() !== publication.repo.toLowerCase()) {
-    throw new CrewdeckError("gh resolved a different GitHub repository", "forge_repo_mismatch", forgeRepo);
-  }
-
-  const prFields = [
-    "number", "url", "state", "isDraft", "headRefName", "baseRefName", "headRefOid",
-    "isCrossRepository", "headRepository", "headRepositoryOwner", "mergeCommit", "mergedAt",
-  ].join(",");
-  let pr;
-  try {
-    pr = await runJson("gh", [
-      "pr", "view", String(publication.number), "--repo", publication.repo, "--json", prFields,
-    ], { timeout: 20_000 });
-  } catch (error) {
-    throw new CrewdeckError("Stored GitHub PR is unavailable", "forge_unavailable", { error: error.message });
-  }
-  const mergeCommit = pr?.mergeCommit?.oid;
-  if (
-    pr?.number !== publication.number ||
-    pr?.url !== publication.url ||
-    !exactPullRequestUrl(pr?.url, publication.repo, publication.number) ||
-    pr?.state !== "MERGED" ||
-    pr?.isDraft !== false ||
-    pr?.headRefName !== publication.remoteHead ||
-    pr?.baseRefName !== publication.base ||
-    pr?.headRefOid !== candidate.head ||
-    pr?.isCrossRepository !== false ||
-    !exactHeadRepository(pr?.headRepository, pr?.headRepositoryOwner, publication.repo) ||
-    !/^[0-9a-f]{40}$/.test(mergeCommit || "") ||
-    typeof pr?.mergedAt !== "string" ||
-    Number.isNaN(Date.parse(pr.mergedAt))
-  ) {
-    throw new CrewdeckError("GitHub PR is not the exact merged publication", "pull_request_not_merged", pr);
-  }
-  const mergedChecks = await inspectGitHubChecks(project, publication.repo, candidate.head);
-  publication.checks = mergedChecks;
-  await withStateLock(async () => {
-    const next = await loadState();
-    const stored = next.tasks[id];
-    if (!stored?.publication || stored.publication.number !== publication.number || stored.publication.headSha !== candidate.head) {
-      throw new CrewdeckError("Publication changed before merged checks persistence", "state_changed");
-    }
-    stored.publication.checks = mergedChecks;
-    await saveState(next);
-  });
-  requirePassingChecks(mergedChecks, "merged reconciliation");
-
-  if (verdictEvidence.status === "legacy-absent") {
-    const rendered = renderVerdictComment(id, candidate, approval);
-    const untrackedVerdict = await findVerdictComment(
-      publication.repo,
-      publication.number,
-      rendered.marker,
-      rendered.body,
-    );
-    if (untrackedVerdict) {
-      throw new CrewdeckError(
-        "Legacy publication has an untracked GitHub verdict comment",
-        "ambiguous_publication",
-        { prNumber: publication.number, marker: rendered.marker },
-      );
-    }
-    verdictEvidence.verifiedAt = new Date().toISOString();
-  }
-
-  const localBaseBefore = (await git(record.repo, ["rev-parse", record.base])).stdout;
-  const remoteBaseSha = await remoteBranchSha(record.repo, publication.remote, publication.base);
-  try {
-    await git(record.repo, [
-      "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", publication.remote,
-      `refs/heads/${publication.base}`,
-    ], { timeout: 120_000 });
-  } catch (error) {
-    throw new CrewdeckError("Cannot fetch remote base evidence without updating refs", "containment_unavailable", {
-      error: error.message,
-    });
-  }
-  if ((await git(record.repo, ["rev-parse", record.base])).stdout !== localBaseBefore) {
-    throw new CrewdeckError("Containment fetch unexpectedly changed the local base", "base_changed");
-  }
-  try {
-    await git(record.repo, [
-      "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", publication.remote, mergeCommit,
-    ], { timeout: 120_000 });
-  } catch {
-    // Some forges refuse fetching an exact SHA. The advertised remote base may
-    // still supply either the merge object or independent containment proof.
-  }
-  const [mergeProof, baseProof] = await Promise.all([
-    gitAncestorProof(record.repo, candidate.head, mergeCommit),
-    gitAncestorProof(record.repo, candidate.head, remoteBaseSha),
-  ]);
-  if (!mergeProof.ancestor && !baseProof.ancestor) {
-    throw new CrewdeckError(
-      "Approved candidate is not proven contained in the PR merge commit or current remote base",
-      "approved_sha_not_contained",
-      { candidate: candidate.head, mergeCommit, remoteBaseSha, mergeProof, baseProof },
-    );
-  }
-
-  const agent = await liveAgent(record);
-  if (agent.available && !["idle", "done"].includes(agent.state)) {
-    throw new CrewdeckError(`Worker is ${agent.state}; reconciliation requires a settled writer`, "worker_not_settled");
-  }
-  if (!agent.available && !provenMissingAgent(agent)) {
-    throw new CrewdeckError("Cannot prove build writer state", "agent_state_unknown", agent);
-  }
-
-  const snapshot = await gitSnapshot(record);
-  if (snapshot.available) {
-    const branch = (await git(record.worktree, ["branch", "--show-current"])).stdout;
-    if (!snapshot.clean) {
-      throw new CrewdeckError("Worktree is dirty; reconciliation never discards uncommitted data", "dirty_worktree", snapshot);
-    }
-    if (snapshot.head !== candidate.head || branch !== record.branch) {
-      throw new CrewdeckError("Worktree no longer matches the latest approved candidate", "stale_candidate", {
-        snapshot,
-        branch,
-      });
-    }
-  } else {
-    let worktreeMissing = false;
-    try {
-      await stat(record.worktree);
-    } catch (error) {
-      if (error.code === "ENOENT") worktreeMissing = true;
-      else throw error;
-    }
-    const priorProof = record.mergeReconciliation?.evidence?.worktree;
-    if (
-      !recovery ||
-      !worktreeMissing ||
-      priorProof?.clean !== true ||
-      priorProof?.head !== candidate.head ||
-      priorProof?.branch !== record.branch
-    ) {
-      throw new CrewdeckError("Cannot prove the build worktree clean", "worktree_state_unknown", snapshot);
-    }
-  }
-
-  const branchRef = `refs/heads/${record.branch}`;
-  let branchSha;
-  try {
-    branchSha = (await git(record.repo, ["rev-parse", "--verify", branchRef])).stdout;
-  } catch (error) {
-    if (!recovery) {
-      throw new CrewdeckError("Owned build branch is missing", "missing_branch", { error: error.message });
-    }
-  }
-  if (branchSha && branchSha !== candidate.head) {
-    throw new CrewdeckError("Owned branch contains a newer or different candidate", "stale_candidate", {
-      expected: candidate.head,
-      actual: branchSha,
-    });
-  }
-
-  const publicationFingerprint = JSON.stringify(publication);
-  const reviewFingerprint = JSON.stringify(record.reviewInbox);
-  const expectedPriorOperationId = record.mergeReconciliation?.operationId;
-  const operationId = randomBytes(12).toString("hex");
-  const startedAt = record.mergeReconciliation?.startedAt || new Date().toISOString();
-  const proofAt = new Date().toISOString();
-  const evidence = {
-    pr: {
-      repo: publication.repo,
-      number: publication.number,
-      url: publication.url,
-      base: publication.base,
-      head: publication.remoteHead,
-      state: "MERGED",
-      mergeCommit,
-      mergedAt: pr.mergedAt,
-    },
-    candidate: {
-      sha: candidate.head,
-      version: candidate.version,
-      reviewerTaskId: approval.reviewTaskId,
-    },
-    verdict: verdictEvidence,
-    containment: {
-      remoteBaseSha,
-      mergeCommit,
-      candidateAncestorOfMergeCommit: mergeProof.ancestor,
-      candidateAncestorOfRemoteBase: baseProof.ancestor,
-      verifiedAt: proofAt,
-    },
-    remote: { name: publication.remote, url: remoteUrl, repo: publication.repo },
-    agent: { state: agent.state, available: agent.available },
-    worktree: { clean: true, head: candidate.head, branch: record.branch, verifiedAt: proofAt },
-  };
-
-  await withStateLock(async () => {
-    const next = await loadState();
-    const stored = next.tasks[id];
-    if (
-      !stored ||
-      stored.status !== "running" ||
-      stored.cleanedAt ||
-      stored.resumeReservation ||
-      JSON.stringify(stored.publication) !== publicationFingerprint ||
-      stored.candidateCollectedVersion !== candidate.version ||
-      JSON.stringify(stored.reviewInbox) !== reviewFingerprint ||
-      stored.mergeReconciliation?.operationId !== expectedPriorOperationId
-    ) {
-      throw new CrewdeckError("Task state changed before reconciliation cleanup", "state_changed");
-    }
-    stored.mergeReconciliation = {
-      status: "cleanup-pending",
-      operationId,
-      startedAt,
-      lastAttemptAt: proofAt,
-      attempts: (stored.mergeReconciliation?.attempts || 0) + 1,
-      fromStatus: "running",
-      evidence,
-    };
-    await saveState(next);
-  });
-
-  const recordFailure = async (error) => {
-    try {
-      await withStateLock(async () => {
-        const next = await loadState();
-        const stored = next.tasks[id];
-        if (stored?.status === "running" && stored.mergeReconciliation?.operationId === operationId) {
-          stored.mergeReconciliation.status = "cleanup-failed";
-          stored.mergeReconciliation.failedAt = new Date().toISOString();
-          stored.mergeReconciliation.lastError = error.message;
-          stored.mergeReconciliation.lastErrorCode = error.code || "cleanup_failed";
-          await saveState(next);
-        }
-      });
-    } catch {
-      // Preserve the original cleanup failure; a reservation still prevents a false terminal state.
-    }
-  };
-
-  try {
-    const closingAgent = await liveAgent(record);
-    if (closingAgent.available && !["idle", "done"].includes(closingAgent.state)) {
-      throw new CrewdeckError(`Worker became ${closingAgent.state} before cleanup`, "worker_not_settled");
-    }
-    if (!closingAgent.available && !provenMissingAgent(closingAgent)) {
-      throw new CrewdeckError("Build writer state became unknown before cleanup", "agent_state_unknown", closingAgent);
-    }
-    if (closingAgent.available) {
-      try {
-        await run("herdr", ["agent", "send-keys", record.agentName, "ctrl+d"], { timeout: 10_000 });
-      } catch (error) {
-        if (closingAgent.state !== "done") {
-          throw new CrewdeckError("Cannot close the settled build agent", "agent_cleanup_failed", {
-            error: error.message,
-          });
-        }
-        // A done agent may already have exited its pane. Removing the proven
-        // isolated workspace remains the closing authority.
-      }
-    }
-
-    const beforeCleanupState = await loadState();
-    const beforeCleanupRecord = beforeCleanupState.tasks[id];
-    const latestJournal = await readCandidateJournal(beforeCleanupRecord || record);
-    const latestCandidate = latestJournal.available ? latestJournal.journal.candidates.at(-1) : undefined;
-    const beforeCleanupSnapshot = await gitSnapshot(record);
-    if (
-      beforeCleanupRecord?.status !== "running" ||
-      beforeCleanupRecord?.mergeReconciliation?.operationId !== operationId ||
-      JSON.stringify(beforeCleanupRecord.publication) !== publicationFingerprint ||
-      beforeCleanupRecord.candidateCollectedVersion !== candidate.version ||
-      JSON.stringify(beforeCleanupRecord.reviewInbox) !== reviewFingerprint ||
-      latestCandidate?.head !== candidate.head ||
-      latestCandidate?.version !== candidate.version ||
-      (beforeCleanupSnapshot.available &&
-        (!beforeCleanupSnapshot.clean || beforeCleanupSnapshot.head !== candidate.head)) ||
-      (!beforeCleanupSnapshot.available && !recovery)
-    ) {
-      throw new CrewdeckError("Candidate or durable state changed before cleanup", "state_changed");
-    }
-    if (await remoteBranchSha(record.repo, publication.remote, publication.base) !== remoteBaseSha) {
-      throw new CrewdeckError("Remote base changed before cleanup; retry containment verification", "remote_base_changed");
-    }
-
-    let worktreeExists = true;
-    try {
-      await stat(record.worktree);
-    } catch (error) {
-      if (error.code === "ENOENT") worktreeExists = false;
-      else throw error;
-    }
-    if (worktreeExists) {
-      try {
-        await runJson("herdr", ["worktree", "remove", "--workspace", record.workspaceId], {
-          timeout: 30_000,
-        });
-      } catch (error) {
-        throw new CrewdeckError("Cannot remove the isolated Herdr worktree", "worktree_cleanup_failed", {
-          error: error.message,
-        });
-      }
-    } else {
-      const workspaceAbsent = await missingWorkspace(record);
-      if (!workspaceAbsent) {
-        try {
-          await runJson("herdr", ["workspace", "close", record.workspaceId], { timeout: 15_000 });
-        } catch (error) {
-          throw new CrewdeckError("Cannot close the residual Herdr workspace", "workspace_cleanup_failed", {
-            error: error.message,
-          });
-        }
-      }
-    }
-    if (!(await missingWorkspace(record))) {
-      throw new CrewdeckError("Herdr workspace still exists after cleanup", "workspace_cleanup_failed");
-    }
-    try {
-      await stat(record.worktree);
-      throw new CrewdeckError("Isolated worktree path still exists after cleanup", "worktree_cleanup_failed");
-    } catch (error) {
-      if (error instanceof CrewdeckError) throw error;
-      if (error.code !== "ENOENT") throw error;
-    }
-
-    let worktrees = await listedWorktrees(record.repo);
-    const registration = worktrees.find((item) => path.resolve(item.worktree) === path.resolve(record.worktree));
-    if (registration) {
-      if (!recovery || registration.branch !== branchRef) {
-        throw new CrewdeckError("Unexpected Git worktree registration survived cleanup", "unsafe_git_metadata", registration);
-      }
-      await git(record.repo, ["worktree", "remove", "--force", record.worktree]);
-      worktrees = await listedWorktrees(record.repo);
-    }
-    const otherCheckout = worktrees.find((item) => item.branch === branchRef);
-    if (otherCheckout) {
-      throw new CrewdeckError("Owned branch is checked out in another worktree", "unsafe_git_metadata", otherCheckout);
-    }
-
-    let currentBranchSha;
-    try {
-      currentBranchSha = (await git(record.repo, ["rev-parse", "--verify", branchRef])).stdout;
-    } catch {
-      currentBranchSha = undefined;
-    }
-    if (currentBranchSha && currentBranchSha !== candidate.head) {
-      throw new CrewdeckError("Owned branch changed during cleanup and was preserved", "stale_candidate", {
-        expected: candidate.head,
-        actual: currentBranchSha,
-      });
-    }
-    if (currentBranchSha) {
-      await git(record.repo, ["update-ref", "-d", branchRef, candidate.head]);
-    }
-    try {
-      await git(record.repo, ["rev-parse", "--verify", branchRef]);
-      throw new CrewdeckError("Owned branch still exists after exact deletion", "branch_cleanup_failed");
-    } catch (error) {
-      if (error instanceof CrewdeckError && error.code === "branch_cleanup_failed") throw error;
-      if (error.code !== "command_failed") throw error;
-    }
-
-    const afterAgent = await liveAgent(record);
-    if (!provenMissingAgent(afterAgent) && !(afterAgent.available && afterAgent.state === "done")) {
-      throw new CrewdeckError("Build agent did not close with its workspace", "agent_cleanup_failed", afterAgent);
-    }
-
-    const reconciledAt = new Date().toISOString();
-    let reconciled;
-    await withStateLock(async () => {
-      const next = await loadState();
-      const stored = next.tasks[id];
-      if (
-        stored?.status !== "running" ||
-        stored.mergeReconciliation?.operationId !== operationId ||
-        JSON.stringify(stored.publication) !== publicationFingerprint ||
-        stored.candidateCollectedVersion !== candidate.version ||
-        JSON.stringify(stored.reviewInbox) !== reviewFingerprint
-      ) {
-        throw new CrewdeckError("Task state changed after cleanup; terminal transition refused", "state_changed");
-      }
-      stored.status = "pr-merged";
-      stored.prMergedAt = pr.mergedAt;
-      stored.mergedReconciledAt = reconciledAt;
-      stored.mergeReconciliation = {
-        ...stored.mergeReconciliation,
-        status: "merged-reconciled",
-        reconciledAt,
-        cleanup: {
-          agentClosedAt: reconciledAt,
-          workspaceClosedAt: reconciledAt,
-          worktreeRemovedAt: reconciledAt,
-          branchDeletedAt: reconciledAt,
-        },
-      };
-      delete stored.error;
-      reconciled = { ...stored };
-      await saveState(next);
-    });
-    return mergedReconciliationResult(reconciled, false);
-  } catch (error) {
-    await recordFailure(error);
-    throw error;
-  }
-}
+export const forwardBaseAdvance = reconciliationService.forwardBaseAdvance;
+export const observePublishedPullRequests = reconciliationService.observePublishedPullRequests;
+export const reconcileMergedPullRequest = reconciliationService.reconcileMergedPullRequest;
 
 export async function retireTaskAgent(configPath, id, { reason, terminate = false } = {}) {
   await loadConfig(configPath);

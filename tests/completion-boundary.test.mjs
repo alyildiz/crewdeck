@@ -91,21 +91,34 @@ test("merged-base pending announcements chunk at twenty and reconcile across res
   handlers.session_shutdown({}, ctx);
 });
 
-test("real Pi tool boundary keeps completion payload single and measures bounded A/B bytes", async (t) => {
+test("completion wake directs collection without a status preflight", async (t) => {
+  const { handlers, messages } = await runtimeFixture(t);
+  const ctx = { ui: { setStatus() {}, setWidget() {}, notify() {} } };
+  await handlers.session_start({}, ctx);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const completion = messages.find((message) => message.startsWith("CREWDECK COMPLETION"));
+  assert.ok(completion);
+  assert.match(completion, /Call crew_collect_results directly/);
+  assert.match(completion, /no crew_status preflight is needed/);
+  assert.doesNotMatch(completion, /then crew_collect_results/);
+  handlers.session_shutdown({}, ctx);
+});
+
+test("real Pi tool boundary keeps completion payload single with token-minimal action status", async (t) => {
   const { tools, marker } = await runtimeFixture(t);
   const status = tools.find((tool) => tool.name === "crew_status");
   const collect = tools.find((tool) => tool.name === "crew_collect_results");
   const ctx = { ui: { setStatus() {} } };
 
   const diagnosticText = (await status.execute("before", { id: "completed-report", mode: "diagnostic" })).content[0].text;
-  const boundedText = (await status.execute("after", { id: "completed-report" })).content[0].text;
+  const actionText = (await status.execute("after", { id: "completed-report" })).content[0].text;
   const collectedText = (await collect.execute("collect", { ids: ["completed-report"], keepReports: true }, undefined, undefined, ctx)).content[0].text;
 
-  assert.equal(occurrences(boundedText, marker), 0);
+  assert.equal(occurrences(actionText, marker), 0);
   assert.equal(occurrences(collectedText, marker), 1);
-  assert.equal(occurrences(boundedText + collectedText, marker), 1);
+  assert.equal(occurrences(actionText + collectedText, marker), 1);
   assert.equal(occurrences(diagnosticText + collectedText, marker), 2, "old full-status completion path duplicated the payload");
-  assert.ok(!boundedText.includes("UNBOUNDED-TASK-"));
+  assert.ok(!actionText.includes("UNBOUNDED-TASK-"));
   assert.ok(!collectedText.includes("UNBOUNDED-TASK-"));
   assert.ok(!collectedText.includes("reports/completed-report.json"));
   assert.ok(!collectedText.includes("\"token\""));
@@ -113,8 +126,11 @@ test("real Pi tool boundary keeps completion payload single and measures bounded
   assert.equal(parsed.length, 1);
   assert.deepEqual(Object.keys(parsed[0].task), ["id", "project", "kind", "lifecycle", "workflow", "status", "observedStatus", "cleanup"]);
 
+  assert.ok(Buffer.byteLength(actionText, "utf8") < 500, `action status must stay below 500 bytes: ${Buffer.byteLength(actionText, "utf8")}`);
+  assert.equal(actionText.includes("\n"), false, "tool JSON must not be pretty-printed");
+  assert.equal(collectedText.includes("\n"), false, "collection JSON must not be pretty-printed");
   const beforeBytes = Buffer.byteLength(diagnosticText + collectedText, "utf8");
-  const afterBytes = Buffer.byteLength(boundedText + collectedText, "utf8");
-  assert.ok(afterBytes < beforeBytes * 0.7, `expected bounded cycle below 70% of old cycle: ${afterBytes}/${beforeBytes}`);
-  console.log(`completion A/B indented UTF-8 bytes: before=${beforeBytes} after=${afterBytes}`);
+  const afterBytes = Buffer.byteLength(actionText + collectedText, "utf8");
+  assert.ok(afterBytes < beforeBytes * 0.7, `expected action cycle below 70% of old cycle: ${afterBytes}/${beforeBytes}`);
+  console.log(`completion A/B compact UTF-8 bytes: before=${beforeBytes} after=${afterBytes}`);
 });

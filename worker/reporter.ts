@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -21,6 +21,7 @@ const parentTaskId = process.env.CREWDECK_PARENT_TASK_ID || "";
 const reviewedHead = process.env.CREWDECK_REVIEWED_HEAD || "";
 const reviewEvidencePath = process.env.CREWDECK_REVIEW_EVIDENCE_PATH || "";
 const reviewEvidenceSha256 = process.env.CREWDECK_REVIEW_EVIDENCE_SHA256 || "";
+const reviewDepth = process.env.CREWDECK_REVIEW_DEPTH || "standard";
 const reportToken = process.env.CREWDECK_REPORT_TOKEN || "";
 const reportDir = process.env.CREWDECK_REPORT_DIR || "";
 const maxReviewRounds = Number(process.env.CREWDECK_MAX_REVIEW_ROUNDS || "3");
@@ -69,24 +70,26 @@ const CandidateResult = Type.Object({
   openQuestions: StringList,
 });
 
+const reviewFindingLimit = reviewDepth === "deep" ? 50 : 20;
+const reviewSummaryLimit = reviewDepth === "deep" ? 8000 : 3000;
 const ReviewResult = Type.Object({
   parentTaskId: Type.String({ pattern: "^[a-z][a-z0-9-]{0,23}$" }),
   reviewedHead: Type.String({ pattern: "^[0-9a-f]{40}$" }),
   verdict: StringEnum(["approved", "changes-requested", "blocked", "inconclusive"] as const),
-  summary: Type.String({ minLength: 1, maxLength: 12000 }),
+  summary: Type.String({ minLength: 1, maxLength: reviewSummaryLimit }),
   findings: Type.Array(
     Type.Object({
       severity: StringEnum(["blocking", "major", "minor", "nit"] as const),
-      title: Type.String({ minLength: 1, maxLength: 1000 }),
-      detail: Type.String({ minLength: 1, maxLength: 6000 }),
-      location: Type.String({ minLength: 1, maxLength: 2000 }),
-      recommendation: Type.String({ minLength: 1, maxLength: 4000 }),
+      title: Type.String({ minLength: 1, maxLength: 500 }),
+      detail: Type.String({ minLength: 1, maxLength: 3000 }),
+      location: Type.String({ minLength: 1, maxLength: 1000 }),
+      recommendation: Type.String({ minLength: 1, maxLength: 2000 }),
     }),
-    { maxItems: 100 },
+    { maxItems: reviewFindingLimit },
   ),
-  checks: StringList,
-  openQuestions: StringList,
-  evidenceSha256: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$" })),
+  checks: Type.Array(Type.String({ minLength: 1, maxLength: 2000 }), { maxItems: 30 }),
+  openQuestions: Type.Array(Type.String({ minLength: 1, maxLength: 2000 }), { maxItems: 30 }),
+  evidenceSha256: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$", description: "Optional compatibility field; Crewdeck attaches the authoritative digest automatically" })),
 });
 
 async function git(args: string[]) {
@@ -115,6 +118,7 @@ export default function crewdeckWorkerReporter(pi: ExtensionAPI) {
     if (taskLifecycle !== "report") throw new Error("Review contracts must use the report lifecycle");
     if (!/^[a-z][a-z0-9-]{0,23}$/.test(parentTaskId)) throw new Error("Invalid CREWDECK_PARENT_TASK_ID");
     if (!/^[0-9a-f]{40}$/.test(reviewedHead)) throw new Error("Invalid CREWDECK_REVIEWED_HEAD");
+    if (reviewDepth !== "standard" && reviewDepth !== "deep") throw new Error("Invalid CREWDECK_REVIEW_DEPTH");
   }
   if (taskWorkflow !== "direct" && taskWorkflow !== "reviewed-pr") {
     throw new Error("Invalid CREWDECK_TASK_WORKFLOW");
@@ -234,13 +238,34 @@ export default function crewdeckWorkerReporter(pi: ExtensionAPI) {
           throw new Error("Review identity must match the bound parentTaskId and reviewedHead");
         }
         if (reviewEvidenceSha256) {
-          if (!path.isAbsolute(reviewEvidencePath) || params.evidenceSha256 !== reviewEvidenceSha256) {
-            throw new Error("Review must attest the authoritative precomputed evidence SHA-256");
+          if (!path.isAbsolute(reviewEvidencePath)) throw new Error("Review evidence path must be absolute");
+          if (params.evidenceSha256 && params.evidenceSha256 !== reviewEvidenceSha256) {
+            throw new Error("Supplied review evidence SHA-256 does not match Crewdeck authority");
           }
           const evidence = JSON.parse(await readFile(reviewEvidencePath, "utf8"));
-          if (evidence.contentSha256 !== reviewEvidenceSha256 || evidence.parentTaskId !== parentTaskId || evidence.candidateSha !== reviewedHead) {
-            throw new Error("Authoritative reviewer evidence identity is stale or tampered");
+          const { contentSha256, ...evidencePayload } = evidence;
+          const actual = createHash("sha256").update(JSON.stringify(evidencePayload), "utf8").digest("hex");
+          if (
+            contentSha256 !== reviewEvidenceSha256 || actual !== contentSha256 ||
+            evidence.parentTaskId !== parentTaskId || evidence.candidateSha !== reviewedHead ||
+            (evidence.schemaVersion === 2 && evidence.reviewDepth !== reviewDepth)
+          ) throw new Error("Authoritative reviewer evidence identity is stale or tampered");
+          if (evidence.schemaVersion === 2) {
+            for (const name of ["fullPatch", "correctionPatch"]) {
+              const descriptor = evidence[name];
+              if (!descriptor) continue;
+              if (!path.isAbsolute(descriptor.path)) throw new Error("Review patch path must be absolute");
+              const patch = await readFile(descriptor.path);
+              if (
+                patch.byteLength !== descriptor.bytes ||
+                createHash("sha256").update(patch).digest("hex") !== descriptor.contentSha256
+              ) throw new Error("Authoritative review patch is stale or tampered");
+            }
           }
+          params.evidenceSha256 = reviewEvidenceSha256;
+        }
+        if (params.summary.length > reviewSummaryLimit || params.findings.length > reviewFindingLimit) {
+          throw new Error(`Review output exceeds the ${reviewDepth} review budget`);
         }
         if (params.verdict === "approved" && params.findings.some((finding: any) => finding.severity === "blocking")) {
           throw new Error("An approved review cannot contain blocking findings");

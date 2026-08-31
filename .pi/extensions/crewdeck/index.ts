@@ -41,7 +41,7 @@ const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 const CONFIG = process.env.CREWDECK_CONFIG || path.join(ROOT, "crewdeck.json");
 
 function text(value: unknown) {
-  return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }], details: value };
+  return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value };
 }
 
 async function validateProfiles(params: any, ctx: any) {
@@ -82,12 +82,11 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     listPending: () => getPendingResultIds(CONFIG),
     maxBatch: 20,
     sendFollowUp: (ready: string[], metadata: { remaining: number }) => {
-      const taskIds = [...new Set(ready.map((key) => key.split("@")[0]))];
       pi.sendUserMessage(
         `CREWDECK COMPLETION: ${ready.length} durable inbox event(s) are ready: ${ready.join(", ")}. ` +
-          `Call bounded crew_status once for each task id (${taskIds.join(", ")}), then crew_collect_results with exactly these inbox keys. ` +
+          "Call crew_collect_results directly with exactly these inbox keys; no crew_status preflight is needed. " +
           (metadata.remaining ? `${metadata.remaining} more event(s) remain and will be announced in another bounded follow-up. ` : "") +
-          "The collection response contains each payload exactly once. Use crew_read_result only for explicit later reinspection. For a collected changes-requested review, use crew_forward_review.",
+          "The collection response contains each payload exactly once. Use crew_status only when the next action is unclear, and crew_read_result only for explicit later reinspection. For a collected changes-requested review, use crew_forward_review.",
         { deliverAs: "followUp" },
       );
     },
@@ -130,13 +129,14 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     name: "crew_spawn_review",
     label: "Spawn Exact-SHA Reviewer",
     description:
-      "Launch the one configured read-only review kind in a proven detached worktree for exactly the current collected candidate SHA of a reviewed-pr build. Refuses concurrent or duplicate reviewers.",
+      "Launch one exact-SHA read-only reviewer. Standard depth is bounded to changed code, direct callers, and related tests; use deep only explicitly for high-risk changes. Later rounds receive a correction delta and prior findings.",
     parameters: Type.Object({
       id: Type.String({ pattern: "^[a-z][a-z0-9-]{0,23}$", description: "Unique review task id" }),
       parentTaskId: Type.String({ description: "Reviewed-pr build task id" }),
       reviewedHead: Type.String({ pattern: "^[0-9a-f]{40}$", description: "Exact 40-character current candidate SHA" }),
       task: Type.String({ description: "Concrete review scope and acceptance criteria" }),
-      profile: Type.Optional(Type.String({ description: "Optional reviewer profile" })),
+      profile: Type.Optional(Type.String({ description: "Optional reviewer profile; standard review refuses xhigh/max profiles" })),
+      reviewDepth: Type.Optional(Type.Union([Type.Literal("standard"), Type.Literal("deep")], { default: "standard", description: "Bounded standard review by default; deep must be explicit for high-risk work" })),
     }),
     async execute(_id, params, _signal, _update, ctx) {
       const config = await loadConfig(CONFIG);
@@ -153,16 +153,16 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     name: "crew_status",
     label: "Crew Status",
     description:
-      "Bounded status only. With id, return one targeted token-safe projection used by completion. Without id, return a paginated active page (20 by default, 50 maximum). scope=history/all is explicit. Opaque nextCursor values are generation-bound. id is mutually exclusive with scope, limit, and cursor, and mode=diagnostic requires id. Full unbounded troubleshooting is available only with mode=diagnostic and one id. Result references are safe identifiers, not filesystem paths.",
+      "Token-minimal action status by default. Returns only task identity, observed state, stable next-action code, and fields required for that action. Use mode=detail for the bounded operational projection, or mode=diagnostic with one id only for full troubleshooting. Without id, returns an active page (20 by default, 50 maximum); scope=history/all is explicit and nextCursor is generation-bound. Completion events should be collected directly without a status preflight.",
     parameters: Type.Object({
       id: Type.Optional(Type.String({ description: "Task id for one bounded projection" })),
-      mode: Type.Optional(Type.Union([Type.Literal("bounded"), Type.Literal("diagnostic")], { default: "bounded" })),
+      mode: Type.Optional(Type.Union([Type.Literal("action"), Type.Literal("detail"), Type.Literal("bounded"), Type.Literal("diagnostic")], { default: "action" })),
       scope: Type.Optional(Type.Union([Type.Literal("active"), Type.Literal("history"), Type.Literal("all")])),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
       cursor: Type.Optional(Type.Union([Type.String(), Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })])),
     }),
     async execute(_id, params) {
-      return text(await getStatusView(CONFIG, params));
+      return text(await getStatusView(CONFIG, { ...params, mode: params.mode || "action" }));
     },
   });
 
@@ -451,7 +451,7 @@ export default function crewdeckExtension(pi: ExtensionAPI) {
     const announceBaseAdvances = (advances: any[]) => {
       for (let offset = 0; offset < advances.length; offset += 20) {
         const chunk = advances.slice(offset, offset + 20);
-        pi.sendUserMessage(`CREWDECK BASE ADVANCES ${offset + 1}-${offset + chunk.length}/${advances.length}: ${chunk.map((entry: any) => `${entry.taskId}#${entry.sequence}:${entry.classification}/${entry.status || "pending"}`).join(", ")}. Use bounded crew_status by id, then crew_forward_base_advance. Unknown classifications fail closed. Remaining work stays visible in /crew.`, { deliverAs: "followUp" });
+        pi.sendUserMessage(`CREWDECK BASE ADVANCES ${offset + 1}-${offset + chunk.length}/${advances.length}: ${chunk.map((entry: any) => `${entry.taskId}#${entry.sequence}:${entry.classification}/${entry.status || "pending"}`).join(", ")}. Use action crew_status by id, then crew_forward_base_advance. Unknown classifications fail closed. Remaining work stays visible in /crew.`, { deliverAs: "followUp" });
       }
     };
     let observing = false;

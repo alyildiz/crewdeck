@@ -11,3 +11,5 @@ This repository is the control deck for coordinating coding workers through Herd
 - Never merge, remove unintegrated work, or force cleanup without the user's explicit approval.
 - Keep worker prompts task-specific; project conventions come from the target worktree's own `AGENTS.md`.
 - Keep worktrees outside this repository so workers never inherit these orchestrator instructions.
+- For implementation work in Crewdeck itself, read `docs/architecture.md` first, then inspect only the routed domain and focused tests. Do not read all of `src/core.mjs` or the full README unless the task crosses those boundaries.
+- Use the focused `npm run test:*` command during iteration, then run both `npm test` and `npm run check` before claiming completion.

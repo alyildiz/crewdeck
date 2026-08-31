@@ -347,7 +347,7 @@ console.error("unexpected gh "+args.join(" "));process.exit(1)
 async function crewWidget(item, mode = "") {
   const widgets = [];
   const command = createCrewCommand(async ({ scope }) => {
-    const result = runCli(item, "status", "--scope", scope);
+    const result = runCli(item, "status", "--detail", "--scope", scope);
     assert.equal(result.status, 0, result.stderr);
     return JSON.parse(result.stdout);
   });
@@ -672,7 +672,7 @@ test("does not mark terminal on cleanup failure and safely resumes cleanup", asy
   let state = await persisted(item);
   assert.equal(state.tasks["build-one"].status, "running");
   assert.equal(state.tasks["build-one"].mergeReconciliation.status, "cleanup-failed");
-  const failedStatus = runCli(item, "status", "build-one");
+  const failedStatus = runCli(item, "status", "--detail", "build-one");
   assert.equal(failedStatus.status, 0, failedStatus.stderr);
   assert.equal(JSON.parse(failedStatus.stdout).observedStatus, "merge-cleanup-failed");
   assert.equal(git(item.repo, "rev-parse", "crew/build-one"), item.head);

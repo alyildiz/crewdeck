@@ -94,7 +94,7 @@ async function fixture({
     "  review:", "    lifecycle: report", "    contract: review", "    description: Exact SHA fixture review", "    permissions: { filesystem: read-only, shell: false }", "    tools: [read]", "    skills: []", "    cleanup: after-collection",
     "  build:", "    lifecycle: change", "    description: Fixture implementation work", "    permissions: { filesystem: write, shell: true }", "    tools: [bash, edit]", "    skills: []", "    cleanup: after-integration", "",
   ].join("\n"));
-  await writeFile(profilesPath, "version: 1\ndefaultProfile: worker\nprofiles:\n  worker:\n    provider: test\n    model: model\n    thinking: low\n    allowedKinds: [scout, review, build]\n");
+  await writeFile(profilesPath, "version: 1\ndefaultProfile: worker\nprofiles:\n  worker:\n    provider: test\n    model: model\n    thinking: low\n    allowedKinds: [scout, review, build]\n  deep-worker:\n    provider: test\n    model: model\n    thinking: xhigh\n    allowedKinds: [review]\n");
   await writeFile(configPath, JSON.stringify({
     maxWorkers: 3,
     maxReviewRounds: 3,
@@ -369,6 +369,7 @@ test("reviewers and scouts use Herdr-opened detached worktrees while builds keep
   let state = JSON.parse(await readFile(item.statePath, "utf8"));
   assert.equal(state.tasks["review-new"].detached, true);
   assert.equal(state.tasks["review-new"].reviewedHead, item.head);
+  assert.equal(state.tasks["review-new"].reviewDepth, "standard");
   assert.equal(state.tasks["scout-new"].detached, true);
 
   const reviewRecord = state.tasks["review-new"];
@@ -384,10 +385,17 @@ test("reviewers and scouts use Herdr-opened detached worktrees while builds keep
   const evidencePath = reviewRecord.reviewEvidence.path;
   const originalEvidence = await readFile(evidencePath, "utf8");
   const evidence = JSON.parse(originalEvidence);
+  assert.equal(evidence.schemaVersion, 2);
   assert.equal(evidence.parentTaskId, "build-one");
   assert.equal(evidence.baseSha, item.baseSha);
   assert.equal(evidence.candidateSha, item.head);
+  assert.equal(evidence.reviewDepth, "standard");
+  assert.equal(evidence.featureScope, "Reviewed fixture build");
+  assert.equal(evidence.candidate.summary, "candidate one");
   assert.ok(evidence.commits.some((commit) => commit.sha === item.head));
+  assert.ok(path.isAbsolute(evidence.fullPatch.path));
+  assert.match(await readFile(evidence.fullPatch.path, "utf8"), /candidate one/);
+  assert.equal(evidence.patch, undefined);
   await chmod(evidencePath, 0o600);
   await writeFile(evidencePath, originalEvidence.replace("candidate one", "tampered subject"));
   result = runCli(item, "collect", "review-new", "--keep-reports");
@@ -395,6 +403,15 @@ test("reviewers and scouts use Herdr-opened detached worktrees while builds keep
   assert.match(result.stderr, /review_evidence_invalid/);
   await writeFile(evidencePath, originalEvidence);
   await chmod(evidencePath, 0o400);
+  const fullPatchPath = evidence.fullPatch.path;
+  const originalPatch = await readFile(fullPatchPath);
+  await chmod(fullPatchPath, 0o600);
+  await writeFile(fullPatchPath, "tampered patch\n");
+  result = runCli(item, "collect", "review-new", "--keep-reports");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /review_evidence_invalid/);
+  await writeFile(fullPatchPath, originalPatch);
+  await chmod(fullPatchPath, 0o400);
 
   item.env.CREW_DETACHED_REMOVE_PATH = reviewWorktree;
   result = runCli(item, "collect", "review-new");
@@ -420,7 +437,65 @@ test("reviewers and scouts use Herdr-opened detached worktrees while builds keep
   assert.match(result.stderr, /writer_already_present/);
   const log = await readFile(item.herdrLog, "utf8");
   assert.match(log, /worktree open/);
+  assert.match(log, /standard bounded review/);
   assert.doesNotMatch(log, /worktree create/);
+});
+
+test("standard review rejects xhigh while explicit deep review enables it", async (t) => {
+  const item = await fixture({ includeReview: false });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  let result = runCli(item, "collect", "build-one@candidate-1", "--keep-reports");
+  assert.equal(result.status, 0, result.stderr);
+  result = runCli(item, "review", "build-one", "deep-review", item.head, "Review high-risk persistence semantics", "--profile", "deep-worker");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /review_profile_too_deep/);
+  result = runCli(item, "review", "build-one", "deep-review", item.head, "Review high-risk persistence semantics", "--profile", "deep-worker", "--deep");
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(await readFile(item.statePath, "utf8"));
+  assert.equal(state.tasks["deep-review"].reviewDepth, "deep");
+  const log = await readFile(item.herdrLog, "utf8");
+  assert.match(log, /explicit deep review/);
+});
+
+test("later review rounds receive prior findings and a focused correction delta", async (t) => {
+  const item = await fixture({ includeReview: false });
+  t.after(() => rm(item.root, { recursive: true, force: true }));
+  let result = runCli(item, "collect", "build-one@candidate-1", "--keep-reports");
+  assert.equal(result.status, 0, result.stderr);
+  await writeFile(path.join(item.worktree, "change.txt"), "candidate one\ncorrected edge case\n");
+  git(item.worktree, "add", "change.txt");
+  git(item.worktree, "commit", "-qm", "correct edge case");
+  const secondHead = git(item.worktree, "rev-parse", "HEAD");
+  const journalPath = path.join(item.stateDir, "reports", "build-one.candidates.json");
+  const journal = JSON.parse(await readFile(journalPath, "utf8"));
+  journal.candidates.push({
+    version: 2,
+    head: secondHead,
+    submittedAt: new Date().toISOString(),
+    payload: { summary: "fix prior edge-case finding", commit: secondHead, tests: [{ command: "npm test", result: "passed" }], risks: [], openQuestions: [] },
+  });
+  await writeFile(journalPath, JSON.stringify(journal));
+  const durable = JSON.parse(await readFile(item.statePath, "utf8"));
+  durable.tasks["build-one"].reviewInbox = [{
+    reviewTaskId: "prior-review", candidateVersion: 1, reviewedHead: item.head,
+    verdict: "changes-requested", summary: "edge case missing", validAtCollection: false,
+    findings: [{ severity: "major", title: "Handle edge case", detail: "Missing handling", location: "change.txt:1", recommendation: "Add handling" }],
+    checks: ["diff"], openQuestions: [],
+  }];
+  await writeFile(item.statePath, JSON.stringify(durable));
+  result = runCli(item, "collect", "build-one@candidate-2", "--keep-reports");
+  assert.equal(result.status, 0, result.stderr);
+  result = runCli(item, "review", "build-one", "review-round-two", secondHead, "Verify the requested correction without reopening unrelated scope", "--profile", "worker");
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(await readFile(item.statePath, "utf8"));
+  const evidence = JSON.parse(await readFile(state.tasks["review-round-two"].reviewEvidence.path, "utf8"));
+  assert.equal(evidence.previousCandidate.head, item.head);
+  assert.equal(evidence.priorReview.verdict, "changes-requested");
+  assert.equal(evidence.priorReview.findings[0].title, "Handle edge case");
+  assert.ok(path.isAbsolute(evidence.correctionPatch.path));
+  const delta = await readFile(evidence.correctionPatch.path, "utf8");
+  assert.match(delta, /corrected edge case/);
+  assert.doesNotMatch(delta, /new file mode/);
 });
 
 test("approved exact SHA publication with the gh 2.45 repository shape retries deterministically", async (t) => {
@@ -907,7 +982,7 @@ test("PR observer persists exact open identity without treating it as merged", a
   const [entry] = JSON.parse(observed.stdout);
   assert.equal(entry.status, "open");
   assert.equal(entry.headSha, item.head);
-  const status = JSON.parse(runCli(item, "status", "build-one").stdout);
+  const status = JSON.parse(runCli(item, "status", "--detail", "build-one").stdout);
   assert.equal(status.observerState, "open");
   assert.equal(status.pr.state, "open");
 });
@@ -1201,7 +1276,7 @@ test("publication refuses stale SHA, dirty worktree, missing review, and any bas
   await writeFile(path.join(stale.worktree, "later.txt"), "later\n");
   git(stale.worktree, "add", "later.txt");
   git(stale.worktree, "commit", "-qm", "later head");
-  let result = runCli(stale, "status", "review-one");
+  let result = runCli(stale, "status", "--detail", "review-one");
   assert.equal(result.status, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout).observedStatus, "review-stale");
   result = publish(stale);
@@ -1238,12 +1313,16 @@ test("Pi extension and CLI expose the reviewed-pr operations without a merge pri
   for (const name of ["crew_spawn_review", "crew_forward_review", "crew_resume_build", "crew_publish_pr"]) {
     assert.match(source, new RegExp(`name: "${name}"`));
   }
+  const reviewTool = source.slice(source.indexOf('name: "crew_spawn_review"'), source.indexOf('name: "crew_status"'));
+  assert.match(reviewTool, /reviewDepth/);
+  assert.match(reviewTool, /Type\.Literal\("standard"\)/);
+  assert.match(reviewTool, /Type\.Literal\("deep"\)/);
   const publishTool = source.slice(source.indexOf('name: "crew_publish_pr"'), source.indexOf('name: "crew_prepare_integration"'));
   assert.match(publishTool, /publishPullRequest/);
   assert.doesNotMatch(publishTool, /mergeTask|gh.*merge/);
   const help = spawnSync(process.execPath, [cli, "--help"], { encoding: "utf8" });
   assert.equal(help.status, 0, help.stderr);
-  assert.match(help.stdout, /review <parent-id>/);
+  assert.match(help.stdout, /review <parent-id>.*--deep/);
   assert.match(help.stdout, /forward-review/);
   assert.match(help.stdout, /publish <build-id>/);
 });
